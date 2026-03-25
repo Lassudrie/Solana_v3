@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use builder::{BuildRequest, BuildResult, BuildStatus, DynamicBuildParameters, TransactionBuilder};
 use detection::NormalizedEvent;
-use reconciliation::{ExecutionRecord, ExecutionTracker};
+use reconciliation::{ExecutionRecord, ExecutionTracker, OnChainReconciler};
 use signing::{HotWallet, SignedTransactionEnvelope, Signer, SigningError, SigningRequest};
 use state::{
     StateError, StatePlane,
@@ -12,6 +12,8 @@ use strategy::{StrategyPlane, opportunity::SelectionOutcome};
 use submit::{SubmitError, SubmitMode, SubmitRequest, SubmitResult, Submitter};
 use telemetry::{LogLevel, PipelineStage, TelemetryStack};
 use thiserror::Error;
+
+use crate::refresh::AsyncRefreshSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathReport {
@@ -92,12 +94,14 @@ pub struct BlockhashService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AltCacheService {
     pub revision: u64,
+    pub lookup_tables: Vec<state::types::LookupTableSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletRefreshService {
     pub balance_lamports: u64,
     pub ready: bool,
+    pub signer_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,16 +122,29 @@ impl ColdPathServices {
             .state
             .execution_state_mut()
             .set_alt_revision(self.alt_cache.revision);
+        hot_path
+            .state
+            .execution_state_mut()
+            .set_lookup_tables(self.alt_cache.lookup_tables.clone());
         hot_path.state.execution_state_mut().set_wallet_state(
             self.wallet_refresh.balance_lamports,
-            self.wallet_refresh.ready,
+            self.wallet_refresh.ready && self.wallet_refresh.signer_available,
         );
         hot_path.wallet.balance_lamports = self.wallet_refresh.balance_lamports;
-        hot_path.wallet.status = if self.wallet_refresh.ready {
-            signing::WalletStatus::Ready
-        } else {
-            signing::WalletStatus::Refreshing
-        };
+        hot_path.wallet.status = wallet_status(
+            self.wallet_refresh.ready,
+            self.wallet_refresh.signer_available,
+        );
+    }
+}
+
+fn wallet_status(ready: bool, signer_available: bool) -> signing::WalletStatus {
+    if !signer_available {
+        signing::WalletStatus::MissingSigner
+    } else if ready {
+        signing::WalletStatus::Ready
+    } else {
+        signing::WalletStatus::Refreshing
     }
 }
 
@@ -135,6 +152,7 @@ pub struct BotRuntime {
     hot_path: HotPathPipeline,
     cold_path: ColdPathServices,
     tracker: ExecutionTracker,
+    reconciler: OnChainReconciler,
     telemetry: TelemetryStack,
     submit_mode: SubmitMode,
     compute_unit_limit: u32,
@@ -155,6 +173,7 @@ impl BotRuntime {
             hot_path,
             cold_path,
             tracker: ExecutionTracker::default(),
+            reconciler: OnChainReconciler::default(),
             telemetry: TelemetryStack::default(),
             submit_mode,
             compute_unit_limit,
@@ -163,11 +182,52 @@ impl BotRuntime {
         }
     }
 
+    pub fn set_reconciler(&mut self, reconciler: OnChainReconciler) {
+        self.reconciler = reconciler;
+    }
+
     pub fn apply_cold_path_seed(&mut self) {
         self.cold_path.seed_hot_path(&mut self.hot_path);
         self.hot_path
             .state
             .set_latest_slot(self.cold_path.blockhash.slot);
+    }
+
+    pub fn apply_async_refresh(&mut self, snapshot: AsyncRefreshSnapshot) {
+        if let Some(blockhash) = snapshot.blockhash {
+            self.hot_path
+                .state
+                .execution_state_mut()
+                .set_blockhash(blockhash.blockhash, blockhash.slot);
+            self.hot_path.state.set_latest_slot(blockhash.slot);
+        }
+
+        if let Some(slot) = snapshot.slot {
+            self.hot_path.state.set_latest_slot(slot.slot);
+        }
+
+        if let Some(lookup_tables) = snapshot.lookup_tables {
+            self.hot_path
+                .state
+                .execution_state_mut()
+                .set_alt_revision(lookup_tables.slot);
+            self.hot_path
+                .state
+                .execution_state_mut()
+                .set_lookup_tables(lookup_tables.tables);
+            self.hot_path.state.set_latest_slot(lookup_tables.slot);
+        }
+
+        if let Some(wallet) = snapshot.wallet {
+            let signer_available = self.hot_path.signer.has_signer_material();
+            self.hot_path
+                .state
+                .execution_state_mut()
+                .set_wallet_state(wallet.balance_lamports, wallet.ready && signer_available);
+            self.hot_path.state.set_latest_slot(wallet.slot);
+            self.hot_path.wallet.balance_lamports = wallet.balance_lamports;
+            self.hot_path.wallet.status = wallet_status(wallet.ready, signer_available);
+        }
     }
 
     pub fn telemetry(&self) -> &TelemetryStack {
@@ -180,6 +240,10 @@ impl BotRuntime {
 
     pub fn latest_slot(&self) -> u64 {
         self.hot_path.state.latest_slot()
+    }
+
+    pub fn wallet_pubkey(&self) -> &str {
+        &self.hot_path.wallet.owner_pubkey
     }
 
     pub fn route_count(&self) -> usize {
@@ -205,6 +269,8 @@ impl BotRuntime {
         self.telemetry.metrics.increment_detect();
         self.telemetry
             .log(LogLevel::Debug, "runtime", "event received");
+        self.reconciler
+            .tick(&mut self.tracker, event.source.observed_slot);
 
         let state_started = Instant::now();
         let state_outcome = self.hot_path.state.apply_event(&event)?;
@@ -255,10 +321,13 @@ impl BotRuntime {
             candidate,
             dynamic: DynamicBuildParameters {
                 recent_blockhash: execution_state.latest_blockhash.unwrap_or_default(),
+                recent_blockhash_slot: execution_state.blockhash_slot,
+                head_slot: execution_state.head_slot,
+                fee_payer_pubkey: self.hot_path.signer.pubkey_string()?,
                 compute_unit_limit: self.compute_unit_limit,
                 compute_unit_price_micro_lamports: self.compute_unit_price_micro_lamports,
                 jito_tip_lamports: self.jito_tip_lamports,
-                alt_revision: execution_state.alt_revision,
+                resolved_lookup_tables: execution_state.lookup_tables.clone(),
             },
         });
         self.telemetry
@@ -296,9 +365,12 @@ impl BotRuntime {
             .record_stage(PipelineStage::Submit, submit_started.elapsed());
         self.telemetry.metrics.increment_submit();
 
-        let execution_record = self
-            .tracker
-            .register_submission(signed_envelope.route_id.clone(), submit_result.clone());
+        let execution_record = self.tracker.register_submission(
+            signed_envelope.route_id.clone(),
+            signed_envelope.build_slot,
+            self.submit_mode,
+            submit_result.clone(),
+        );
 
         Ok(HotPathReport {
             state_outcome: Some(state_outcome),
@@ -314,15 +386,24 @@ impl BotRuntime {
 #[cfg(test)]
 mod tests {
     use detection::{AccountUpdate, EventSourceKind, NormalizedEvent};
+    use solana_sdk::signer::{Signer as SolanaCurveSigner, keypair::Keypair};
+    use solana_sdk::{hash::hashv, pubkey::Pubkey};
     use submit::SubmitStatus;
 
     use crate::{
         bootstrap::bootstrap,
         config::{
-            AccountDependencyConfig, BotConfig, RouteConfig, RouteLegConfig, RoutesConfig,
+            AccountDependencyConfig, BotConfig, MessageModeConfig,
+            OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteConfig,
+            RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
             SwapSideConfig,
         },
     };
+
+    fn test_signing_material() -> (String, String) {
+        let keypair = Keypair::new_from_array([7; 32]);
+        (keypair.pubkey().to_string(), keypair.to_base58_string())
+    }
 
     fn encode_pool(price_bps: u64, fee_bps: u16, reserve_depth: u64) -> Vec<u8> {
         let mut data = Vec::new();
@@ -330,6 +411,22 @@ mod tests {
         data.extend_from_slice(&fee_bps.to_le_bytes());
         data.extend_from_slice(&reserve_depth.to_le_bytes());
         data
+    }
+
+    fn test_pubkey(label: &str) -> String {
+        Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
+    }
+
+    fn route_execution() -> RouteExecutionConfig {
+        RouteExecutionConfig {
+            message_mode: MessageModeConfig::V0Required,
+            lookup_tables: Vec::new(),
+            default_compute_unit_limit: 300_000,
+            default_compute_unit_price_micro_lamports: 25_000,
+            default_jito_tip_lamports: 5_000,
+            max_quote_slot_lag: 4,
+            max_alt_slot_lag: 4,
+        }
     }
 
     fn route_config() -> RouteConfig {
@@ -344,11 +441,47 @@ mod tests {
                     venue: "orca".into(),
                     pool_id: "pool-a".into(),
                     side: SwapSideConfig::BuyBase,
+                    execution: RouteLegExecutionConfig::OrcaSimplePool(
+                        OrcaSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("orca-program"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            swap_account: test_pubkey("orca-swap"),
+                            authority: test_pubkey("orca-authority"),
+                            pool_source_token_account: test_pubkey("orca-pool-source"),
+                            pool_destination_token_account: test_pubkey("orca-pool-destination"),
+                            pool_mint: test_pubkey("orca-pool-mint"),
+                            fee_account: test_pubkey("orca-fee-account"),
+                            user_source_token_account: test_pubkey("route-input-ata"),
+                            user_destination_token_account: test_pubkey("route-mid-ata"),
+                            host_fee_account: None,
+                        },
+                    ),
                 },
                 RouteLegConfig {
                     venue: "raydium".into(),
                     pool_id: "pool-b".into(),
                     side: SwapSideConfig::SellBase,
+                    execution: RouteLegExecutionConfig::RaydiumSimplePool(
+                        RaydiumSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("raydium-program"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            amm_pool: test_pubkey("raydium-amm-pool"),
+                            amm_authority: test_pubkey("raydium-amm-authority"),
+                            amm_open_orders: test_pubkey("raydium-open-orders"),
+                            amm_coin_vault: test_pubkey("raydium-coin-vault"),
+                            amm_pc_vault: test_pubkey("raydium-pc-vault"),
+                            market_program: test_pubkey("serum-program"),
+                            market: test_pubkey("serum-market"),
+                            market_bids: test_pubkey("serum-bids"),
+                            market_asks: test_pubkey("serum-asks"),
+                            market_event_queue: test_pubkey("serum-event-queue"),
+                            market_coin_vault: test_pubkey("serum-coin-vault"),
+                            market_pc_vault: test_pubkey("serum-pc-vault"),
+                            market_vault_signer: test_pubkey("serum-vault-signer"),
+                            user_source_token_account: test_pubkey("route-mid-ata"),
+                            user_destination_token_account: test_pubkey("route-output-ata"),
+                        },
+                    ),
                 },
             ],
             account_dependencies: vec![
@@ -363,6 +496,7 @@ mod tests {
                     decoder_key: "pool-price-v1".into(),
                 },
             ],
+            execution: route_execution(),
         }
     }
 
@@ -372,6 +506,13 @@ mod tests {
         config.routes = RoutesConfig {
             definitions: vec![route_config()],
         };
+        config.jito.endpoint = "mock://jito".into();
+        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        let (owner_pubkey, keypair_base58) = test_signing_material();
+        config.signing.owner_pubkey = owner_pubkey;
+        config.signing.keypair_base58 = Some(keypair_base58);
         let mut runtime = bootstrap(config);
 
         let first = NormalizedEvent::account_update(

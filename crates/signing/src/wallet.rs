@@ -10,6 +10,7 @@ pub enum WalletPrecondition {
     Ok,
     WalletNotReady,
     InsufficientBalance,
+    MissingSigner,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,7 @@ impl HotWallet {
         match self.status {
             WalletStatus::Ready if self.balance_lamports > 0 => WalletPrecondition::Ok,
             WalletStatus::Ready => WalletPrecondition::InsufficientBalance,
+            WalletStatus::MissingSigner => WalletPrecondition::MissingSigner,
             _ => WalletPrecondition::WalletNotReady,
         }
     }

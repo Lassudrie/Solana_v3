@@ -57,6 +57,15 @@ pub struct RuntimeMetrics {
     pub build_count: u64,
     pub submit_count: u64,
     pub inclusion_count: u64,
+    pub shredstream_events: u64,
+    pub shredstream_sequence_gaps: u64,
+    pub shredstream_sequence_reorders: u64,
+    pub shredstream_sequence_duplicates: u64,
+    pub shredstream_ingest_latency_nanos: u64,
+    pub shredstream_ingest_latency_count: u64,
+    pub shredstream_interarrival_latency_nanos: u64,
+    pub shredstream_interarrival_latency_count: u64,
+    pub shredstream_events_per_second: u64,
     pub stage_latency_nanos: BTreeMap<String, u128>,
 }
 
@@ -69,6 +78,15 @@ impl RuntimeMetrics {
             build_count: snapshot.build_count,
             submit_count: snapshot.submit_count,
             inclusion_count: snapshot.inclusion_count,
+            shredstream_events: snapshot.shredstream_events,
+            shredstream_sequence_gaps: snapshot.shredstream_sequence_gaps,
+            shredstream_sequence_reorders: snapshot.shredstream_sequence_reorders,
+            shredstream_sequence_duplicates: snapshot.shredstream_sequence_duplicates,
+            shredstream_ingest_latency_nanos: snapshot.shredstream_ingest_latency_nanos,
+            shredstream_ingest_latency_count: snapshot.shredstream_ingest_latency_count,
+            shredstream_interarrival_latency_nanos: snapshot.shredstream_interarrival_latency_nanos,
+            shredstream_interarrival_latency_count: snapshot.shredstream_interarrival_latency_count,
+            shredstream_events_per_second: snapshot.shredstream_events_per_second,
             stage_latency_nanos: snapshot
                 .stage_latency_nanos
                 .into_iter()
@@ -121,6 +139,15 @@ impl Default for RuntimeStatus {
                 build_count: 0,
                 submit_count: 0,
                 inclusion_count: 0,
+                shredstream_events: 0,
+                shredstream_sequence_gaps: 0,
+                shredstream_sequence_reorders: 0,
+                shredstream_sequence_duplicates: 0,
+                shredstream_ingest_latency_nanos: 0,
+                shredstream_ingest_latency_count: 0,
+                shredstream_interarrival_latency_nanos: 0,
+                shredstream_interarrival_latency_count: 0,
+                shredstream_events_per_second: 0,
                 stage_latency_nanos: BTreeMap::new(),
             }),
             last_error: None,
@@ -185,6 +212,51 @@ impl RuntimeStatus {
         output.push_str(&format!(
             "bot_rejections_total {}\n",
             self.metrics.rejection_count
+        ));
+        output.push_str("# TYPE bot_shredstream_events_total counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_events_total {}\n",
+            self.metrics.shredstream_events
+        ));
+        output.push_str("# TYPE bot_shredstream_events_per_second gauge\n");
+        output.push_str(&format!(
+            "bot_shredstream_events_per_second {}\n",
+            self.metrics.shredstream_events_per_second
+        ));
+        output.push_str("# TYPE bot_shredstream_sequence_gaps_total counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_sequence_gaps_total {}\n",
+            self.metrics.shredstream_sequence_gaps
+        ));
+        output.push_str("# TYPE bot_shredstream_sequence_reorders_total counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_sequence_reorders_total {}\n",
+            self.metrics.shredstream_sequence_reorders
+        ));
+        output.push_str("# TYPE bot_shredstream_sequence_duplicates_total counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_sequence_duplicates_total {}\n",
+            self.metrics.shredstream_sequence_duplicates
+        ));
+        output.push_str("# TYPE bot_shredstream_ingest_latency_nanos_total counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_ingest_latency_nanos_total {}\n",
+            self.metrics.shredstream_ingest_latency_nanos
+        ));
+        output.push_str("# TYPE bot_shredstream_ingest_latency_nanos_count counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_ingest_latency_nanos_count {}\n",
+            self.metrics.shredstream_ingest_latency_count
+        ));
+        output.push_str("# TYPE bot_shredstream_interarrival_latency_nanos_total counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_interarrival_latency_nanos_total {}\n",
+            self.metrics.shredstream_interarrival_latency_nanos
+        ));
+        output.push_str("# TYPE bot_shredstream_interarrival_latency_nanos_count counter\n");
+        output.push_str(&format!(
+            "bot_shredstream_interarrival_latency_nanos_count {}\n",
+            self.metrics.shredstream_interarrival_latency_count
         ));
         output.push_str("# TYPE bot_build_total counter\n");
         output.push_str(&format!("bot_build_total {}\n", self.metrics.build_count));
@@ -357,6 +429,15 @@ mod tests {
                 detect_events: 7,
                 stale_updates: 1,
                 rejection_count: 2,
+                shredstream_events: 10,
+                shredstream_sequence_gaps: 1,
+                shredstream_sequence_reorders: 1,
+                shredstream_sequence_duplicates: 1,
+                shredstream_ingest_latency_nanos: 1200,
+                shredstream_ingest_latency_count: 4,
+                shredstream_interarrival_latency_nanos: 1100,
+                shredstream_interarrival_latency_count: 3,
+                shredstream_events_per_second: 9,
                 build_count: 3,
                 submit_count: 4,
                 inclusion_count: 5,
@@ -369,6 +450,9 @@ mod tests {
 
         assert!(output.contains("bot_runtime_ready 1"));
         assert!(output.contains("bot_detect_events_total 7"));
+        assert!(output.contains("bot_shredstream_events_total 10"));
+        assert!(output.contains("bot_shredstream_events_per_second 9"));
+        assert!(output.contains("bot_shredstream_sequence_gaps_total 1"));
         assert!(output.contains("bot_stage_latency_nanos_total{stage=\"select\"} 99"));
     }
 }

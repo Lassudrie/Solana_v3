@@ -2,6 +2,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod refresh;
 pub mod runtime;
 pub mod sources;
 

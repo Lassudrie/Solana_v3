@@ -6,6 +6,8 @@ use crate::types::{SubmitRequest, SubmitResult};
 pub enum SubmitError {
     #[error("submit transport unavailable")]
     TransportUnavailable,
+    #[error("submit upstream protocol error")]
+    UpstreamProtocol,
 }
 
 pub trait Submitter: Send + Sync {

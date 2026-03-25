@@ -6,5 +6,7 @@ license.workspace = true
 
 [dependencies]
 builder = { path = "../builder" }
+bs58.workspace = true
+solana-sdk.workspace = true
 state = { path = "../state" }
 thiserror.workspace = true

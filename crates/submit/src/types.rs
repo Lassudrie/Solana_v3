@@ -1,6 +1,6 @@
 use signing::SignedTransactionEnvelope;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubmitMode {
     SingleTransaction,
     Bundle,
@@ -24,7 +24,14 @@ pub enum SubmitStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitRejectionReason {
     InvalidEnvelope,
+    InvalidRequest,
+    BundleDisabled,
+    Unauthorized,
+    RateLimited,
+    DuplicateSubmission,
+    TipTooLow,
     ChannelUnavailable,
+    RemoteRejected,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

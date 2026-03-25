@@ -1,6 +1,6 @@
 use strategy::opportunity::OpportunityCandidate;
 
-use crate::types::{AtomicLegPlan, InstructionTemplate};
+use crate::types::AtomicLegPlan;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomicTwoLegTemplate {
@@ -35,37 +35,34 @@ impl AtomicTwoLegTemplate {
         ]
     }
 
-    pub fn materialize_instructions(
+    pub fn materialize_leg_memos(
         &self,
         route_id: &state::types::RouteId,
+        quoted_slot: u64,
+        expected_net_profit: i64,
         leg_plans: &[AtomicLegPlan; 2],
-        tip_lamports: u64,
-    ) -> Vec<InstructionTemplate> {
-        vec![
-            InstructionTemplate {
-                label: "compute-budget".into(),
-                program: "solana.compute_budget".into(),
-                accounts: Vec::new(),
-                data: b"set_budget".to_vec(),
-            },
-            InstructionTemplate {
-                label: format!("{}-leg-1", route_id.0),
-                program: leg_plans[0].venue.clone(),
-                accounts: vec![leg_plans[0].pool_id.0.clone()],
-                data: leg_plans[0].min_output_amount.to_le_bytes().to_vec(),
-            },
-            InstructionTemplate {
-                label: format!("{}-leg-2", route_id.0),
-                program: leg_plans[1].venue.clone(),
-                accounts: vec![leg_plans[1].pool_id.0.clone()],
-                data: leg_plans[1].min_output_amount.to_le_bytes().to_vec(),
-            },
-            InstructionTemplate {
-                label: "jito-tip".into(),
-                program: "jito.tip".into(),
-                accounts: vec!["tip".into()],
-                data: tip_lamports.to_le_bytes().to_vec(),
-            },
+    ) -> [Vec<u8>; 2] {
+        [
+            format!(
+                "template={};route={};leg=0;slot={quoted_slot};profit={expected_net_profit};venue={};pool={};in={};min_out={}",
+                self.template_name,
+                route_id.0,
+                leg_plans[0].venue,
+                leg_plans[0].pool_id.0,
+                leg_plans[0].input_amount,
+                leg_plans[0].min_output_amount,
+            )
+            .into_bytes(),
+            format!(
+                "template={};route={};leg=1;slot={quoted_slot};profit={expected_net_profit};venue={};pool={};in={};min_out={}",
+                self.template_name,
+                route_id.0,
+                leg_plans[1].venue,
+                leg_plans[1].pool_id.0,
+                leg_plans[1].input_amount,
+                leg_plans[1].min_output_amount,
+            )
+            .into_bytes(),
         ]
     }
 }

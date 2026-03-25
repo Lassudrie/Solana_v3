@@ -1,16 +1,18 @@
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use detection::{IngestError, MarketEventSource};
+use detection::{EventSourceKind, IngestError, MarketEventSource, NormalizedEvent};
 use thiserror::Error;
 
 use crate::{
     bootstrap::bootstrap,
     config::{BotConfig, RuntimeControlConfig},
     control::{RuntimeIssue, RuntimeMode, RuntimeStatus, SharedRuntimeStatus},
+    refresh::AsyncStateRefresher,
     runtime::BotRuntime,
     sources::{EventSourceConfigError, build_event_source},
 };
@@ -34,12 +36,15 @@ pub enum DaemonError {
 
 pub struct BotDaemon {
     runtime: BotRuntime,
+    refresher: AsyncStateRefresher,
     source: Box<dyn MarketEventSource>,
     status: SharedRuntimeStatus,
     control: RuntimeControlConfig,
     kill_switch_sentinel_path: Option<PathBuf>,
     min_wallet_balance_lamports: u64,
     max_blockhash_slot_lag: u64,
+    last_shredstream_sequence: Option<u64>,
+    last_shredstream_seen_at: Option<SystemTime>,
 }
 
 impl BotDaemon {
@@ -47,6 +52,26 @@ impl BotDaemon {
         let source = build_event_source(&config.runtime.event_source, &config.shredstream)?;
         let mut runtime = bootstrap(config.clone());
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
+        let lookup_table_keys = config
+            .routes
+            .definitions
+            .iter()
+            .flat_map(|route| {
+                route
+                    .execution
+                    .lookup_tables
+                    .iter()
+                    .map(|table| table.account_key.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let refresher = AsyncStateRefresher::new(
+            &config.runtime.refresh,
+            &config.reconciliation.rpc_http_endpoint,
+            runtime.wallet_pubkey(),
+            &lookup_table_keys,
+        );
 
         let status = SharedRuntimeStatus::new(RuntimeStatus::default());
         if let Err(source) = status.spawn_http_server(&config.runtime.health_server) {
@@ -58,6 +83,7 @@ impl BotDaemon {
 
         let daemon = Self {
             runtime,
+            refresher,
             source,
             status,
             control: config.runtime.control.clone(),
@@ -69,6 +95,8 @@ impl BotDaemon {
                 .map(PathBuf::from),
             min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
             max_blockhash_slot_lag: config.strategy.max_blockhash_slot_lag,
+            last_shredstream_sequence: None,
+            last_shredstream_seen_at: None,
         };
         daemon.refresh_status(None, None, None);
         Ok(daemon)
@@ -80,6 +108,8 @@ impl BotDaemon {
 
     pub fn run(&mut self) -> Result<DaemonExit, DaemonError> {
         loop {
+            self.runtime
+                .apply_async_refresh(self.refresher.drain_snapshot());
             let kill_switch_active = self.refresh_kill_switch();
             if kill_switch_active {
                 self.refresh_status(None, Some(RuntimeIssue::KillSwitchActive), None);
@@ -92,6 +122,9 @@ impl BotDaemon {
                 match self.source.poll_next() {
                     Ok(Some(event)) => {
                         processed += 1;
+                        if event.source.source == EventSourceKind::ShredStream {
+                            self.record_shredstream_metrics(&event);
+                        }
                         if let Err(error) = self.runtime.process_event(event) {
                             let detail = error.to_string();
                             self.refresh_status(
@@ -142,6 +175,48 @@ impl BotDaemon {
             .unwrap_or(false);
         self.runtime.apply_kill_switch(active);
         active
+    }
+
+    fn record_shredstream_metrics(&mut self, event: &NormalizedEvent) {
+        let observed_at = event.latency.source_received_at;
+        let normalized_latency = event
+            .latency
+            .normalized_at
+            .duration_since(event.latency.source_received_at)
+            .unwrap_or(Duration::ZERO);
+
+        self.runtime.telemetry().metrics.record_shredstream_event(
+            observed_at,
+            observed_at,
+            self.last_shredstream_seen_at,
+            normalized_latency,
+        );
+
+        match self.last_shredstream_sequence {
+            None => {}
+            Some(last) if event.source.sequence > last.saturating_add(1) => {
+                self.runtime
+                    .telemetry()
+                    .metrics
+                    .increment_shredstream_sequence_gap();
+            }
+            Some(last) if event.source.sequence == last => {
+                self.runtime
+                    .telemetry()
+                    .metrics
+                    .increment_shredstream_sequence_duplicate();
+            }
+            Some(last) if event.source.sequence < last => {
+                self.runtime
+                    .telemetry()
+                    .metrics
+                    .increment_shredstream_sequence_reorder();
+            }
+            Some(_) => {}
+        }
+
+        self.last_shredstream_sequence = Some(event.source.sequence);
+        self.last_shredstream_seen_at = Some(observed_at);
     }
 
     fn refresh_status(
@@ -235,11 +310,14 @@ impl BotDaemon {
 
 #[cfg(test)]
 mod tests {
+    use solana_sdk::{hash::hashv, pubkey::Pubkey, signer::keypair::Keypair};
     use std::{env, fs, path::PathBuf};
 
     use crate::config::{
-        AccountDependencyConfig, BotConfig, EventSourceMode, RouteConfig, RouteLegConfig,
-        RoutesConfig, SwapSideConfig,
+        AccountDependencyConfig, BotConfig, EventSourceMode, MessageModeConfig,
+        OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteConfig,
+        RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
+        SwapSideConfig,
     };
 
     use super::{BotDaemon, DaemonExit};
@@ -307,6 +385,13 @@ mod tests {
 
     fn bot_config(path: String) -> BotConfig {
         let mut config = BotConfig::default();
+        let keypair = Keypair::new_from_array([7; 32]);
+        config.jito.endpoint = "mock://jito".into();
+        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        config.runtime.refresh.enabled = false;
+        config.signing.keypair_base58 = Some(keypair.to_base58_string());
         config.routes = RoutesConfig {
             definitions: vec![RouteConfig {
                 route_id: "route-a".into(),
@@ -319,11 +404,49 @@ mod tests {
                         venue: "orca".into(),
                         pool_id: "pool-a".into(),
                         side: SwapSideConfig::BuyBase,
+                        execution: RouteLegExecutionConfig::OrcaSimplePool(
+                            OrcaSimplePoolLegExecutionConfig {
+                                program_id: test_pubkey("orca-program"),
+                                token_program_id: test_pubkey("spl-token-program"),
+                                swap_account: test_pubkey("orca-swap"),
+                                authority: test_pubkey("orca-authority"),
+                                pool_source_token_account: test_pubkey("orca-pool-source"),
+                                pool_destination_token_account: test_pubkey(
+                                    "orca-pool-destination",
+                                ),
+                                pool_mint: test_pubkey("orca-pool-mint"),
+                                fee_account: test_pubkey("orca-fee-account"),
+                                user_source_token_account: test_pubkey("route-input-ata"),
+                                user_destination_token_account: test_pubkey("route-mid-ata"),
+                                host_fee_account: None,
+                            },
+                        ),
                     },
                     RouteLegConfig {
                         venue: "raydium".into(),
                         pool_id: "pool-b".into(),
                         side: SwapSideConfig::SellBase,
+                        execution: RouteLegExecutionConfig::RaydiumSimplePool(
+                            RaydiumSimplePoolLegExecutionConfig {
+                                program_id: test_pubkey("raydium-program"),
+                                token_program_id: test_pubkey("spl-token-program"),
+                                amm_pool: test_pubkey("raydium-amm-pool"),
+                                amm_authority: test_pubkey("raydium-amm-authority"),
+                                amm_open_orders: test_pubkey("raydium-open-orders"),
+                                amm_coin_vault: test_pubkey("raydium-coin-vault"),
+                                amm_pc_vault: test_pubkey("raydium-pc-vault"),
+                                market_program: test_pubkey("serum-program"),
+                                market: test_pubkey("serum-market"),
+                                market_bids: test_pubkey("serum-bids"),
+                                market_asks: test_pubkey("serum-asks"),
+                                market_event_queue: test_pubkey("serum-event-queue"),
+                                market_coin_vault: test_pubkey("serum-coin-vault"),
+                                market_pc_vault: test_pubkey("serum-pc-vault"),
+                                market_vault_signer: test_pubkey("serum-vault-signer"),
+                                user_source_token_account: test_pubkey("route-mid-ata"),
+                                user_destination_token_account: test_pubkey("route-output-ata"),
+                            },
+                        ),
                     },
                 ],
                 account_dependencies: vec![
@@ -338,11 +461,24 @@ mod tests {
                         decoder_key: "pool-price-v1".into(),
                     },
                 ],
+                execution: RouteExecutionConfig {
+                    message_mode: MessageModeConfig::V0Required,
+                    lookup_tables: Vec::new(),
+                    default_compute_unit_limit: 300_000,
+                    default_compute_unit_price_micro_lamports: 25_000,
+                    default_jito_tip_lamports: 5_000,
+                    max_quote_slot_lag: 4,
+                    max_alt_slot_lag: 4,
+                },
             }],
         };
         config.runtime.event_source.mode = EventSourceMode::JsonlFile;
         config.runtime.event_source.path = Some(path);
         config
+    }
+
+    fn test_pubkey(label: &str) -> String {
+        Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
     }
 
     fn replay_event(pubkey: &str, sequence: u64, price_bps: u64) -> String {

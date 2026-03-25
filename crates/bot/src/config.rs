@@ -5,7 +5,6 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotConfig {
-    pub detection: DetectionConfig,
     pub shredstream: ShredstreamConfig,
     pub state: StateConfig,
     pub routes: RoutesConfig,
@@ -14,7 +13,6 @@ pub struct BotConfig {
     pub signing: SigningConfig,
     pub submit: SubmitConfig,
     pub jito: JitoSubmitConfig,
-    pub telemetry: TelemetryConfig,
     pub reconciliation: ReconciliationConfig,
     pub risk: RiskConfig,
     pub runtime: RuntimeConfig,
@@ -23,7 +21,6 @@ pub struct BotConfig {
 impl Default for BotConfig {
     fn default() -> Self {
         Self {
-            detection: DetectionConfig::default(),
             shredstream: ShredstreamConfig::default(),
             state: StateConfig::default(),
             routes: RoutesConfig::default(),
@@ -32,7 +29,6 @@ impl Default for BotConfig {
             signing: SigningConfig::default(),
             submit: SubmitConfig::default(),
             jito: JitoSubmitConfig::default(),
-            telemetry: TelemetryConfig::default(),
             reconciliation: ReconciliationConfig::default(),
             risk: RiskConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -90,21 +86,6 @@ impl BotConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DetectionConfig {
-    pub primary_source: String,
-    pub max_batch: usize,
-}
-
-impl Default for DetectionConfig {
-    fn default() -> Self {
-        Self {
-            primary_source: "shredstream".into(),
-            max_batch: 1,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShredstreamConfig {
     pub endpoint: String,
     pub auth_token: Option<String>,
@@ -133,7 +114,7 @@ impl Default for StateConfig {
     fn default() -> Self {
         Self {
             max_snapshot_slot_lag: 2,
-            bootstrap_blockhash: "bootstrap-blockhash".into(),
+            bootstrap_blockhash: "11111111111111111111111111111111".into(),
             bootstrap_blockhash_slot: 1,
             bootstrap_alt_revision: 1,
         }
@@ -154,6 +135,7 @@ pub struct RouteConfig {
     pub max_trade_size: u64,
     pub legs: [RouteLegConfig; 2],
     pub account_dependencies: Vec<AccountDependencyConfig>,
+    pub execution: RouteExecutionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -161,6 +143,7 @@ pub struct RouteLegConfig {
     pub venue: String,
     pub pool_id: String,
     pub side: SwapSideConfig,
+    pub execution: RouteLegExecutionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,6 +158,90 @@ pub struct AccountDependencyConfig {
     pub account_key: String,
     pub pool_id: String,
     pub decoder_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteExecutionConfig {
+    #[serde(default)]
+    pub message_mode: MessageModeConfig,
+    #[serde(default)]
+    pub lookup_tables: Vec<LookupTableConfig>,
+    pub default_compute_unit_limit: u32,
+    pub default_compute_unit_price_micro_lamports: u64,
+    pub default_jito_tip_lamports: u64,
+    #[serde(default = "default_max_quote_slot_lag")]
+    pub max_quote_slot_lag: u64,
+    #[serde(default = "default_max_alt_slot_lag")]
+    pub max_alt_slot_lag: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageModeConfig {
+    V0Required,
+    V0OrLegacy,
+}
+
+impl Default for MessageModeConfig {
+    fn default() -> Self {
+        Self::V0Required
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LookupTableConfig {
+    pub account_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RouteLegExecutionConfig {
+    OrcaSimplePool(OrcaSimplePoolLegExecutionConfig),
+    RaydiumSimplePool(RaydiumSimplePoolLegExecutionConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrcaSimplePoolLegExecutionConfig {
+    pub program_id: String,
+    pub token_program_id: String,
+    pub swap_account: String,
+    pub authority: String,
+    pub pool_source_token_account: String,
+    pub pool_destination_token_account: String,
+    pub pool_mint: String,
+    pub fee_account: String,
+    pub user_source_token_account: String,
+    pub user_destination_token_account: String,
+    pub host_fee_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaydiumSimplePoolLegExecutionConfig {
+    pub program_id: String,
+    pub token_program_id: String,
+    pub amm_pool: String,
+    pub amm_authority: String,
+    pub amm_open_orders: String,
+    pub amm_coin_vault: String,
+    pub amm_pc_vault: String,
+    pub market_program: String,
+    pub market: String,
+    pub market_bids: String,
+    pub market_asks: String,
+    pub market_event_queue: String,
+    pub market_coin_vault: String,
+    pub market_pc_vault: String,
+    pub market_vault_signer: String,
+    pub user_source_token_account: String,
+    pub user_destination_token_account: String,
+}
+
+fn default_max_quote_slot_lag() -> u64 {
+    2
+}
+
+fn default_max_alt_slot_lag() -> u64 {
+    32
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +288,8 @@ impl Default for BuilderConfig {
 pub struct SigningConfig {
     pub wallet_id: String,
     pub owner_pubkey: String,
+    pub keypair_path: Option<String>,
+    pub keypair_base58: Option<String>,
     pub bootstrap_balance_lamports: u64,
     pub wallet_ready: bool,
 }
@@ -229,7 +298,9 @@ impl Default for SigningConfig {
     fn default() -> Self {
         Self {
             wallet_id: "hot-wallet".into(),
-            owner_pubkey: "wallet-owner".into(),
+            owner_pubkey: String::new(),
+            keypair_path: None,
+            keypair_base58: None,
             bootstrap_balance_lamports: 1_000_000,
             wallet_ready: true,
         }
@@ -239,14 +310,12 @@ impl Default for SigningConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmitConfig {
     pub mode: SubmitModeConfig,
-    pub max_inflight: usize,
 }
 
 impl Default for SubmitConfig {
     fn default() -> Self {
         Self {
             mode: SubmitModeConfig::SingleTransaction,
-            max_inflight: 64,
         }
     }
 }
@@ -259,44 +328,57 @@ pub enum SubmitModeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct JitoSubmitConfig {
     pub endpoint: String,
+    pub ws_endpoint: String,
+    pub auth_token: Option<String>,
     pub bundle_enabled: bool,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub retry_attempts: usize,
+    pub retry_backoff_ms: u64,
+    pub idempotency_cache_size: usize,
 }
 
 impl Default for JitoSubmitConfig {
     fn default() -> Self {
         Self {
             endpoint: "https://mainnet.block-engine.jito.wtf".into(),
+            ws_endpoint: "wss://bundles.jito.wtf/api/v1/bundles/tip_stream".into(),
+            auth_token: None,
             bundle_enabled: true,
+            connect_timeout_ms: 300,
+            request_timeout_ms: 1_000,
+            retry_attempts: 3,
+            retry_backoff_ms: 50,
+            idempotency_cache_size: 1_024,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TelemetryConfig {
-    pub enable_memory_logs: bool,
-}
-
-impl Default for TelemetryConfig {
-    fn default() -> Self {
-        Self {
-            enable_memory_logs: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ReconciliationConfig {
-    pub retain_history_limit: usize,
-    pub classify_failures: bool,
+    pub enabled: bool,
+    pub rpc_http_endpoint: String,
+    pub rpc_ws_endpoint: String,
+    pub websocket_enabled: bool,
+    pub websocket_timeout_ms: u64,
+    pub search_transaction_history: bool,
+    pub max_pending_slots: u64,
 }
 
 impl Default for ReconciliationConfig {
     fn default() -> Self {
         Self {
-            retain_history_limit: 10_000,
-            classify_failures: true,
+            enabled: true,
+            rpc_http_endpoint: "https://api.mainnet-beta.solana.com".into(),
+            rpc_ws_endpoint: "wss://api.mainnet-beta.solana.com".into(),
+            websocket_enabled: true,
+            websocket_timeout_ms: 5,
+            search_transaction_history: true,
+            max_pending_slots: 150,
         }
     }
 }
@@ -304,14 +386,12 @@ impl Default for ReconciliationConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RiskConfig {
     pub kill_switch_enabled: bool,
-    pub fail_closed: bool,
 }
 
 impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             kill_switch_enabled: false,
-            fail_closed: true,
         }
     }
 }
@@ -321,6 +401,8 @@ pub struct RuntimeConfig {
     pub event_source: EventSourceConfig,
     pub health_server: HealthServerConfig,
     pub control: RuntimeControlConfig,
+    #[serde(default)]
+    pub refresh: AsyncRefreshConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -329,6 +411,34 @@ impl Default for RuntimeConfig {
             event_source: EventSourceConfig::default(),
             health_server: HealthServerConfig::default(),
             control: RuntimeControlConfig::default(),
+            refresh: AsyncRefreshConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AsyncRefreshConfig {
+    pub enabled: bool,
+    pub blockhash_refresh_millis: u64,
+    #[serde(default = "default_slot_refresh_millis")]
+    pub slot_refresh_millis: u64,
+    pub alt_refresh_millis: u64,
+    pub wallet_refresh_millis: u64,
+}
+
+fn default_slot_refresh_millis() -> u64 {
+    500
+}
+
+impl Default for AsyncRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            blockhash_refresh_millis: 500,
+            slot_refresh_millis: default_slot_refresh_millis(),
+            alt_refresh_millis: 2_000,
+            wallet_refresh_millis: 2_000,
         }
     }
 }

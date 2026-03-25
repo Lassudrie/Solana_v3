@@ -54,6 +54,7 @@ pub fn build_event_source(
             ShredStreamConfig {
                 endpoint: shredstream.endpoint.clone(),
                 auth_token: shredstream.auth_token.clone(),
+                replay_on_gap: shredstream.replay_on_gap,
             },
         ))),
         EventSourceMode::UdpJson => {

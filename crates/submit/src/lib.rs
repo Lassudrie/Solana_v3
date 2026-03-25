@@ -22,8 +22,12 @@ mod tests {
     };
 
     #[test]
-    fn submitter_stub_returns_structured_result() {
-        let submitter = JitoSubmitter::new(JitoConfig::default());
+    fn submitter_mock_returns_structured_result() {
+        let submitter = JitoSubmitter::new(JitoConfig {
+            endpoint: "mock://jito".into(),
+            ws_endpoint: "mock://jito-tip-stream".into(),
+            ..JitoConfig::default()
+        });
         let result = submitter
             .submit(SubmitRequest {
                 envelope: SignedTransactionEnvelope {
@@ -40,6 +44,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, SubmitStatus::Accepted);
-        assert!(result.submission_id.0.starts_with("jito-single-"));
+        assert_eq!(result.submission_id.0, "jito-single-sig");
+    }
+
+    #[test]
+    fn submitter_minimally_deduplicates_same_signature() {
+        let submitter = JitoSubmitter::new(JitoConfig {
+            endpoint: "mock://jito".into(),
+            ws_endpoint: "mock://jito-tip-stream".into(),
+            ..JitoConfig::default()
+        });
+        let request = SubmitRequest {
+            envelope: SignedTransactionEnvelope {
+                route_id: RouteId("route-a".into()),
+                recent_blockhash: "blockhash-1".into(),
+                signature: "sig".into(),
+                signer_id: "wallet".into(),
+                signed_message: vec![1, 2, 3],
+                build_slot: 10,
+                signed_at: SystemTime::now(),
+            },
+            mode: SubmitMode::SingleTransaction,
+        };
+
+        let first = submitter.submit(request.clone()).unwrap();
+        let second = submitter.submit(request).unwrap();
+
+        assert_eq!(first, second);
     }
 }

@@ -1,10 +1,11 @@
 use std::{
+    collections::BTreeMap,
     collections::VecDeque,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     time::{Duration, SystemTime},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     events::{EventSourceKind, LatencyMetadata, MarketEvent, NormalizedEvent, SourceMetadata},
@@ -15,6 +16,7 @@ use crate::{
 pub struct ShredStreamConfig {
     pub endpoint: String,
     pub auth_token: Option<String>,
+    pub replay_on_gap: bool,
 }
 
 impl Default for ShredStreamConfig {
@@ -22,6 +24,7 @@ impl Default for ShredStreamConfig {
         Self {
             endpoint: "udp://127.0.0.1:10000".to_string(),
             auth_token: None,
+            replay_on_gap: false,
         }
     }
 }
@@ -32,7 +35,10 @@ pub struct ShredStreamSource {
     socket: Option<UdpSocket>,
     bind_error: Option<String>,
     queue: VecDeque<NormalizedEvent>,
-    next_sequence: u64,
+    deferred_events: BTreeMap<u64, NormalizedEvent>,
+    expected_sequence: u64,
+    generated_sequence: u64,
+    pending_replay_range: Option<(u64, u64)>,
     exhausted: bool,
 }
 
@@ -43,7 +49,10 @@ impl ShredStreamSource {
             socket: None,
             bind_error: None,
             queue: VecDeque::new(),
-            next_sequence: 1,
+            deferred_events: BTreeMap::new(),
+            expected_sequence: 1,
+            generated_sequence: 1,
+            pending_replay_range: None,
             exhausted: false,
         }
     }
@@ -99,15 +108,21 @@ impl MarketEventSource for ShredStreamSource {
         };
 
         let mut buffer = [0u8; 65_535];
-        match socket.recv(&mut buffer) {
-            Ok(bytes) => {
+        match socket.recv_from(&mut buffer) {
+            Ok((bytes, sender)) => {
                 let payload = std::str::from_utf8(&buffer[..bytes]).map_err(|error| {
                     IngestError::SourceFailure {
                         kind: self.source_kind(),
                         detail: error.to_string(),
                     }
                 })?;
-                parse_wire_event(payload, self.source_kind(), &mut self.next_sequence).map(Some)
+                let event = parse_wire_event(
+                    payload,
+                    self.source_kind(),
+                    &mut self.generated_sequence,
+                    self.config.auth_token.as_deref(),
+                )?;
+                self.ingest_event(event, sender)
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(IngestError::SourceFailure {
@@ -119,6 +134,38 @@ impl MarketEventSource for ShredStreamSource {
 }
 
 impl ShredStreamSource {
+    fn ingest_event(
+        &mut self,
+        event: NormalizedEvent,
+        sender: SocketAddr,
+    ) -> Result<Option<NormalizedEvent>, IngestError> {
+        let sequence = event.source.sequence;
+        if sequence < self.expected_sequence {
+            return Ok(self.queue.pop_front());
+        }
+
+        if sequence > self.expected_sequence {
+            if !self.config.replay_on_gap {
+                return Err(IngestError::SourceFailure {
+                    kind: self.source_kind(),
+                    detail: format!(
+                        "sequence gap detected: expected {}, received {}",
+                        self.expected_sequence, sequence
+                    ),
+                });
+            }
+
+            self.deferred_events.entry(sequence).or_insert(event);
+            self.request_replay(self.expected_sequence, sequence.saturating_sub(1), sender)?;
+            return Ok(self.queue.pop_front());
+        }
+
+        self.expected_sequence = self.expected_sequence.saturating_add(1);
+        self.queue.push_back(event);
+        self.drain_deferred_events();
+        Ok(self.queue.pop_front())
+    }
+
     fn connect_socket(&mut self) -> Result<(), String> {
         let bind_address = parse_udp_address(&self.config.endpoint);
         let socket = UdpSocket::bind(bind_address)
@@ -129,12 +176,85 @@ impl ShredStreamSource {
         self.socket = Some(socket);
         Ok(())
     }
+
+    fn request_replay(
+        &mut self,
+        from_sequence: u64,
+        to_sequence: u64,
+        sender: SocketAddr,
+    ) -> Result<(), IngestError> {
+        if from_sequence > to_sequence {
+            return Ok(());
+        }
+
+        let (request_from, request_to) = match self.pending_replay_range {
+            Some((pending_from, pending_to))
+                if from_sequence >= pending_from && to_sequence <= pending_to =>
+            {
+                return Ok(());
+            }
+            Some((pending_from, pending_to)) => {
+                (pending_from.min(from_sequence), pending_to.max(to_sequence))
+            }
+            None => (from_sequence, to_sequence),
+        };
+
+        let request = ReplayRequest {
+            message_type: "replay_request",
+            auth_token: self.config.auth_token.clone(),
+            from_sequence: request_from,
+            to_sequence: request_to,
+        };
+        let payload = serde_json::to_vec(&request).map_err(|error| IngestError::SourceFailure {
+            kind: self.source_kind(),
+            detail: error.to_string(),
+        })?;
+
+        let Some(socket) = self.socket.as_ref() else {
+            return Err(IngestError::SourceFailure {
+                kind: self.source_kind(),
+                detail: "replay requested before socket initialization".into(),
+            });
+        };
+        socket
+            .send_to(&payload, sender)
+            .map_err(|error| IngestError::SourceFailure {
+                kind: self.source_kind(),
+                detail: format!("failed to send replay request to {sender}: {error}"),
+            })?;
+        self.pending_replay_range = Some((request_from, request_to));
+        Ok(())
+    }
+
+    fn drain_deferred_events(&mut self) {
+        while let Some(event) = self.deferred_events.remove(&self.expected_sequence) {
+            self.expected_sequence = self.expected_sequence.saturating_add(1);
+            self.queue.push_back(event);
+        }
+
+        if let Some((_, pending_to)) = self.pending_replay_range {
+            if self.expected_sequence > pending_to {
+                self.pending_replay_range = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayRequest {
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth_token: Option<String>,
+    from_sequence: u64,
+    to_sequence: u64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireEvent {
     AccountUpdate {
+        auth_token: Option<String>,
         source: Option<WireSourceKind>,
         sequence: Option<u64>,
         observed_slot: Option<u64>,
@@ -146,6 +266,7 @@ enum WireEvent {
         write_version: u64,
     },
     SlotBoundary {
+        auth_token: Option<String>,
         source: Option<WireSourceKind>,
         sequence: Option<u64>,
         observed_slot: Option<u64>,
@@ -153,6 +274,7 @@ enum WireEvent {
         leader: Option<String>,
     },
     Heartbeat {
+        auth_token: Option<String>,
         source: Option<WireSourceKind>,
         sequence: Option<u64>,
         observed_slot: Option<u64>,
@@ -182,6 +304,7 @@ fn parse_wire_event(
     input: &str,
     default_kind: EventSourceKind,
     next_sequence: &mut u64,
+    expected_auth_token: Option<&str>,
 ) -> Result<NormalizedEvent, IngestError> {
     let event: WireEvent =
         serde_json::from_str(input).map_err(|error| IngestError::SourceFailure {
@@ -190,6 +313,7 @@ fn parse_wire_event(
         })?;
     match event {
         WireEvent::AccountUpdate {
+            auth_token,
             source,
             sequence,
             observed_slot,
@@ -199,48 +323,59 @@ fn parse_wire_event(
             data_hex,
             slot,
             write_version,
-        } => Ok(normalized_event(
-            source,
-            sequence,
-            observed_slot.unwrap_or(slot),
-            default_kind,
-            MarketEvent::AccountUpdate(crate::events::AccountUpdate {
-                pubkey,
-                owner,
-                lamports,
-                data: decode_hex(&data_hex)?,
-                slot,
-                write_version,
-            }),
-            next_sequence,
-        )),
+        } => {
+            validate_auth_token(expected_auth_token, auth_token.as_deref(), default_kind)?;
+            Ok(normalized_event(
+                source,
+                sequence,
+                observed_slot.unwrap_or(slot),
+                default_kind,
+                MarketEvent::AccountUpdate(crate::events::AccountUpdate {
+                    pubkey,
+                    owner,
+                    lamports,
+                    data: decode_hex(&data_hex)?,
+                    slot,
+                    write_version,
+                }),
+                next_sequence,
+            ))
+        }
         WireEvent::SlotBoundary {
+            auth_token,
             source,
             sequence,
             observed_slot,
             slot,
             leader,
-        } => Ok(normalized_event(
-            source,
-            sequence,
-            observed_slot.unwrap_or(slot),
-            default_kind,
-            MarketEvent::SlotBoundary(crate::events::SlotBoundary { slot, leader }),
-            next_sequence,
-        )),
+        } => {
+            validate_auth_token(expected_auth_token, auth_token.as_deref(), default_kind)?;
+            Ok(normalized_event(
+                source,
+                sequence,
+                observed_slot.unwrap_or(slot),
+                default_kind,
+                MarketEvent::SlotBoundary(crate::events::SlotBoundary { slot, leader }),
+                next_sequence,
+            ))
+        }
         WireEvent::Heartbeat {
+            auth_token,
             source,
             sequence,
             observed_slot,
             slot,
-        } => Ok(normalized_event(
-            source,
-            sequence,
-            observed_slot.unwrap_or(slot),
-            default_kind,
-            MarketEvent::Heartbeat(crate::events::Heartbeat { slot, note: "wire" }),
-            next_sequence,
-        )),
+        } => {
+            validate_auth_token(expected_auth_token, auth_token.as_deref(), default_kind)?;
+            Ok(normalized_event(
+                source,
+                sequence,
+                observed_slot.unwrap_or(slot),
+                default_kind,
+                MarketEvent::Heartbeat(crate::events::Heartbeat { slot, note: "wire" }),
+                next_sequence,
+            ))
+        }
     }
 }
 
@@ -279,6 +414,20 @@ fn parse_udp_address(endpoint: &str) -> &str {
     endpoint.strip_prefix("udp://").unwrap_or(endpoint)
 }
 
+fn validate_auth_token(
+    expected: Option<&str>,
+    received: Option<&str>,
+    kind: EventSourceKind,
+) -> Result<(), IngestError> {
+    match expected {
+        Some(expected) if received != Some(expected) => Err(IngestError::SourceFailure {
+            kind,
+            detail: "unauthorized shredstream datagram".into(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 fn decode_hex(input: &str) -> Result<Vec<u8>, IngestError> {
     if input.len() % 2 != 0 {
         return Err(IngestError::SourceFailure {
@@ -306,6 +455,8 @@ fn decode_hex(input: &str) -> Result<Vec<u8>, IngestError> {
 mod tests {
     use super::*;
     use std::net::UdpSocket;
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime};
 
     fn pick_free_port() -> u16 {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -318,6 +469,7 @@ mod tests {
         let mut source = ShredStreamSource::new(ShredStreamConfig {
             endpoint: format!("udp://127.0.0.1:{port}"),
             auth_token: None,
+            replay_on_gap: false,
         });
         let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
 
@@ -346,6 +498,7 @@ mod tests {
         let mut source = ShredStreamSource::new(ShredStreamConfig {
             endpoint: "udp://127.0.0.1:0".into(),
             auth_token: None,
+            replay_on_gap: false,
         });
         source.push_test_event(NormalizedEvent {
             payload: MarketEvent::Heartbeat(crate::events::Heartbeat {
@@ -369,5 +522,130 @@ mod tests {
             source.poll_next(),
             Err(IngestError::Exhausted { kind }) if kind == EventSourceKind::ShredStream
         ));
+    }
+
+    #[test]
+    fn measures_udp_round_trip_latency() {
+        let port = pick_free_port();
+        let mut source = ShredStreamSource::new(ShredStreamConfig {
+            endpoint: format!("udp://127.0.0.1:{port}"),
+            auth_token: None,
+            replay_on_gap: false,
+        });
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        assert_eq!(source.poll_next().unwrap(), None);
+        let sent_at = SystemTime::now();
+        sender
+            .send_to(
+                b"{\"type\":\"heartbeat\",\"slot\":123,\"observed_slot\":456}",
+                format!("127.0.0.1:{port}"),
+            )
+            .unwrap();
+
+        let start = Instant::now();
+        let event = loop {
+            if let Ok(Some(event)) = source.poll_next() {
+                break event;
+            }
+            if start.elapsed() > Duration::from_millis(250) {
+                panic!("timed out waiting for shredstream event");
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        let normalized_latency = event
+            .latency
+            .normalized_at
+            .duration_since(sent_at)
+            .expect("event time should be after send");
+        assert!(normalized_latency <= Duration::from_millis(250));
+        println!(
+            "shredstream udp normalized latency {:?}",
+            normalized_latency
+        );
+        assert_eq!(event.latency.source_latency, Duration::ZERO);
+    }
+
+    #[test]
+    fn rejects_udp_datagram_with_invalid_auth_token() {
+        let port = pick_free_port();
+        let mut source = ShredStreamSource::new(ShredStreamConfig {
+            endpoint: format!("udp://127.0.0.1:{port}"),
+            auth_token: Some("secret".into()),
+            replay_on_gap: false,
+        });
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        assert_eq!(source.poll_next().unwrap(), None);
+        sender
+            .send_to(
+                b"{\"type\":\"heartbeat\",\"slot\":123,\"auth_token\":\"wrong\"}",
+                format!("127.0.0.1:{port}"),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            source.poll_next(),
+            Err(IngestError::SourceFailure { kind, detail })
+                if kind == EventSourceKind::ShredStream && detail == "unauthorized shredstream datagram"
+        ));
+    }
+
+    #[test]
+    fn requests_replay_and_reorders_gap_sequence() {
+        let port = pick_free_port();
+        let mut source = ShredStreamSource::new(ShredStreamConfig {
+            endpoint: format!("udp://127.0.0.1:{port}"),
+            auth_token: Some("secret".into()),
+            replay_on_gap: true,
+        });
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sender
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+
+        assert_eq!(source.poll_next().unwrap(), None);
+        sender
+            .send_to(
+                b"{\"type\":\"heartbeat\",\"sequence\":2,\"slot\":2,\"auth_token\":\"secret\"}",
+                format!("127.0.0.1:{port}"),
+            )
+            .unwrap();
+
+        assert_eq!(source.poll_next().unwrap(), None);
+
+        let mut replay_request_buffer = [0u8; 1024];
+        let (bytes, _) = sender.recv_from(&mut replay_request_buffer).unwrap();
+        let replay_request = String::from_utf8_lossy(&replay_request_buffer[..bytes]);
+        assert!(replay_request.contains("\"type\":\"replay_request\""));
+        assert!(replay_request.contains("\"from_sequence\":1"));
+        assert!(replay_request.contains("\"to_sequence\":1"));
+        assert!(replay_request.contains("\"auth_token\":\"secret\""));
+
+        sender
+            .send_to(
+                b"{\"type\":\"heartbeat\",\"source\":\"replay\",\"sequence\":1,\"slot\":1,\"auth_token\":\"secret\"}",
+                format!("127.0.0.1:{port}"),
+            )
+            .unwrap();
+
+        let first = loop {
+            if let Ok(Some(event)) = source.poll_next() {
+                break event;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(first.source.sequence, 1);
+        assert_eq!(first.source.source, EventSourceKind::Replay);
+
+        let second = loop {
+            if let Ok(Some(event)) = source.poll_next() {
+                break event;
+            }
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(second.source.sequence, 2);
+        assert_eq!(second.source.source, EventSourceKind::ShredStream);
     }
 }

@@ -81,9 +81,18 @@ pub struct ExecutionStateSnapshot {
     pub latest_blockhash: Option<String>,
     pub blockhash_slot: Option<u64>,
     pub alt_revision: u64,
+    pub lookup_tables: Vec<LookupTableSnapshot>,
     pub wallet_balance_lamports: u64,
     pub wallet_ready: bool,
     pub kill_switch_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupTableSnapshot {
+    pub account_key: String,
+    pub addresses: Vec<String>,
+    pub last_extended_slot: u64,
+    pub fetched_slot: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

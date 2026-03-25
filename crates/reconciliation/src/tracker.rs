@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use state::types::RouteId;
-use submit::{SubmissionId, SubmitResult, SubmitStatus};
+use submit::{SubmissionId, SubmitMode, SubmitResult, SubmitStatus};
 
 use crate::{classifier::FailureClass, history::ExecutionHistory};
 
@@ -11,6 +11,7 @@ pub enum InclusionStatus {
     Submitted,
     Landed { slot: u64 },
     Dropped,
+    Expired { observed_slot: u64 },
     Failed(FailureClass),
 }
 
@@ -25,7 +26,10 @@ pub enum ExecutionOutcome {
 pub struct ExecutionRecord {
     pub route_id: RouteId,
     pub submission_id: SubmissionId,
+    pub submit_mode: SubmitMode,
+    pub submit_endpoint: String,
     pub submit_status: SubmitStatus,
+    pub build_slot: u64,
     pub inclusion_status: InclusionStatus,
     pub outcome: ExecutionOutcome,
     pub created_at: SystemTime,
@@ -41,13 +45,18 @@ impl ExecutionTracker {
     pub fn register_submission(
         &mut self,
         route_id: RouteId,
+        build_slot: u64,
+        submit_mode: SubmitMode,
         result: SubmitResult,
     ) -> ExecutionRecord {
         let now = SystemTime::now();
         let record = ExecutionRecord {
             route_id,
             submission_id: result.submission_id.clone(),
+            submit_mode,
+            submit_endpoint: result.endpoint.clone(),
             submit_status: result.status,
+            build_slot,
             inclusion_status: InclusionStatus::Submitted,
             outcome: ExecutionOutcome::Pending,
             created_at: now,
@@ -68,6 +77,7 @@ impl ExecutionTracker {
         record.outcome = match status {
             InclusionStatus::Landed { slot } => ExecutionOutcome::Included { slot },
             InclusionStatus::Dropped => ExecutionOutcome::Failed(FailureClass::ChainDropped),
+            InclusionStatus::Expired { .. } => ExecutionOutcome::Failed(FailureClass::Expired),
             InclusionStatus::Failed(class) => ExecutionOutcome::Failed(class),
             InclusionStatus::Pending | InclusionStatus::Submitted => ExecutionOutcome::Pending,
         };
@@ -83,5 +93,13 @@ impl ExecutionTracker {
             .values()
             .filter(|record| record.outcome == ExecutionOutcome::Pending)
             .count()
+    }
+
+    pub fn pending_records(&self) -> Vec<ExecutionRecord> {
+        self.history
+            .values()
+            .filter(|record| record.outcome == ExecutionOutcome::Pending)
+            .cloned()
+            .collect()
     }
 }

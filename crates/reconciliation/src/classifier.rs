@@ -5,6 +5,8 @@ use submit::SubmitResult;
 pub enum FailureClass {
     SubmitRejected,
     ChainDropped,
+    ChainExecutionFailed,
+    Expired,
     Unknown,
 }
 
@@ -22,7 +24,8 @@ impl OutcomeClassifier {
     pub fn classify_inclusion(status: &InclusionStatus) -> Option<FailureClass> {
         match status {
             InclusionStatus::Dropped => Some(FailureClass::ChainDropped),
-            InclusionStatus::Failed(_) => Some(FailureClass::Unknown),
+            InclusionStatus::Expired { .. } => Some(FailureClass::Expired),
+            InclusionStatus::Failed(class) => Some(class.clone()),
             _ => None,
         }
     }
