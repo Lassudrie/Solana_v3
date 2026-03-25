@@ -1,0 +1,11 @@
+[package]
+name = "builder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+state = { path = "../state" }
+strategy = { path = "../strategy" }
+thiserror.workspace = true
+

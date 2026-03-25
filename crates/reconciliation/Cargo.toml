@@ -1,0 +1,11 @@
+[package]
+name = "reconciliation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+state = { path = "../state" }
+submit = { path = "../submit" }
+thiserror.workspace = true
+

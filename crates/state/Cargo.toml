@@ -1,0 +1,10 @@
+[package]
+name = "state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+detection = { path = "../detection" }
+thiserror.workspace = true
+

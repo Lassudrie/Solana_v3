@@ -1,0 +1,19 @@
+[package]
+name = "bot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+builder = { path = "../builder" }
+detection = { path = "../detection" }
+reconciliation = { path = "../reconciliation" }
+serde.workspace = true
+serde_json.workspace = true
+signing = { path = "../signing" }
+state = { path = "../state" }
+strategy = { path = "../strategy" }
+submit = { path = "../submit" }
+telemetry = { path = "../telemetry" }
+thiserror.workspace = true
+toml.workspace = true

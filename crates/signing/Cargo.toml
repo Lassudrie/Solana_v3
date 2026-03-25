@@ -1,0 +1,10 @@
+[package]
+name = "signing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+builder = { path = "../builder" }
+state = { path = "../state" }
+thiserror.workspace = true

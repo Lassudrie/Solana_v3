@@ -1,0 +1,12 @@
+[package]
+name = "strategy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+state = { path = "../state" }
+thiserror.workspace = true
+
+[dev-dependencies]
+detection = { path = "../detection" }
