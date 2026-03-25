@@ -79,6 +79,7 @@ Types principaux présents dans le code :
 - `RouteDefinition`
 - `RouteState`
 - `WarmupStatus`
+- `NormalizedEvent` ([documentation dédiée](/root/bot/Solana_v3/docs/architecture/normalized-event.md))
 - `FreshnessState`
 - `OpportunityCandidate`
 - `OpportunityDecision`
