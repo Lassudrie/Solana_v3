@@ -83,21 +83,73 @@ impl BotConfig {
             }),
         }
     }
+
+    pub fn apply_runtime_profile_defaults(&mut self) {
+        if self.runtime.profile != RuntimeProfileConfig::UltraFast {
+            return;
+        }
+
+        self.runtime.control.idle_sleep_millis = 0;
+        self.runtime.control.max_events_per_tick = 4_096;
+        self.reconciliation.poll_interval_millis = 25;
+        self.runtime.refresh.enabled = true;
+        self.runtime.refresh.blockhash_refresh_millis = 200;
+        self.runtime.refresh.slot_refresh_millis = 100;
+        self.runtime.refresh.alt_refresh_millis = 1_000;
+        self.runtime.refresh.wallet_refresh_millis = 1_000;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ShredstreamConfig {
-    pub endpoint: String,
-    pub auth_token: Option<String>,
-    pub replay_on_gap: bool,
+    #[serde(alias = "endpoint")]
+    pub grpc_endpoint: String,
+    pub grpc_connect_timeout_ms: u64,
+    pub buffer_capacity: usize,
+    pub reconnect_backoff_millis: u64,
+    pub max_reconnect_backoff_millis: u64,
+    #[serde(default)]
+    pub reducers: LiveReducerConfig,
 }
 
 impl Default for ShredstreamConfig {
     fn default() -> Self {
         Self {
-            endpoint: "udp://127.0.0.1:10000".into(),
-            auth_token: None,
-            replay_on_gap: false,
+            grpc_endpoint: "http://127.0.0.1:50051".into(),
+            grpc_connect_timeout_ms: 500,
+            buffer_capacity: 4_096,
+            reconnect_backoff_millis: 250,
+            max_reconnect_backoff_millis: 5_000,
+            reducers: LiveReducerConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReducerRolloutMode {
+    Disabled,
+    Shadow,
+    Active,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LiveReducerConfig {
+    pub orca_simple_pool: ReducerRolloutMode,
+    pub raydium_simple_pool: ReducerRolloutMode,
+    pub orca_whirlpool: ReducerRolloutMode,
+    pub raydium_clmm: ReducerRolloutMode,
+}
+
+impl Default for LiveReducerConfig {
+    fn default() -> Self {
+        Self {
+            orca_simple_pool: ReducerRolloutMode::Active,
+            raydium_simple_pool: ReducerRolloutMode::Shadow,
+            orca_whirlpool: ReducerRolloutMode::Shadow,
+            raydium_clmm: ReducerRolloutMode::Shadow,
         }
     }
 }
@@ -127,15 +179,40 @@ pub struct RoutesConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteClassConfig {
+    AmmFastPath,
+    ClmmSlowPath,
+}
+
+impl Default for RouteClassConfig {
+    fn default() -> Self {
+        Self::ClmmSlowPath
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteConfig {
+    #[serde(default = "default_route_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub route_class: RouteClassConfig,
     pub route_id: String,
     pub input_mint: String,
     pub output_mint: String,
+    pub base_mint: Option<String>,
+    pub quote_mint: Option<String>,
     pub default_trade_size: u64,
     pub max_trade_size: u64,
+    #[serde(default)]
+    pub size_ladder: Vec<u64>,
     pub legs: [RouteLegConfig; 2],
     pub account_dependencies: Vec<AccountDependencyConfig>,
     pub execution: RouteExecutionConfig,
+}
+
+fn default_route_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +220,7 @@ pub struct RouteLegConfig {
     pub venue: String,
     pub pool_id: String,
     pub side: SwapSideConfig,
+    pub fee_bps: Option<u16>,
     pub execution: RouteLegExecutionConfig,
 }
 
@@ -197,7 +275,9 @@ pub struct LookupTableConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouteLegExecutionConfig {
     OrcaSimplePool(OrcaSimplePoolLegExecutionConfig),
+    OrcaWhirlpool(OrcaWhirlpoolLegExecutionConfig),
     RaydiumSimplePool(RaydiumSimplePoolLegExecutionConfig),
+    RaydiumClmm(RaydiumClmmLegExecutionConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,6 +293,19 @@ pub struct OrcaSimplePoolLegExecutionConfig {
     pub user_source_token_account: String,
     pub user_destination_token_account: String,
     pub host_fee_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OrcaWhirlpoolLegExecutionConfig {
+    pub program_id: String,
+    pub token_program_id: String,
+    pub whirlpool: String,
+    pub token_mint_a: String,
+    pub token_vault_a: String,
+    pub token_mint_b: String,
+    pub token_vault_b: String,
+    pub tick_spacing: u16,
+    pub a_to_b: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,6 +327,24 @@ pub struct RaydiumSimplePoolLegExecutionConfig {
     pub market_vault_signer: String,
     pub user_source_token_account: String,
     pub user_destination_token_account: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaydiumClmmLegExecutionConfig {
+    pub program_id: String,
+    pub token_program_id: String,
+    pub token_program_2022_id: String,
+    pub memo_program_id: String,
+    pub pool_state: String,
+    pub amm_config: String,
+    pub observation_state: String,
+    pub ex_bitmap_account: Option<String>,
+    pub token_mint_0: String,
+    pub token_vault_0: String,
+    pub token_mint_1: String,
+    pub token_vault_1: String,
+    pub tick_spacing: u16,
+    pub zero_for_one: bool,
 }
 
 fn default_max_quote_slot_lag() -> u64 {
@@ -285,11 +396,39 @@ impl Default for BuilderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SigningProviderKind {
+    Local,
+    SecureUnix,
+}
+
+impl Default for SigningProviderKind {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+fn default_signing_connect_timeout_ms() -> u64 {
+    50
+}
+
+fn default_signing_read_timeout_ms() -> u64 {
+    50
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SigningConfig {
     pub wallet_id: String,
     pub owner_pubkey: String,
+    #[serde(default)]
+    pub provider: SigningProviderKind,
     pub keypair_path: Option<String>,
     pub keypair_base58: Option<String>,
+    pub socket_path: Option<String>,
+    #[serde(default = "default_signing_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_signing_read_timeout_ms")]
+    pub read_timeout_ms: u64,
     pub bootstrap_balance_lamports: u64,
     pub wallet_ready: bool,
 }
@@ -299,8 +438,12 @@ impl Default for SigningConfig {
         Self {
             wallet_id: "hot-wallet".into(),
             owner_pubkey: String::new(),
+            provider: SigningProviderKind::Local,
             keypair_path: None,
             keypair_base58: None,
+            socket_path: None,
+            connect_timeout_ms: default_signing_connect_timeout_ms(),
+            read_timeout_ms: default_signing_read_timeout_ms(),
             bootstrap_balance_lamports: 1_000_000,
             wallet_ready: true,
         }
@@ -366,6 +509,7 @@ pub struct ReconciliationConfig {
     pub websocket_enabled: bool,
     pub websocket_timeout_ms: u64,
     pub search_transaction_history: bool,
+    pub poll_interval_millis: u64,
     pub max_pending_slots: u64,
 }
 
@@ -378,6 +522,7 @@ impl Default for ReconciliationConfig {
             websocket_enabled: true,
             websocket_timeout_ms: 5,
             search_transaction_history: true,
+            poll_interval_millis: 100,
             max_pending_slots: 150,
         }
     }
@@ -398,8 +543,11 @@ impl Default for RiskConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    #[serde(default)]
+    pub profile: RuntimeProfileConfig,
     pub event_source: EventSourceConfig,
     pub health_server: HealthServerConfig,
+    pub monitor_server: MonitorServerConfig,
     pub control: RuntimeControlConfig,
     #[serde(default)]
     pub refresh: AsyncRefreshConfig,
@@ -408,11 +556,26 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
+            profile: RuntimeProfileConfig::default(),
             event_source: EventSourceConfig::default(),
             health_server: HealthServerConfig::default(),
+            monitor_server: MonitorServerConfig::default(),
             control: RuntimeControlConfig::default(),
             refresh: AsyncRefreshConfig::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeProfileConfig {
+    Default,
+    UltraFast,
+}
+
+impl Default for RuntimeProfileConfig {
+    fn default() -> Self {
+        Self::Default
     }
 }
 
@@ -485,6 +648,30 @@ impl Default for HealthServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MonitorServerConfig {
+    pub enabled: bool,
+    pub bind_address: String,
+    pub poll_interval_millis: u64,
+    pub max_signal_samples: usize,
+    pub max_rejections: usize,
+    pub max_trades: usize,
+}
+
+impl Default for MonitorServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "127.0.0.1:8081".into(),
+            poll_interval_millis: 250,
+            max_signal_samples: 4_096,
+            max_rejections: 2_048,
+            max_trades: 2_048,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeControlConfig {
     pub idle_sleep_millis: u64,
     pub max_events_per_tick: usize,
@@ -494,7 +681,7 @@ pub struct RuntimeControlConfig {
 impl Default for RuntimeControlConfig {
     fn default() -> Self {
         Self {
-            idle_sleep_millis: 100,
+            idle_sleep_millis: 1,
             max_events_per_tick: 128,
             kill_switch_sentinel_path: None,
         }
@@ -509,7 +696,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{BotConfig, EventSourceMode};
+    use super::{BotConfig, EventSourceMode, RuntimeProfileConfig};
 
     #[test]
     fn loads_toml_config_from_path() {
@@ -524,6 +711,19 @@ mod tests {
         assert_eq!(loaded, config);
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ultra_fast_profile_applies_runtime_defaults() {
+        let mut config = BotConfig::default();
+        config.runtime.profile = RuntimeProfileConfig::UltraFast;
+        config.apply_runtime_profile_defaults();
+
+        assert_eq!(config.runtime.control.idle_sleep_millis, 0);
+        assert_eq!(config.runtime.control.max_events_per_tick, 4_096);
+        assert_eq!(config.reconciliation.poll_interval_millis, 25);
+        assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 200);
+        assert_eq!(config.runtime.refresh.slot_refresh_millis, 100);
     }
 
     fn temp_path(prefix: &str, extension: &str) -> PathBuf {

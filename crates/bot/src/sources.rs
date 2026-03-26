@@ -8,12 +8,16 @@ use std::{
 
 use detection::{
     AccountUpdate, EventSourceKind, Heartbeat, IngestError, LatencyMetadata, MarketEvent,
-    MarketEventSource, NormalizedEvent, ShredStreamConfig, SlotBoundary, SourceMetadata,
+    MarketEventSource, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate, SlotBoundary,
+    SourceMetadata,
 };
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::config::{EventSourceConfig, EventSourceMode, ShredstreamConfig};
+use crate::{
+    config::{BotConfig, EventSourceMode},
+    live::GrpcEntriesEventSource,
+};
 
 #[derive(Debug, Error)]
 pub enum EventSourceConfigError {
@@ -35,30 +39,31 @@ pub enum EventSourceConfigError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to initialize live shredstream source: {detail}")]
+    LiveShredstream { detail: String },
 }
 
 pub fn build_event_source(
-    config: &EventSourceConfig,
-    shredstream: &ShredstreamConfig,
+    config: &BotConfig,
 ) -> Result<Box<dyn MarketEventSource>, EventSourceConfigError> {
-    match config.mode {
+    match config.runtime.event_source.mode {
         EventSourceMode::Disabled => Err(EventSourceConfigError::Disabled),
         EventSourceMode::JsonlFile => {
             let path = config
+                .runtime
+                .event_source
                 .path
                 .as_deref()
                 .ok_or(EventSourceConfigError::MissingPath)?;
             Ok(Box::new(JsonlFileEventSource::open(path)?))
         }
-        EventSourceMode::Shredstream => Ok(Box::new(detection::ShredStreamSource::new(
-            ShredStreamConfig {
-                endpoint: shredstream.endpoint.clone(),
-                auth_token: shredstream.auth_token.clone(),
-                replay_on_gap: shredstream.replay_on_gap,
-            },
-        ))),
+        EventSourceMode::Shredstream => GrpcEntriesEventSource::spawn(config)
+            .map(|source| Box::new(source) as Box<dyn MarketEventSource>)
+            .map_err(|detail| EventSourceConfigError::LiveShredstream { detail }),
         EventSourceMode::UdpJson => {
             let bind_address = config
+                .runtime
+                .event_source
                 .bind_address
                 .as_deref()
                 .ok_or(EventSourceConfigError::MissingBindAddress)?;
@@ -179,6 +184,34 @@ enum WireEvent {
         slot: u64,
         write_version: u64,
     },
+    PoolSnapshotUpdate {
+        source: Option<WireSourceKind>,
+        sequence: Option<u64>,
+        observed_slot: Option<u64>,
+        pool_id: String,
+        price_bps: u64,
+        fee_bps: u16,
+        reserve_depth: u64,
+        reserve_a: Option<u64>,
+        reserve_b: Option<u64>,
+        active_liquidity: Option<u64>,
+        sqrt_price_x64: Option<u128>,
+        exact: Option<bool>,
+        repair_pending: Option<bool>,
+        token_mint_a: String,
+        token_mint_b: String,
+        tick_spacing: u16,
+        current_tick_index: Option<i32>,
+        slot: u64,
+        write_version: u64,
+    },
+    PoolInvalidation {
+        source: Option<WireSourceKind>,
+        sequence: Option<u64>,
+        observed_slot: Option<u64>,
+        pool_id: String,
+        slot: u64,
+    },
     SlotBoundary {
         source: Option<WireSourceKind>,
         sequence: Option<u64>,
@@ -197,6 +230,7 @@ enum WireEvent {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum WireSourceKind {
+    #[serde(alias = "shredstream")]
     ShredStream,
     Replay,
     Synthetic,
@@ -242,6 +276,65 @@ fn parse_wire_event(
                 slot,
                 write_version,
             }),
+            next_sequence,
+        )),
+        WireEvent::PoolSnapshotUpdate {
+            source,
+            sequence,
+            observed_slot,
+            pool_id,
+            price_bps,
+            fee_bps,
+            reserve_depth,
+            reserve_a,
+            reserve_b,
+            active_liquidity,
+            sqrt_price_x64,
+            exact,
+            repair_pending,
+            token_mint_a,
+            token_mint_b,
+            tick_spacing,
+            current_tick_index,
+            slot,
+            write_version,
+        } => Ok(normalized_event(
+            source,
+            sequence,
+            observed_slot.unwrap_or(slot),
+            default_kind,
+            MarketEvent::PoolSnapshotUpdate(PoolSnapshotUpdate {
+                pool_id,
+                price_bps,
+                fee_bps,
+                reserve_depth,
+                reserve_a,
+                reserve_b,
+                active_liquidity,
+                sqrt_price_x64,
+                exact,
+                repair_pending,
+                token_mint_a,
+                token_mint_b,
+                tick_spacing,
+                current_tick_index,
+                slot,
+                write_version,
+            }),
+            next_sequence,
+        )),
+        WireEvent::PoolInvalidation {
+            source,
+            sequence,
+            observed_slot,
+            pool_id,
+            slot,
+        } => Ok(normalized_event(
+            source,
+            sequence,
+            observed_slot.unwrap_or(slot),
+            default_kind,
+            MarketEvent::PoolInvalidation(PoolInvalidation { pool_id }),
             next_sequence,
         )),
         WireEvent::SlotBoundary {
@@ -329,7 +422,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use detection::MarketEventSource;
+    use detection::{MarketEvent, MarketEventSource};
 
     use super::JsonlFileEventSource;
 
@@ -347,6 +440,24 @@ mod tests {
 
         assert_eq!(event.source.sequence, 7);
         assert_eq!(event.source.observed_slot, 11);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_source_reads_pool_snapshot_updates() {
+        let path = temp_file_path("bot-jsonl-live-source");
+        fs::write(
+            &path,
+            "{\"type\":\"pool_snapshot_update\",\"source\":\"shredstream\",\"sequence\":9,\"observed_slot\":33,\"pool_id\":\"pool-a\",\"price_bps\":10001,\"fee_bps\":4,\"reserve_depth\":5000,\"token_mint_a\":\"a\",\"token_mint_b\":\"b\",\"tick_spacing\":4,\"current_tick_index\":12,\"slot\":33,\"write_version\":2}\n",
+        )
+        .unwrap();
+
+        let mut source = JsonlFileEventSource::open(&path).unwrap();
+        let event = source.poll_next().unwrap().expect("event");
+
+        assert_eq!(event.source.sequence, 9);
+        assert!(matches!(event.payload, MarketEvent::PoolSnapshotUpdate(_)));
 
         let _ = fs::remove_file(path);
     }

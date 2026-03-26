@@ -5,7 +5,8 @@ pub mod types;
 
 pub use execution::{
     ExecutionRegistry, LookupTableUsageConfig, MessageMode, OrcaSimplePoolConfig,
-    RaydiumSimplePoolConfig, RouteExecutionConfig, VenueExecutionConfig,
+    OrcaWhirlpoolConfig, RaydiumClmmConfig, RaydiumSimplePoolConfig, RouteExecutionConfig,
+    VenueExecutionConfig,
 };
 pub use templates::AtomicTwoLegTemplate;
 pub use transaction_builder::{AtomicArbTransactionBuilder, TransactionBuilder};
@@ -21,7 +22,7 @@ mod tests {
     use solana_sdk::signer::{SeedDerivable, Signer as SolanaSigner, keypair::Keypair};
     use solana_sdk::{hash::hashv, message::VersionedMessage, pubkey::Pubkey};
     use state::types::{LookupTableSnapshot, RouteId};
-    use strategy::{opportunity::OpportunityCandidate, quote::LegQuote};
+    use strategy::{opportunity::OpportunityCandidate, quote::LegQuote, route_registry::SwapSide};
 
     use crate::{
         AtomicArbTransactionBuilder, BuildRejectionReason, ExecutionRegistry,
@@ -53,21 +54,27 @@ mod tests {
             quoted_slot: 42,
             trade_size: 10_000,
             expected_net_output: 10_250,
+            expected_gross_profit: 250,
+            estimated_execution_cost_lamports: 0,
             expected_net_profit: 250,
             leg_quotes: [
                 LegQuote {
                     venue: "orca".into(),
                     pool_id: state::types::PoolId("pool-a".into()),
+                    side: SwapSide::BuyBase,
                     input_amount: 10_000,
                     output_amount: 10_120,
                     fee_paid: 5,
+                    current_tick_index: None,
                 },
                 LegQuote {
                     venue: "raydium".into(),
                     pool_id: state::types::PoolId("pool-b".into()),
+                    side: SwapSide::SellBase,
                     input_amount: 10_120,
                     output_amount: 10_250,
                     fee_paid: 5,
+                    current_tick_index: None,
                 },
             ],
         }

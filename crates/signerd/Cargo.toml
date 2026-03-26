@@ -1,10 +1,12 @@
 [package]
-name = "state"
+name = "signerd"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-bs58.workspace = true
-detection = { path = "../detection" }
+base64 = "0.22"
+serde_json.workspace = true
+signing = { path = "../signing" }
+solana-sdk.workspace = true
 thiserror.workspace = true

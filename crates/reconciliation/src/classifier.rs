@@ -4,6 +4,7 @@ use submit::SubmitResult;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailureClass {
     SubmitRejected,
+    TransportFailed,
     ChainDropped,
     ChainExecutionFailed,
     Expired,
@@ -15,10 +16,8 @@ pub struct OutcomeClassifier;
 
 impl OutcomeClassifier {
     pub fn classify_submit(result: &SubmitResult) -> Option<FailureClass> {
-        result
-            .rejection
-            .as_ref()
-            .map(|_| FailureClass::SubmitRejected)
+        matches!(result.status, submit::SubmitStatus::Rejected)
+            .then_some(FailureClass::SubmitRejected)
     }
 
     pub fn classify_inclusion(status: &InclusionStatus) -> Option<FailureClass> {

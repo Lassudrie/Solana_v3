@@ -29,14 +29,18 @@ pub struct RouteExecutionConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VenueExecutionConfig {
     OrcaSimplePool(OrcaSimplePoolConfig),
+    OrcaWhirlpool(OrcaWhirlpoolConfig),
     RaydiumSimplePool(RaydiumSimplePoolConfig),
+    RaydiumClmm(RaydiumClmmConfig),
 }
 
 impl VenueExecutionConfig {
     pub fn venue_name(&self) -> &'static str {
         match self {
             Self::OrcaSimplePool(_) => "orca",
+            Self::OrcaWhirlpool(_) => "orca_whirlpool",
             Self::RaydiumSimplePool(_) => "raydium",
+            Self::RaydiumClmm(_) => "raydium_clmm",
         }
     }
 }
@@ -54,6 +58,19 @@ pub struct OrcaSimplePoolConfig {
     pub user_source_token_account: String,
     pub user_destination_token_account: String,
     pub host_fee_account: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrcaWhirlpoolConfig {
+    pub program_id: String,
+    pub token_program_id: String,
+    pub whirlpool: String,
+    pub token_mint_a: String,
+    pub token_vault_a: String,
+    pub token_mint_b: String,
+    pub token_vault_b: String,
+    pub tick_spacing: u16,
+    pub a_to_b: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +92,24 @@ pub struct RaydiumSimplePoolConfig {
     pub market_vault_signer: String,
     pub user_source_token_account: String,
     pub user_destination_token_account: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaydiumClmmConfig {
+    pub program_id: String,
+    pub token_program_id: String,
+    pub token_program_2022_id: String,
+    pub memo_program_id: String,
+    pub pool_state: String,
+    pub amm_config: String,
+    pub observation_state: String,
+    pub ex_bitmap_account: Option<String>,
+    pub token_mint_0: String,
+    pub token_vault_0: String,
+    pub token_mint_1: String,
+    pub token_vault_1: String,
+    pub tick_spacing: u16,
+    pub zero_for_one: bool,
 }
 
 #[derive(Debug, Clone, Default)]

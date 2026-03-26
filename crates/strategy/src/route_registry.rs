@@ -13,6 +13,7 @@ pub struct RouteLeg {
     pub venue: String,
     pub pool_id: PoolId,
     pub side: SwapSide,
+    pub fee_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,9 +21,13 @@ pub struct RouteDefinition {
     pub route_id: RouteId,
     pub input_mint: String,
     pub output_mint: String,
+    pub base_mint: Option<String>,
+    pub quote_mint: Option<String>,
     pub legs: [RouteLeg; 2],
     pub default_trade_size: u64,
     pub max_trade_size: u64,
+    pub size_ladder: Vec<u64>,
+    pub estimated_execution_cost_lamports: u64,
 }
 
 #[derive(Debug, Default)]

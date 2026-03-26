@@ -6,18 +6,38 @@ license.workspace = true
 
 [dependencies]
 base64 = "0.22"
+bincode.workspace = true
 builder = { path = "../builder" }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
 detection = { path = "../detection" }
+openssl = { version = "0.10", features = ["vendored"] }
+ratatui = "0.29"
 reconciliation = { path = "../reconciliation" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 signing = { path = "../signing" }
 solana-address-lookup-table-interface = { version = "2.2.2", features = ["bincode", "bytemuck"] }
+solana-entry-legacy = { package = "solana-entry", version = "=2.2.1" }
+solana-message-legacy = { package = "solana-message", version = "=2.2.1" }
+solana-pubkey-legacy = { package = "solana-pubkey", version = "=2.2.1" }
 solana-sdk.workspace = true
+solana-transaction-legacy = { package = "solana-transaction", version = "=2.2.1" }
+prost = "0.13"
+prost-types = "0.13"
 state = { path = "../state" }
 strategy = { path = "../strategy" }
 submit = { path = "../submit" }
 telemetry = { path = "../telemetry" }
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tonic = { version = "0.13", features = ["tls-webpki-roots"] }
 toml.workspace = true
+
+[build-dependencies]
+protobuf-src = "1"
+tonic-build = "0.13"
+
+[dev-dependencies]
+signerd = { path = "../signerd" }

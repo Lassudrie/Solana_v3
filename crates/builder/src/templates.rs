@@ -23,14 +23,18 @@ impl AtomicTwoLegTemplate {
             AtomicLegPlan {
                 venue: first.venue.clone(),
                 pool_id: first.pool_id.clone(),
+                side: first.side,
                 input_amount: first.input_amount,
                 min_output_amount: first.output_amount,
+                current_tick_index: first.current_tick_index,
             },
             AtomicLegPlan {
                 venue: second.venue.clone(),
                 pool_id: second.pool_id.clone(),
+                side: second.side,
                 input_amount: second.input_amount,
                 min_output_amount: second.output_amount,
+                current_tick_index: second.current_tick_index,
             },
         ]
     }

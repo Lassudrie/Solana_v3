@@ -32,6 +32,31 @@ pub struct AccountUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolSnapshotUpdate {
+    pub pool_id: String,
+    pub price_bps: u64,
+    pub fee_bps: u16,
+    pub reserve_depth: u64,
+    pub reserve_a: Option<u64>,
+    pub reserve_b: Option<u64>,
+    pub active_liquidity: Option<u64>,
+    pub sqrt_price_x64: Option<u128>,
+    pub exact: Option<bool>,
+    pub repair_pending: Option<bool>,
+    pub token_mint_a: String,
+    pub token_mint_b: String,
+    pub tick_spacing: u16,
+    pub current_tick_index: Option<i32>,
+    pub slot: u64,
+    pub write_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolInvalidation {
+    pub pool_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotBoundary {
     pub slot: u64,
     pub leader: Option<String>,
@@ -46,6 +71,8 @@ pub struct Heartbeat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarketEvent {
     AccountUpdate(AccountUpdate),
+    PoolSnapshotUpdate(PoolSnapshotUpdate),
+    PoolInvalidation(PoolInvalidation),
     SlotBoundary(SlotBoundary),
     Heartbeat(Heartbeat),
 }
@@ -64,9 +91,51 @@ impl NormalizedEvent {
         observed_slot: u64,
         update: AccountUpdate,
     ) -> Self {
+        Self::with_payload(
+            source,
+            sequence,
+            observed_slot,
+            MarketEvent::AccountUpdate(update),
+        )
+    }
+
+    pub fn pool_snapshot_update(
+        source: EventSourceKind,
+        sequence: u64,
+        observed_slot: u64,
+        update: PoolSnapshotUpdate,
+    ) -> Self {
+        Self::with_payload(
+            source,
+            sequence,
+            observed_slot,
+            MarketEvent::PoolSnapshotUpdate(update),
+        )
+    }
+
+    pub fn pool_invalidation(
+        source: EventSourceKind,
+        sequence: u64,
+        observed_slot: u64,
+        invalidation: PoolInvalidation,
+    ) -> Self {
+        Self::with_payload(
+            source,
+            sequence,
+            observed_slot,
+            MarketEvent::PoolInvalidation(invalidation),
+        )
+    }
+
+    pub fn with_payload(
+        source: EventSourceKind,
+        sequence: u64,
+        observed_slot: u64,
+        payload: MarketEvent,
+    ) -> Self {
         let now = SystemTime::now();
         Self {
-            payload: MarketEvent::AccountUpdate(update),
+            payload,
             source: SourceMetadata {
                 source,
                 sequence,

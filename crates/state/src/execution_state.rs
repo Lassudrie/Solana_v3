@@ -2,6 +2,7 @@ use crate::types::{ExecutionStateSnapshot, LookupTableSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionState {
+    rpc_slot: Option<u64>,
     latest_blockhash: Option<String>,
     blockhash_slot: Option<u64>,
     alt_revision: u64,
@@ -14,6 +15,7 @@ pub struct ExecutionState {
 impl Default for ExecutionState {
     fn default() -> Self {
         Self {
+            rpc_slot: None,
             latest_blockhash: None,
             blockhash_slot: None,
             alt_revision: 0,
@@ -29,6 +31,7 @@ impl ExecutionState {
     pub fn snapshot(&self, head_slot: u64) -> ExecutionStateSnapshot {
         ExecutionStateSnapshot {
             head_slot,
+            rpc_slot: self.rpc_slot,
             latest_blockhash: self.latest_blockhash.clone(),
             blockhash_slot: self.blockhash_slot,
             alt_revision: self.alt_revision,
@@ -42,6 +45,10 @@ impl ExecutionState {
     pub fn set_blockhash(&mut self, blockhash: impl Into<String>, slot: u64) {
         self.latest_blockhash = Some(blockhash.into());
         self.blockhash_slot = Some(slot);
+    }
+
+    pub fn set_rpc_slot(&mut self, slot: u64) {
+        self.rpc_slot = Some(self.rpc_slot.unwrap_or(0).max(slot));
     }
 
     pub fn set_wallet_state(&mut self, balance_lamports: u64, ready: bool) {

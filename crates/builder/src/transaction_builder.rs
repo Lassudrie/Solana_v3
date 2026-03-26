@@ -2,7 +2,7 @@ use std::{collections::HashMap, str::FromStr};
 
 use bincode::serialize;
 use solana_sdk::{
-    hash::Hash,
+    hash::{Hash, hashv},
     instruction::{AccountMeta, Instruction},
     message::{AddressLookupTableAccount, Message, VersionedMessage, v0},
     pubkey::Pubkey,
@@ -11,8 +11,8 @@ use solana_system_interface::instruction;
 
 use crate::{
     execution::{
-        ExecutionRegistry, MessageMode, OrcaSimplePoolConfig, RaydiumSimplePoolConfig,
-        RouteExecutionConfig, VenueExecutionConfig,
+        ExecutionRegistry, MessageMode, OrcaSimplePoolConfig, OrcaWhirlpoolConfig,
+        RaydiumClmmConfig, RaydiumSimplePoolConfig, RouteExecutionConfig, VenueExecutionConfig,
     },
     templates::AtomicTwoLegTemplate,
     types::{
@@ -26,8 +26,11 @@ const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
 const DEFAULT_JITO_TIP_ACCOUNT: &str = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5";
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
+const ORCA_WHIRLPOOL_TICK_ARRAY_SIZE: i32 = 88;
+const RAYDIUM_CLMM_TICK_ARRAY_SIZE: i32 = 60;
 
 pub trait TransactionBuilder: Send + Sync {
     fn build(&self, request: BuildRequest) -> BuildResult;
@@ -274,8 +277,14 @@ fn compile_leg_instruction(
         VenueExecutionConfig::OrcaSimplePool(config) => {
             compile_orca_simple_pool(config, fee_payer, leg_plan)
         }
+        VenueExecutionConfig::OrcaWhirlpool(config) => {
+            compile_orca_whirlpool(config, fee_payer, leg_plan)
+        }
         VenueExecutionConfig::RaydiumSimplePool(config) => {
             compile_raydium_simple_pool(config, fee_payer, leg_plan)
+        }
+        VenueExecutionConfig::RaydiumClmm(config) => {
+            compile_raydium_clmm(config, fee_payer, leg_plan)
         }
     }
 }
@@ -344,6 +353,144 @@ fn compile_raydium_simple_pool(
             AccountMeta::new(parse_pubkey(&config.user_destination_token_account)?, false),
             AccountMeta::new_readonly(fee_payer, true),
         ],
+        data,
+    })
+}
+
+fn compile_orca_whirlpool(
+    config: &OrcaWhirlpoolConfig,
+    fee_payer: Pubkey,
+    leg_plan: &AtomicLegPlan,
+) -> Result<Instruction, BuildRejectionReason> {
+    let current_tick_index = leg_plan
+        .current_tick_index
+        .ok_or(BuildRejectionReason::MissingExecutionHint)?;
+    let token_program_id = parse_pubkey(&config.token_program_id)?;
+    let token_mint_a = parse_pubkey(&config.token_mint_a)?;
+    let token_mint_b = parse_pubkey(&config.token_mint_b)?;
+    let whirlpool = parse_pubkey(&config.whirlpool)?;
+    let program_id = parse_pubkey(&config.program_id)?;
+    let user_token_account_a =
+        associated_token_address(&fee_payer, &token_mint_a, &token_program_id);
+    let user_token_account_b =
+        associated_token_address(&fee_payer, &token_mint_b, &token_program_id);
+    let tick_arrays = derive_orca_tick_arrays(
+        program_id,
+        whirlpool,
+        config.tick_spacing,
+        current_tick_index,
+        config.a_to_b,
+    );
+    let oracle = derive_orca_oracle(program_id, whirlpool);
+
+    let mut data = anchor_instruction_data("swap");
+    data.extend_from_slice(&leg_plan.input_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.min_output_amount.to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes());
+    data.push(1);
+    data.push(u8::from(config.a_to_b));
+
+    Ok(Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new_readonly(token_program_id, false),
+            AccountMeta::new_readonly(fee_payer, true),
+            AccountMeta::new(whirlpool, false),
+            AccountMeta::new(user_token_account_a, false),
+            AccountMeta::new(parse_pubkey(&config.token_vault_a)?, false),
+            AccountMeta::new(user_token_account_b, false),
+            AccountMeta::new(parse_pubkey(&config.token_vault_b)?, false),
+            AccountMeta::new(tick_arrays[0], false),
+            AccountMeta::new(tick_arrays[1], false),
+            AccountMeta::new(tick_arrays[2], false),
+            AccountMeta::new_readonly(oracle, false),
+        ],
+        data,
+    })
+}
+
+fn compile_raydium_clmm(
+    config: &RaydiumClmmConfig,
+    fee_payer: Pubkey,
+    leg_plan: &AtomicLegPlan,
+) -> Result<Instruction, BuildRejectionReason> {
+    let current_tick_index = leg_plan
+        .current_tick_index
+        .ok_or(BuildRejectionReason::MissingExecutionHint)?;
+    let token_program_id = parse_pubkey(&config.token_program_id)?;
+    let token_mint_0 = parse_pubkey(&config.token_mint_0)?;
+    let token_mint_1 = parse_pubkey(&config.token_mint_1)?;
+    let pool_state = parse_pubkey(&config.pool_state)?;
+    let program_id = parse_pubkey(&config.program_id)?;
+    let user_token_account_0 =
+        associated_token_address(&fee_payer, &token_mint_0, &token_program_id);
+    let user_token_account_1 =
+        associated_token_address(&fee_payer, &token_mint_1, &token_program_id);
+    let (
+        input_token_account,
+        output_token_account,
+        input_vault,
+        output_vault,
+        input_mint,
+        output_mint,
+    ) = if config.zero_for_one {
+        (
+            user_token_account_0,
+            user_token_account_1,
+            parse_pubkey(&config.token_vault_0)?,
+            parse_pubkey(&config.token_vault_1)?,
+            token_mint_0,
+            token_mint_1,
+        )
+    } else {
+        (
+            user_token_account_1,
+            user_token_account_0,
+            parse_pubkey(&config.token_vault_1)?,
+            parse_pubkey(&config.token_vault_0)?,
+            token_mint_1,
+            token_mint_0,
+        )
+    };
+    let tick_arrays = derive_raydium_tick_arrays(
+        program_id,
+        pool_state,
+        config.tick_spacing,
+        current_tick_index,
+        config.zero_for_one,
+    );
+
+    let mut data = anchor_instruction_data("swap_v2");
+    data.extend_from_slice(&leg_plan.input_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.min_output_amount.to_le_bytes());
+    data.extend_from_slice(&0u128.to_le_bytes());
+    data.push(1);
+
+    let mut accounts = vec![
+        AccountMeta::new_readonly(fee_payer, true),
+        AccountMeta::new_readonly(parse_pubkey(&config.amm_config)?, false),
+        AccountMeta::new(pool_state, false),
+        AccountMeta::new(input_token_account, false),
+        AccountMeta::new(output_token_account, false),
+        AccountMeta::new(input_vault, false),
+        AccountMeta::new(output_vault, false),
+        AccountMeta::new(parse_pubkey(&config.observation_state)?, false),
+        AccountMeta::new_readonly(token_program_id, false),
+        AccountMeta::new_readonly(parse_pubkey(&config.token_program_2022_id)?, false),
+        AccountMeta::new_readonly(parse_pubkey(&config.memo_program_id)?, false),
+        AccountMeta::new_readonly(input_mint, false),
+        AccountMeta::new_readonly(output_mint, false),
+    ];
+    if let Some(ex_bitmap_account) = &config.ex_bitmap_account {
+        accounts.push(AccountMeta::new(parse_pubkey(ex_bitmap_account)?, false));
+    }
+    for tick_array in tick_arrays {
+        accounts.push(AccountMeta::new(tick_array, false));
+    }
+
+    Ok(Instruction {
+        program_id,
+        accounts,
         data,
     })
 }
@@ -436,6 +583,89 @@ fn parse_pubkey(value: &str) -> Result<Pubkey, BuildRejectionReason> {
 
 fn parse_static_pubkey(value: &str) -> Pubkey {
     Pubkey::from_str(value).expect("static Solana address should parse")
+}
+
+fn anchor_instruction_data(name: &str) -> Vec<u8> {
+    let preimage = format!("global:{name}");
+    let hash = hashv(&[preimage.as_bytes()]);
+    hash.to_bytes()[..8].to_vec()
+}
+
+fn associated_token_address(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID),
+    )
+    .0
+}
+
+fn derive_orca_tick_arrays(
+    program_id: Pubkey,
+    whirlpool: Pubkey,
+    tick_spacing: u16,
+    current_tick_index: i32,
+    a_to_b: bool,
+) -> [Pubkey; 3] {
+    let offsets = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
+    offsets.map(|offset| {
+        let start_tick_index = tick_array_start_index(
+            current_tick_index,
+            tick_spacing,
+            ORCA_WHIRLPOOL_TICK_ARRAY_SIZE,
+            offset,
+        );
+        Pubkey::find_program_address(
+            &[
+                b"tick_array",
+                whirlpool.as_ref(),
+                start_tick_index.to_string().as_bytes(),
+            ],
+            &program_id,
+        )
+        .0
+    })
+}
+
+fn derive_orca_oracle(program_id: Pubkey, whirlpool: Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"oracle", whirlpool.as_ref()], &program_id).0
+}
+
+fn derive_raydium_tick_arrays(
+    program_id: Pubkey,
+    pool_state: Pubkey,
+    tick_spacing: u16,
+    current_tick_index: i32,
+    zero_for_one: bool,
+) -> [Pubkey; 3] {
+    let offsets = if zero_for_one { [0, -1, -2] } else { [0, 1, 2] };
+    offsets.map(|offset| {
+        let start_tick_index = tick_array_start_index(
+            current_tick_index,
+            tick_spacing,
+            RAYDIUM_CLMM_TICK_ARRAY_SIZE,
+            offset,
+        );
+        Pubkey::find_program_address(
+            &[
+                b"tick_array",
+                pool_state.as_ref(),
+                &start_tick_index.to_be_bytes(),
+            ],
+            &program_id,
+        )
+        .0
+    })
+}
+
+fn tick_array_start_index(
+    current_tick_index: i32,
+    tick_spacing: u16,
+    tick_array_size: i32,
+    offset: i32,
+) -> i32 {
+    let ticks_in_array = i32::from(tick_spacing) * tick_array_size;
+    let real_index = current_tick_index.div_euclid(ticks_in_array);
+    (real_index + offset) * ticks_in_array
 }
 
 fn effective_u32(value: u32, default_value: u32) -> u32 {

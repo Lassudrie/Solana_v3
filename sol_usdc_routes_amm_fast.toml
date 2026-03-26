@@ -1,0 +1,146 @@
+[routes]
+
+# AMM-only ultra-fast route template.
+# Raydium Standard AMM v4 SOL/USDC keys are sourced from the official Raydium API:
+# https://api-v3.raydium.io/pools/key/ids?ids=58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2
+#
+# Orca's current official docs expose Splash/Whirlpool flows. The legacy simple-pool leg
+# below stays disabled until a compatible official Orca pool is confirmed for OrcaSimplePool.
+
+[[routes.definitions]]
+enabled = false
+route_class = "amm_fast_path"
+route_id = "sol-usdc-rayv4-orca-legacy"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+default_trade_size = 1000000
+max_trade_size = 5000000
+size_ladder = [250000, 500000, 1000000, 2000000, 3000000, 5000000]
+
+[[routes.definitions.legs]]
+venue = "raydium"
+pool_id = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+side = "buy_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_simple_pool"
+program_id = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+amm_pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+amm_authority = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"
+amm_open_orders = "HmiHHzq4Fym9e1D4qzLS6LDDM3tNsCTBPDWHTLZ763jY"
+amm_coin_vault = "DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz"
+amm_pc_vault = "HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz"
+market_program = "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"
+market = "8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6"
+market_bids = "5jWUncPNBMZJ3sTHKmMLszypVkoRK6bfEQMQUHweeQnh"
+market_asks = "EaXdHx7x3mdGA38j5RSmKYSXMzAFzzUXCLNBEDXDn1d5"
+market_event_queue = "8CvwxZ9Db6XbLD46NZwwmVDZZRDy7eydFcAGkXKh9axa"
+market_coin_vault = "CKxTHwM9fPMRRvZmFnFoqKNd9pQR21c5Aq9bh5h9oghX"
+market_pc_vault = "6A5NHCj1yF6urc9wZNe6Bcjj4LVszQNj5DwAWG97yzMu"
+market_vault_signer = "CTz5UMLQm2SRWHzQnU62Pi4yJqbNGjgRBHqqp6oDHfF7"
+user_source_token_account = "REPLACE_WITH_WALLET_USDC_ATA"
+user_destination_token_account = "REPLACE_WITH_WALLET_WSOL_ATA"
+
+[[routes.definitions.legs]]
+venue = "orca"
+pool_id = "REPLACE_WITH_ORCA_SIMPLE_SOL_USDC_POOL"
+side = "sell_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_simple_pool"
+program_id = "REPLACE_WITH_ORCA_SIMPLE_PROGRAM"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+swap_account = "REPLACE_WITH_ORCA_SWAP_ACCOUNT"
+authority = "REPLACE_WITH_ORCA_AUTHORITY"
+pool_source_token_account = "REPLACE_WITH_ORCA_POOL_SOURCE"
+pool_destination_token_account = "REPLACE_WITH_ORCA_POOL_DESTINATION"
+pool_mint = "REPLACE_WITH_ORCA_LP_MINT"
+fee_account = "REPLACE_WITH_ORCA_FEE_ACCOUNT"
+user_source_token_account = "REPLACE_WITH_WALLET_WSOL_ATA"
+user_destination_token_account = "REPLACE_WITH_WALLET_USDC_ATA"
+host_fee_account = ""
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 25000
+default_jito_tip_lamports = 5000
+max_quote_slot_lag = 2
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8rG5WFRriQYz3SiYSjB2V7TVCqJiTfur23foeRkWLD67"
+
+[[routes.definitions]]
+enabled = false
+route_class = "amm_fast_path"
+route_id = "sol-usdc-orca-legacy-rayv4"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+default_trade_size = 1000000
+max_trade_size = 5000000
+size_ladder = [250000, 500000, 1000000, 2000000, 3000000, 5000000]
+
+[[routes.definitions.legs]]
+venue = "orca"
+pool_id = "REPLACE_WITH_ORCA_SIMPLE_SOL_USDC_POOL"
+side = "buy_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_simple_pool"
+program_id = "REPLACE_WITH_ORCA_SIMPLE_PROGRAM"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+swap_account = "REPLACE_WITH_ORCA_SWAP_ACCOUNT"
+authority = "REPLACE_WITH_ORCA_AUTHORITY"
+pool_source_token_account = "REPLACE_WITH_ORCA_POOL_SOURCE"
+pool_destination_token_account = "REPLACE_WITH_ORCA_POOL_DESTINATION"
+pool_mint = "REPLACE_WITH_ORCA_LP_MINT"
+fee_account = "REPLACE_WITH_ORCA_FEE_ACCOUNT"
+user_source_token_account = "REPLACE_WITH_WALLET_USDC_ATA"
+user_destination_token_account = "REPLACE_WITH_WALLET_WSOL_ATA"
+host_fee_account = ""
+
+[[routes.definitions.legs]]
+venue = "raydium"
+pool_id = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+side = "sell_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_simple_pool"
+program_id = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+amm_pool = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+amm_authority = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1"
+amm_open_orders = "HmiHHzq4Fym9e1D4qzLS6LDDM3tNsCTBPDWHTLZ763jY"
+amm_coin_vault = "DQyrAcCrDXQ7NeoqGgDCZwBvWDcYmFCjSb9JtteuvPpz"
+amm_pc_vault = "HLmqeL62xR1QoZ1HKKbXRrdN1p3phKpxRMb2VVopvBBz"
+market_program = "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"
+market = "8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6"
+market_bids = "5jWUncPNBMZJ3sTHKmMLszypVkoRK6bfEQMQUHweeQnh"
+market_asks = "EaXdHx7x3mdGA38j5RSmKYSXMzAFzzUXCLNBEDXDn1d5"
+market_event_queue = "8CvwxZ9Db6XbLD46NZwwmVDZZRDy7eydFcAGkXKh9axa"
+market_coin_vault = "CKxTHwM9fPMRRvZmFnFoqKNd9pQR21c5Aq9bh5h9oghX"
+market_pc_vault = "6A5NHCj1yF6urc9wZNe6Bcjj4LVszQNj5DwAWG97yzMu"
+market_vault_signer = "CTz5UMLQm2SRWHzQnU62Pi4yJqbNGjgRBHqqp6oDHfF7"
+user_source_token_account = "REPLACE_WITH_WALLET_WSOL_ATA"
+user_destination_token_account = "REPLACE_WITH_WALLET_USDC_ATA"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 25000
+default_jito_tip_lamports = 5000
+max_quote_slot_lag = 2
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8rG5WFRriQYz3SiYSjB2V7TVCqJiTfur23foeRkWLD67"

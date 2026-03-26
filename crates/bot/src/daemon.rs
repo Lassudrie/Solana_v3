@@ -2,16 +2,17 @@ use std::{
     collections::BTreeSet,
     path::PathBuf,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use detection::{EventSourceKind, IngestError, MarketEventSource, NormalizedEvent};
 use thiserror::Error;
 
 use crate::{
-    bootstrap::bootstrap,
+    bootstrap::{BootstrapError, bootstrap},
     config::{BotConfig, RuntimeControlConfig},
     control::{RuntimeIssue, RuntimeMode, RuntimeStatus, SharedRuntimeStatus},
+    observer::ObserverHandle,
     refresh::AsyncStateRefresher,
     runtime::BotRuntime,
     sources::{EventSourceConfigError, build_event_source},
@@ -24,6 +25,8 @@ pub enum DaemonExit {
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
+    #[error(transparent)]
+    Bootstrap(#[from] BootstrapError),
     #[error(transparent)]
     EventSourceConfig(#[from] EventSourceConfigError),
     #[error("failed to start health server on {bind_address}: {source}")]
@@ -39,18 +42,23 @@ pub struct BotDaemon {
     refresher: AsyncStateRefresher,
     source: Box<dyn MarketEventSource>,
     status: SharedRuntimeStatus,
+    observer: ObserverHandle,
     control: RuntimeControlConfig,
     kill_switch_sentinel_path: Option<PathBuf>,
     min_wallet_balance_lamports: u64,
     max_blockhash_slot_lag: u64,
+    reconciliation_poll_interval: Duration,
+    last_reconcile_at: Option<Instant>,
     last_shredstream_sequence: Option<u64>,
     last_shredstream_seen_at: Option<SystemTime>,
 }
 
 impl BotDaemon {
     pub fn from_config(config: BotConfig) -> Result<Self, DaemonError> {
-        let source = build_event_source(&config.runtime.event_source, &config.shredstream)?;
-        let mut runtime = bootstrap(config.clone());
+        let mut config = config;
+        config.apply_runtime_profile_defaults();
+        let source = build_event_source(&config)?;
+        let mut runtime = bootstrap(config.clone())?;
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
         let lookup_table_keys = config
             .routes
@@ -80,12 +88,20 @@ impl BotDaemon {
                 source,
             });
         }
+        let observer =
+            ObserverHandle::spawn(&config.runtime.monitor_server, &config).map_err(|source| {
+                DaemonError::HealthServer {
+                    bind_address: config.runtime.monitor_server.bind_address.clone(),
+                    source,
+                }
+            })?;
 
         let daemon = Self {
             runtime,
             refresher,
             source,
             status,
+            observer,
             control: config.runtime.control.clone(),
             kill_switch_sentinel_path: config
                 .runtime
@@ -95,6 +111,10 @@ impl BotDaemon {
                 .map(PathBuf::from),
             min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
             max_blockhash_slot_lag: config.strategy.max_blockhash_slot_lag,
+            reconciliation_poll_interval: Duration::from_millis(
+                config.reconciliation.poll_interval_millis,
+            ),
+            last_reconcile_at: None,
             last_shredstream_sequence: None,
             last_shredstream_seen_at: None,
         };
@@ -110,6 +130,7 @@ impl BotDaemon {
         loop {
             self.runtime
                 .apply_async_refresh(self.refresher.drain_snapshot());
+            self.reconcile_if_due();
             let kill_switch_active = self.refresh_kill_switch();
             if kill_switch_active {
                 self.refresh_status(None, Some(RuntimeIssue::KillSwitchActive), None);
@@ -125,21 +146,26 @@ impl BotDaemon {
                         if event.source.source == EventSourceKind::ShredStream {
                             self.record_shredstream_metrics(&event);
                         }
-                        if let Err(error) = self.runtime.process_event(event) {
-                            let detail = error.to_string();
-                            self.refresh_status(
-                                Some(RuntimeMode::Degraded),
-                                Some(RuntimeIssue::RuntimeFailure {
-                                    detail: detail.clone(),
-                                }),
-                                Some(detail),
-                            );
-                        } else {
-                            self.refresh_status(None, None, None);
+                        match self.runtime.process_event(event) {
+                            Ok(report) => {
+                                self.observer.publish_hot_path(report);
+                                self.refresh_status(None, None, None);
+                            }
+                            Err(error) => {
+                                let detail = error.to_string();
+                                self.refresh_status(
+                                    Some(RuntimeMode::Degraded),
+                                    Some(RuntimeIssue::RuntimeFailure {
+                                        detail: detail.clone(),
+                                    }),
+                                    Some(detail),
+                                );
+                            }
                         }
                     }
                     Ok(None) => break,
                     Err(IngestError::Exhausted { .. }) => {
+                        self.reconcile_now();
                         self.refresh_status(
                             Some(RuntimeMode::Stopped),
                             Some(RuntimeIssue::EventSourceExhausted),
@@ -162,8 +188,42 @@ impl BotDaemon {
             }
 
             if processed == 0 {
-                thread::sleep(Duration::from_millis(self.control.idle_sleep_millis));
+                if self.control.idle_sleep_millis == 0 {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(Duration::from_millis(self.control.idle_sleep_millis));
+                }
             }
+        }
+    }
+
+    fn reconcile_if_due(&mut self) {
+        if !self.reconciliation_due() {
+            return;
+        }
+
+        self.reconcile_now();
+    }
+
+    fn reconcile_now(&mut self) {
+        let observed_slot = self.runtime.latest_slot();
+        let transitions = self.runtime.reconcile(observed_slot);
+        for transition in transitions {
+            if let Some(record) = self.runtime.execution_record(&transition.submission_id) {
+                self.observer.publish_trade_update(record);
+            }
+        }
+        self.last_reconcile_at = Some(Instant::now());
+    }
+
+    fn reconciliation_due(&self) -> bool {
+        if self.reconciliation_poll_interval == Duration::ZERO {
+            return true;
+        }
+
+        match self.last_reconcile_at {
+            None => true,
+            Some(last) => last.elapsed() >= self.reconciliation_poll_interval,
         }
     }
 
@@ -228,9 +288,7 @@ impl BotDaemon {
         let execution_state = self.runtime.execution_state();
         let total_routes = self.runtime.route_count();
         let ready_routes = self.runtime.ready_route_count();
-        let blockhash_slot_lag = execution_state
-            .blockhash_slot
-            .map(|slot| execution_state.head_slot.saturating_sub(slot));
+        let blockhash_slot_lag = execution_state.blockhash_slot_lag();
         let derived_issue = issue_override.or_else(|| {
             if execution_state.kill_switch_enabled {
                 return Some(RuntimeIssue::KillSwitchActive);
@@ -282,13 +340,14 @@ impl BotDaemon {
             }
         });
 
-        self.status.replace(RuntimeStatus {
+        let snapshot = RuntimeStatus {
             mode,
             live: true,
             ready,
             issue: derived_issue,
             kill_switch_active: execution_state.kill_switch_enabled,
             latest_slot: self.runtime.latest_slot(),
+            rpc_slot: execution_state.rpc_slot,
             total_routes,
             ready_routes,
             inflight_submissions: self.runtime.pending_submissions(),
@@ -304,19 +363,29 @@ impl BotDaemon {
                 .duration_since(UNIX_EPOCH)
                 .expect("system clock before unix epoch")
                 .as_millis(),
-        });
+        };
+        self.status.replace(snapshot.clone());
+        self.observer.publish_status(snapshot);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::{Value, json};
     use solana_sdk::{hash::hashv, pubkey::Pubkey, signer::keypair::Keypair};
-    use std::{env, fs, path::PathBuf};
+    use std::{
+        env, fs,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        path::PathBuf,
+        sync::Arc,
+        thread,
+    };
 
     use crate::config::{
         AccountDependencyConfig, BotConfig, EventSourceMode, MessageModeConfig,
-        OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteConfig,
-        RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
+        OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteClassConfig,
+        RouteConfig, RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
         SwapSideConfig,
     };
 
@@ -329,8 +398,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("acct-a", 1, 10_150),
-                replay_event("acct-b", 2, 10_080)
+                replay_event("acct-a", 1, 12_000),
+                replay_event("acct-b", 2, 12_000)
             ),
         )
         .unwrap();
@@ -359,8 +428,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("acct-a", 1, 10_150),
-                replay_event("acct-b", 2, 10_080)
+                replay_event("acct-a", 1, 12_000),
+                replay_event("acct-b", 2, 12_000)
             ),
         )
         .unwrap();
@@ -383,27 +452,78 @@ mod tests {
         let _ = fs::remove_file(kill_switch);
     }
 
+    #[test]
+    fn daemon_reconciles_pending_submissions_during_idle_loop() {
+        let path = temp_path("bot-daemon-reconcile", "jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                replay_event("acct-a", 1, 12_000),
+                replay_event("acct-b", 2, 12_000)
+            ),
+        )
+        .unwrap();
+
+        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getSignatureStatuses" => {
+                    json!({ "result": { "value": [{ "slot": 99, "err": null }] } }).to_string()
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let mut config = bot_config(path.to_string_lossy().into_owned());
+        config.runtime.health_server.enabled = false;
+        config.reconciliation.rpc_http_endpoint = rpc_endpoint;
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        config.reconciliation.websocket_enabled = false;
+        config.reconciliation.poll_interval_millis = 0;
+        let mut daemon = BotDaemon::from_config(config).unwrap();
+
+        let exit = daemon.run().unwrap();
+        let status = daemon.status_snapshot();
+
+        assert_eq!(exit, DaemonExit::SourceExhausted);
+        assert_eq!(status.metrics.submit_count, 1);
+        assert_eq!(status.metrics.inclusion_count, 1);
+        assert_eq!(status.inflight_submissions, 0);
+
+        let _ = fs::remove_file(path);
+    }
+
     fn bot_config(path: String) -> BotConfig {
         let mut config = BotConfig::default();
         let keypair = Keypair::new_from_array([7; 32]);
         config.jito.endpoint = "mock://jito".into();
         config.jito.ws_endpoint = "mock://jito-tip-stream".into();
+        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
         config.runtime.refresh.enabled = false;
         config.signing.keypair_base58 = Some(keypair.to_base58_string());
         config.routes = RoutesConfig {
             definitions: vec![RouteConfig {
+                enabled: true,
+                route_class: RouteClassConfig::AmmFastPath,
                 route_id: "route-a".into(),
                 input_mint: "USDC".into(),
                 output_mint: "USDC".into(),
+                base_mint: None,
+                quote_mint: None,
                 default_trade_size: 10_000,
                 max_trade_size: 20_000,
+                size_ladder: Vec::new(),
                 legs: [
                     RouteLegConfig {
                         venue: "orca".into(),
                         pool_id: "pool-a".into(),
                         side: SwapSideConfig::BuyBase,
+                        fee_bps: None,
                         execution: RouteLegExecutionConfig::OrcaSimplePool(
                             OrcaSimplePoolLegExecutionConfig {
                                 program_id: test_pubkey("orca-program"),
@@ -426,6 +546,7 @@ mod tests {
                         venue: "raydium".into(),
                         pool_id: "pool-b".into(),
                         side: SwapSideConfig::SellBase,
+                        fee_bps: None,
                         execution: RouteLegExecutionConfig::RaydiumSimplePool(
                             RaydiumSimplePoolLegExecutionConfig {
                                 program_id: test_pubkey("raydium-program"),
@@ -517,5 +638,82 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time went backwards")
             .as_nanos()
+    }
+
+    fn spawn_mock_rpc_server<F>(handler: F) -> String
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc server");
+        let address = listener.local_addr().expect("mock rpc address");
+        let handler = Arc::new(handler);
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let body = read_http_body(&mut stream);
+                let response_body = (handler.as_ref())(&body);
+                write_http_response(&mut stream, &response_body);
+            }
+        });
+
+        format!("http://{address}")
+    }
+
+    fn read_http_body(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let bytes_read = stream.read(&mut buffer).expect("read mock request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+
+            if header_end.is_none() {
+                header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4);
+                if let Some(end) = header_end {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or(0);
+                }
+            }
+
+            if let Some(end) = header_end {
+                if request.len() >= end + content_length {
+                    let body = &request[end..end + content_length];
+                    return String::from_utf8_lossy(body).into_owned();
+                }
+            }
+        }
+
+        String::new()
+    }
+
+    fn write_http_response(stream: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write mock response");
     }
 }

@@ -15,7 +15,7 @@ use tungstenite::{
 
 use crate::{
     classifier::FailureClass,
-    tracker::{ExecutionRecord, ExecutionTracker, InclusionStatus},
+    tracker::{ExecutionRecord, ExecutionTracker, ExecutionTransition, InclusionStatus},
 };
 
 const MOCK_SCHEME: &str = "mock://";
@@ -80,57 +80,65 @@ impl OnChainReconciler {
         })
     }
 
-    pub fn tick(&mut self, tracker: &mut ExecutionTracker, observed_slot: u64) {
+    pub fn tick(
+        &mut self,
+        tracker: &mut ExecutionTracker,
+        observed_slot: u64,
+    ) -> Vec<ExecutionTransition> {
         if !self.config.enabled {
-            return;
+            return Vec::new();
         }
 
-        self.expire_stale_submissions(tracker, observed_slot);
+        let mut transitions = self.expire_stale_submissions(tracker, observed_slot);
         let mut pending = tracker.pending_records();
         if pending.is_empty() {
-            return;
+            return transitions;
         }
 
         if self.config.websocket_enabled {
             self.ws.ensure_subscriptions(&pending);
-            self.ws.drain_notifications(tracker);
+            transitions.extend(self.ws.drain_notifications(tracker));
         }
 
         pending = tracker.pending_records();
         if pending.is_empty() {
-            return;
+            return transitions;
         }
 
-        self.poll_transaction_statuses(tracker, &pending);
-        self.poll_bundle_statuses(tracker, &pending, observed_slot);
-        self.advance_submitted_to_pending(tracker);
+        transitions.extend(self.poll_transaction_statuses(tracker, &pending));
+        transitions.extend(self.poll_bundle_statuses(tracker, &pending));
+        transitions
     }
 
-    fn expire_stale_submissions(&self, tracker: &mut ExecutionTracker, observed_slot: u64) {
+    fn expire_stale_submissions(
+        &self,
+        tracker: &mut ExecutionTracker,
+        observed_slot: u64,
+    ) -> Vec<ExecutionTransition> {
+        let mut transitions = Vec::new();
         for record in tracker.pending_records() {
             if observed_slot.saturating_sub(record.build_slot) > self.config.max_pending_slots {
-                let _ = tracker.transition(
+                if let Some(transition) = tracker.transition(
                     &record.submission_id,
                     InclusionStatus::Expired { observed_slot },
-                );
+                ) {
+                    transitions.push(transition);
+                }
             }
         }
+        transitions
     }
 
     fn poll_transaction_statuses(
         &mut self,
         tracker: &mut ExecutionTracker,
         pending: &[ExecutionRecord],
-    ) {
-        let single_records = pending
-            .iter()
-            .filter(|record| record.submit_mode == SubmitMode::SingleTransaction)
-            .cloned()
-            .collect::<Vec<_>>();
-        for batch in single_records.chunks(SIGNATURE_STATUS_BATCH_LIMIT) {
+    ) -> Vec<ExecutionTransition> {
+        let mut transitions = Vec::new();
+        for batch in pending.chunks(SIGNATURE_STATUS_BATCH_LIMIT) {
             let signatures = batch
                 .iter()
-                .map(|record| record.submission_id.0.clone())
+                .map(|record| record.chain_signature.clone())
                 .collect::<Vec<_>>();
             let Some(statuses) = self
                 .rpc
@@ -141,29 +149,34 @@ impl OnChainReconciler {
             for (record, status) in batch.iter().zip(statuses.into_iter()) {
                 match status {
                     Some(status) if status.err.is_some() => {
-                        let _ = tracker.transition(
+                        if let Some(transition) = tracker.transition(
                             &record.submission_id,
                             InclusionStatus::Failed(FailureClass::ChainExecutionFailed),
-                        );
+                        ) {
+                            transitions.push(transition);
+                        }
                     }
                     Some(status) => {
-                        let _ = tracker.transition(
+                        if let Some(transition) = tracker.transition(
                             &record.submission_id,
                             InclusionStatus::Landed { slot: status.slot },
-                        );
+                        ) {
+                            transitions.push(transition);
+                        }
                     }
                     None => {}
                 }
             }
         }
+        transitions
     }
 
     fn poll_bundle_statuses(
         &self,
         tracker: &mut ExecutionTracker,
         pending: &[ExecutionRecord],
-        observed_slot: u64,
-    ) {
+    ) -> Vec<ExecutionTransition> {
+        let mut transitions = Vec::new();
         let mut by_endpoint = HashMap::<String, Vec<ExecutionRecord>>::new();
         for record in pending
             .iter()
@@ -198,36 +211,28 @@ impl OnChainReconciler {
                     };
                     match status.status.as_str() {
                         "Pending" => {}
-                        "Landed" => {
-                            let _ = tracker.transition(
-                                &record.submission_id,
-                                InclusionStatus::Landed {
-                                    slot: status.landed_slot.unwrap_or(observed_slot),
-                                },
-                            );
-                        }
+                        "Landed" => {}
                         "Failed" | "Invalid" => {
-                            let _ =
-                                tracker.transition(&record.submission_id, InclusionStatus::Dropped);
+                            if let Some(transition) = tracker.transition(
+                                &record.submission_id,
+                                InclusionStatus::Failed(FailureClass::TransportFailed),
+                            ) {
+                                transitions.push(transition);
+                            }
                         }
                         _ => {
-                            let _ = tracker.transition(
+                            if let Some(transition) = tracker.transition(
                                 &record.submission_id,
                                 InclusionStatus::Failed(FailureClass::Unknown),
-                            );
+                            ) {
+                                transitions.push(transition);
+                            }
                         }
                     }
                 }
             }
         }
-    }
-
-    fn advance_submitted_to_pending(&self, tracker: &mut ExecutionTracker) {
-        for record in tracker.pending_records() {
-            if record.inclusion_status == InclusionStatus::Submitted {
-                let _ = tracker.transition(&record.submission_id, InclusionStatus::Pending);
-            }
-        }
+        transitions
     }
 }
 
@@ -346,10 +351,7 @@ impl SignatureWsClient {
             return;
         }
 
-        for record in records
-            .iter()
-            .filter(|record| record.submit_mode == SubmitMode::SingleTransaction)
-        {
+        for record in records {
             if self.tracked_submissions.contains(&record.submission_id) {
                 continue;
             }
@@ -361,7 +363,7 @@ impl SignatureWsClient {
                 "id": request_id,
                 "method": "signatureSubscribe",
                 "params": [
-                    record.submission_id.0,
+                    record.chain_signature.clone(),
                     {
                         "commitment": "confirmed",
                         "enableReceivedNotification": true
@@ -385,21 +387,26 @@ impl SignatureWsClient {
         }
     }
 
-    fn drain_notifications(&mut self, tracker: &mut ExecutionTracker) {
+    fn drain_notifications(&mut self, tracker: &mut ExecutionTracker) -> Vec<ExecutionTransition> {
         if self.endpoint.starts_with(MOCK_SCHEME) || self.socket.is_none() {
-            return;
+            return Vec::new();
         }
 
+        let mut transitions = Vec::new();
         for _ in 0..64 {
             let read_result = {
                 let Some(socket) = self.socket.as_mut() else {
-                    return;
+                    return transitions;
                 };
                 socket.read()
             };
 
             match read_result {
-                Ok(message) => self.handle_message(message, tracker),
+                Ok(message) => {
+                    if let Some(transition) = self.handle_message(message, tracker) {
+                        transitions.push(transition);
+                    }
+                }
                 Err(WsError::Io(error))
                     if matches!(
                         error.kind(),
@@ -418,6 +425,7 @@ impl SignatureWsClient {
                 }
             }
         }
+        transitions
     }
 
     fn ensure_connected(&mut self) -> Option<()> {
@@ -438,52 +446,59 @@ impl SignatureWsClient {
         Some(())
     }
 
-    fn handle_message(&mut self, message: Message, tracker: &mut ExecutionTracker) {
+    fn handle_message(
+        &mut self,
+        message: Message,
+        tracker: &mut ExecutionTracker,
+    ) -> Option<ExecutionTransition> {
         let Message::Text(text) = message else {
-            return;
+            return None;
         };
         let Ok(payload) = serde_json::from_str::<WsEnvelope>(text.as_ref()) else {
-            return;
+            return None;
         };
 
         if let (Some(id), Some(subscription_id)) = (payload.id, payload.result.as_u64()) {
             if let Some(submission_id) = self.pending_requests.remove(&id) {
                 self.subscriptions.insert(subscription_id, submission_id);
             }
-            return;
+            return None;
         }
 
         if payload.method.as_deref() != Some("signatureNotification") {
-            return;
+            return None;
         }
 
         let Some(params) = payload.params else {
-            return;
+            return None;
         };
-        let Some(submission_id) = self.subscriptions.remove(&params.subscription) else {
-            return;
+        let Some(submission_id) = self.subscriptions.get(&params.subscription).cloned() else {
+            return None;
         };
-        self.tracked_submissions.remove(&submission_id);
 
         match params.result.value {
             WsSignatureValue::ReceivedSignature(value) if value == "receivedSignature" => {
-                let _ = tracker.transition(&submission_id, InclusionStatus::Pending);
+                tracker.transition(&submission_id, InclusionStatus::Pending)
             }
             WsSignatureValue::Processed { err: Some(_) } => {
-                let _ = tracker.transition(
+                self.subscriptions.remove(&params.subscription);
+                self.tracked_submissions.remove(&submission_id);
+                tracker.transition(
                     &submission_id,
                     InclusionStatus::Failed(FailureClass::ChainExecutionFailed),
-                );
+                )
             }
             WsSignatureValue::Processed { err: None } => {
-                let _ = tracker.transition(
+                self.subscriptions.remove(&params.subscription);
+                self.tracked_submissions.remove(&submission_id);
+                tracker.transition(
                     &submission_id,
                     InclusionStatus::Landed {
                         slot: params.result.context.slot,
                     },
-                );
+                )
             }
-            WsSignatureValue::ReceivedSignature(_) => {}
+            WsSignatureValue::ReceivedSignature(_) => None,
         }
     }
 
@@ -526,7 +541,8 @@ struct JitoInflightBundleResult {
 struct JitoInflightBundleStatus {
     bundle_id: String,
     status: String,
-    landed_slot: Option<u64>,
+    #[serde(rename = "landed_slot")]
+    _landed_slot: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

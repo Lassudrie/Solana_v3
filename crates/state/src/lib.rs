@@ -1,6 +1,7 @@
 pub mod account_store;
 pub mod decoder;
 pub mod dependency_graph;
+pub mod executable_pool_state;
 pub mod execution_state;
 pub mod pool_snapshots;
 pub mod types;
@@ -8,7 +9,9 @@ pub mod warmup;
 
 use std::time::SystemTime;
 
-use detection::{AccountUpdate, MarketEvent, NormalizedEvent};
+use detection::{
+    AccountUpdate, MarketEvent, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
+};
 use thiserror::Error;
 
 use crate::{
@@ -18,8 +21,8 @@ use crate::{
     execution_state::ExecutionState,
     pool_snapshots::PoolSnapshotStore,
     types::{
-        AccountKey, AccountRecord, AccountUpdateStatus, ExecutionStateSnapshot, PoolId,
-        StateApplyOutcome, WarmupStatus,
+        AccountKey, AccountRecord, AccountUpdateStatus, ExecutionStateSnapshot, LiquidityModel,
+        PoolConfidence, PoolId, StateApplyOutcome, WarmupStatus,
     },
     warmup::WarmupManager,
 };
@@ -114,6 +117,13 @@ impl StatePlane {
         self.pool_snapshots.get(pool_id)
     }
 
+    pub fn pool_snapshots_for(&self, pool_ids: &[PoolId]) -> Vec<crate::types::PoolSnapshot> {
+        pool_ids
+            .iter()
+            .filter_map(|pool_id| self.pool_snapshots.get(pool_id).cloned())
+            .collect()
+    }
+
     pub fn route_state(&self, route_id: &crate::types::RouteId) -> crate::types::RouteState {
         self.warmup.route_state(route_id)
     }
@@ -124,6 +134,10 @@ impl StatePlane {
     ) -> Result<Option<StateApplyOutcome>, StateError> {
         match &event.payload {
             MarketEvent::AccountUpdate(update) => self.apply_account_update(update),
+            MarketEvent::PoolSnapshotUpdate(update) => self.apply_pool_snapshot_update(update),
+            MarketEvent::PoolInvalidation(invalidation) => {
+                Ok(Some(self.apply_pool_invalidation(invalidation)))
+            }
             MarketEvent::SlotBoundary(slot_boundary) => {
                 self.latest_slot = self.latest_slot.max(slot_boundary.slot);
                 self.pool_snapshots
@@ -188,11 +202,91 @@ impl StatePlane {
                     snapshot.last_update_slot,
                     self.max_slot_lag,
                 );
-                self.pool_snapshots.upsert(snapshot);
+                self.pool_snapshots
+                    .upsert_with_version(snapshot, update.write_version);
                 impacted_pools.push(dependency.pool_id);
             }
         }
 
+        Ok(Some(self.state_outcome(update_status, impacted_pools)))
+    }
+
+    fn apply_pool_snapshot_update(
+        &mut self,
+        update: &PoolSnapshotUpdate,
+    ) -> Result<Option<StateApplyOutcome>, StateError> {
+        self.latest_slot = self.latest_slot.max(update.slot);
+        let pool_id = crate::types::PoolId(update.pool_id.clone());
+        let snapshot = crate::types::PoolSnapshot {
+            pool_id: pool_id.clone(),
+            price_bps: update.price_bps,
+            fee_bps: update.fee_bps,
+            reserve_depth: update.reserve_depth,
+            reserve_a: update.reserve_a,
+            reserve_b: update.reserve_b,
+            active_liquidity: update.active_liquidity.unwrap_or(update.reserve_depth),
+            sqrt_price_x64: update.sqrt_price_x64,
+            venue: None,
+            confidence: if update.exact.unwrap_or(true) {
+                PoolConfidence::Exact
+            } else {
+                PoolConfidence::Probable
+            },
+            repair_pending: update.repair_pending.unwrap_or(false),
+            liquidity_model: LiquidityModel::from_market_hints(
+                update.tick_spacing,
+                update.current_tick_index,
+                update.sqrt_price_x64,
+            ),
+            slippage_factor_bps: crate::types::PoolSnapshot::default_slippage_factor_bps(
+                LiquidityModel::from_market_hints(
+                    update.tick_spacing,
+                    update.current_tick_index,
+                    update.sqrt_price_x64,
+                ),
+                update.tick_spacing,
+            ),
+            token_mint_a: update.token_mint_a.clone(),
+            token_mint_b: update.token_mint_b.clone(),
+            tick_spacing: update.tick_spacing,
+            current_tick_index: update.current_tick_index,
+            last_update_slot: update.slot,
+            derived_at: SystemTime::now(),
+            freshness: crate::types::FreshnessState::at(
+                self.latest_slot,
+                update.slot,
+                self.max_slot_lag,
+            ),
+        };
+        let update_status = if self
+            .pool_snapshots
+            .upsert_with_version(snapshot, update.write_version)
+        {
+            AccountUpdateStatus::Applied
+        } else {
+            AccountUpdateStatus::StaleRejected
+        };
+        let impacted_pools = if update_status == AccountUpdateStatus::Applied {
+            vec![pool_id]
+        } else {
+            Vec::new()
+        };
+        Ok(Some(self.state_outcome(update_status, impacted_pools)))
+    }
+
+    fn apply_pool_invalidation(&mut self, invalidation: &PoolInvalidation) -> StateApplyOutcome {
+        let pool_id = crate::types::PoolId(invalidation.pool_id.clone());
+        let impacted_pools = vec![pool_id.clone()];
+        self.pool_snapshots
+            .invalidate(&pool_id, self.latest_slot, self.max_slot_lag);
+        self.state_outcome(AccountUpdateStatus::Applied, impacted_pools)
+    }
+
+    fn state_outcome(
+        &mut self,
+        update_status: AccountUpdateStatus,
+        impacted_pools: Vec<crate::types::PoolId>,
+    ) -> StateApplyOutcome {
         let impacted_routes = self
             .dependency_graph
             .impacted_routes_for_pools(&impacted_pools);
@@ -201,19 +295,21 @@ impl StatePlane {
                 .refresh_route(route_id, &self.pool_snapshots, self.latest_slot);
         }
 
-        Ok(Some(StateApplyOutcome {
+        StateApplyOutcome {
             update_status,
             refreshed_snapshots: impacted_pools.len(),
             impacted_pools,
             impacted_routes,
             latest_slot: self.latest_slot,
-        }))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use detection::{AccountUpdate, EventSourceKind, NormalizedEvent};
+    use detection::{
+        AccountUpdate, EventSourceKind, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
+    };
 
     use super::StatePlane;
     use crate::{
@@ -283,5 +379,85 @@ mod tests {
         let outcome = plane.apply_event(&second).unwrap().unwrap();
         assert_eq!(plane.route_warmup_status(&route_id), WarmupStatus::Ready);
         assert_eq!(outcome.impacted_routes, vec![route_id]);
+    }
+
+    #[test]
+    fn pool_snapshot_update_warms_route_without_account_decoder_path() {
+        let route_id = RouteId("route-live".into());
+        let pool_id = PoolId("pool-live".into());
+        let mut plane = StatePlane::new(2);
+        plane.register_route(route_id.clone(), vec![pool_id.clone()]);
+
+        let event = NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::ShredStream,
+            1,
+            55,
+            PoolSnapshotUpdate {
+                pool_id: pool_id.0.clone(),
+                price_bps: 10_250,
+                fee_bps: 4,
+                reserve_depth: 77_000,
+                reserve_a: None,
+                reserve_b: None,
+                active_liquidity: Some(77_000),
+                sqrt_price_x64: None,
+                exact: None,
+                repair_pending: None,
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                tick_spacing: 4,
+                current_tick_index: Some(12),
+                slot: 55,
+                write_version: 1,
+            },
+        );
+
+        let outcome = plane.apply_event(&event).unwrap().unwrap();
+        assert_eq!(plane.route_warmup_status(&route_id), WarmupStatus::Ready);
+        assert_eq!(outcome.impacted_pools, vec![pool_id.clone()]);
+        assert_eq!(outcome.latest_slot, 55);
+        assert_eq!(plane.pool_snapshot(&pool_id).unwrap().price_bps, 10_250);
+    }
+
+    #[test]
+    fn pool_invalidation_marks_snapshot_stale_immediately() {
+        let pool_id = PoolId("pool-stale".into());
+        let mut plane = StatePlane::new(2);
+        let seed = NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::ShredStream,
+            1,
+            88,
+            PoolSnapshotUpdate {
+                pool_id: pool_id.0.clone(),
+                price_bps: 10_000,
+                fee_bps: 4,
+                reserve_depth: 1_000,
+                reserve_a: None,
+                reserve_b: None,
+                active_liquidity: Some(1_000),
+                sqrt_price_x64: None,
+                exact: None,
+                repair_pending: None,
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                tick_spacing: 4,
+                current_tick_index: Some(1),
+                slot: 88,
+                write_version: 1,
+            },
+        );
+        plane.apply_event(&seed).unwrap();
+
+        let invalidation = NormalizedEvent::pool_invalidation(
+            EventSourceKind::ShredStream,
+            2,
+            88,
+            PoolInvalidation {
+                pool_id: pool_id.0.clone(),
+            },
+        );
+        plane.apply_event(&invalidation).unwrap();
+
+        assert!(plane.pool_snapshot(&pool_id).unwrap().freshness.is_stale);
     }
 }

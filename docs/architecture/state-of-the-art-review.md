@@ -1,94 +1,128 @@
 # Revue "State of the Art" de l’architecture bot Solana
 
 Date: 2026-03-25  
-Version: Évaluation du scaffold actuel (avant intégration complète production)
+Version: révision après remise au vert de `cargo test --workspace`
 
 ## Verdict court
 
-L’architecture est **bien conçue** (separation en planes, flux hot/cold, chemins d’erreur structurés), mais **pas encore state of the art pour un bot HFT réel**.  
-Le pipeline est cohérent, toutefois des briques critiques restent au stade scaffold / partial implementation (transactions réelles, signatures, cold-path dynamique, instrumentation SLO, inclusion on-chain).
+Le workspace n'est **pas encore state of the art** pour un bot Solana HFT réellement compétitif, mais il n'est plus au stade scaffold.
 
-## Ce qui est bon aujourd’hui
+Le pipeline critique existe déjà de bout en bout:
 
-- séparation claire par crates : détection, state, stratégie, build, signing, submit, reconciliation, telemetry, bot.
-- hot-path orienté RAM locale, sans RPC synchrone dans le calcul de quote/route (objectif aligné HFT).
-- détection ShredStream/JSON UDP fonctionnelle, dépendance route->pool->snapshot explicite.
-- garde-fous de base implémentés : route non `warm`, snapshots stales, max inflight, kill-switch, blockhash stale guard.
-- soumission Jito non-bidon : HTTP JSON-RPC, retries, classification d’erreur, idempotence locale basique.
-- observabilité de base : métriques de counters/stages, endpoints `/status`, `/ready`, `/live`, `/metrics`.
+- ingestion UDP/ShredStream avec auth et replay sur gap;
+- state/invalidation/warmup;
+- quote et sélection;
+- build Solana réel avec messages `Legacy` et `V0`;
+- signature cryptographique locale ou via signer Unix sécurisé;
+- submit Jito réel;
+- reconciliation RPC/WebSocket réelle.
 
-## Écarts bloquants pour une version production HFT
+L'écart principal n'est donc plus "avoir une transaction réelle", mais **avoir un moteur marché/exécution suffisamment fidèle pour gagner en live**.
 
-### 1) Construction de transaction
-- Les templates/build ne produisent pas de message Solana compilable réel (instr. factices, `message_bytes` texte).
-- Pas de compilation message/Account metas réelles, pas de versioned message réel.
-- Pas de gestion détaillée CU budget/slots/ALT par venue.
+## Ce qui est solide aujourd'hui
 
-### 2) Signature et wallet
-- Signature non cryptographique (hash deterministic local).
-- Pas d’intégration de wallet runtime (clés locales/secure provider), pas de gestion d’erreur keypair fine.
+- séparation claire par crates et hot path sans RPC synchrone dans quote/build;
+- builder venue-native dans [transaction_builder.rs](../../crates/builder/src/transaction_builder.rs):
+  - compute budget;
+  - tip Jito;
+  - compilation `VersionedMessage::V0` ou fallback legacy;
+  - instructions Orca simple pool, Orca Whirlpool, Raydium simple pool et Raydium CLMM;
+- signature réelle dans [signer.rs](../../crates/signing/src/signer.rs):
+  - chargement keypair fichier ou base58;
+  - vérification locale de la signature;
+  - support d'un signer Unix sécurisé;
+- refresh asynchrone réel dans [refresh.rs](../../crates/bot/src/refresh.rs):
+  - `getLatestBlockhash`;
+  - `getSlot`;
+  - `getMultipleAccounts` pour les ALT;
+  - `getBalance`;
+- reconciliation réelle dans [onchain.rs](../../crates/reconciliation/src/onchain.rs):
+  - expiration des pending;
+  - `getSignatureStatuses`;
+  - `getInflightBundleStatuses`;
+  - `signatureSubscribe`;
+- observabilité opératoire utile:
+  - `/status`, `/ready`, `/live`, `/metrics`;
+  - historique mémoire de signaux avec `p50/p95/p99` dans [observer.rs](../../crates/bot/src/observer.rs).
 
-### 3) Quoting / modélisation financière
-- Quote AMM simplifiée (`price_bps`, `fee_bps`, `reserve_depth`).
-- Pas de pricing venue réel (AMM CPMM/constant-product, slippage dynamique, profondeur réelle, fees supplémentaires, JIT risk).
+## Écarts encore bloquants
 
-4) Gestion source de marché / ingestion
-- ShredStream minimal :
-  - pas de replay sur gap robuste,
-  - pas de reconnexion/backoff systématique,
-  - pas de pipeline de fiabilité pour trous de séquence.
-- `source_latency` non exploité ; observabilité de latence moins exploitable que potentiellement possible.
+### 1) Quote / sizing encore trop simplifiés
 
-### 5) Cold path incomplet
-- `blockhash`, `wallet`, ALT injectés une fois au bootstrap puis figés.
-- Pas d’actualisation continue de blockhash/slot-lag, ni de solde wallet.
-- `max_batch` / `primary_source` / `replay_on_gap` existent en config mais restent partiellement inactifs.
+- Le moteur de quote dans [quote.rs](../../crates/strategy/src/quote.rs) reste affine:
+  - une seule taille = `default_trade_size`;
+  - pas de ladder de tailles;
+  - pas de coût complet `CU + tip + probabilité d'échec`;
+  - pas de sélection par expected value.
+- C'est aujourd'hui le principal frein à la profitabilité live.
 
-### 6) Reconciliation / exécution réelle
-- Suivi inclusion on-chain non connecté aux WebSockets/RPC de statut.
-- Pas de loop de confirmation, pas de gestion de régression (drop/expired) en production.
+### 2) State marché trop pauvre
 
-### 7) Configuration / gouvernance opératoire
-- Certains champs de config sont présents mais ignorés dans le runtime chaud/froid.
-- Pas de politique de fail-closed homogène (ex. `risk.fail_closed` non effectif).
+- `PoolSnapshot` dans [types.rs](../../crates/state/src/types.rs) ne porte qu'un sous-ensemble de l'information réellement utile au pricing:
+  - `price_bps`;
+  - `fee_bps`;
+  - `reserve_depth`;
+  - mints, tick spacing, current tick.
+- Les décodeurs `orca-whirlpool-v1` et `raydium-clmm-v1` existent dans [decoder.rs](../../crates/state/src/decoder.rs), mais le snapshot agrégé reste trop réduit pour un sizing fiable.
+- Il manque encore la composition multi-comptes réellement exploitable pour la décision live.
 
-## Points de maturité (niveau actuel)
+### 3) Sécurité d'exécution incomplète
+
+- Le builder dérive des ATA utilisateur mais ne gère pas leur création ni leur prévalidation.
+- Pas de shadow simulation ou calibration live avant exécution.
+- Pas de contrôle explicite "route prête à trader" sur complétude des comptes runtime au-delà du build.
+- Pas de politique avancée de remplacement/réémission.
+
+### 4) Ingestion et mesure d'avance encore minimales
+
+- `auth_token` et `replay_on_gap` sont bien actifs dans [shredstream.rs](../../crates/detection/src/shredstream.rs).
+- En revanche:
+  - `source_latency` reste à `Duration::ZERO`;
+  - pas de redondance multi-source/région;
+  - pas de reconnexion/backoff structurés côté feed.
+
+### 5) Observabilité encore partielle pour un desk HFT
+
+- Les percentiles existent dans l'observer mémoire, mais pas comme export primaire Prometheus/SLO.
+- Le control plane expose surtout des compteurs et des latences cumulées.
+- Il manque encore:
+  - `source -> decision -> submit -> terminal` comme série SLO exploitable;
+  - ventilation par leader/région/canal;
+  - suivi clair landing rate vs expired vs failed.
+
+## Niveau actuel par domaine
 
 | Domaine | Niveau | Note |
 |---|---:|---|
-| Architecture | 8/10 | solide, découplée, extensible |
-| Hot path | 7/10 | court et déterministe, mais input encore simplifié |
-| Quoting | 3/10 | pédagogique, pas réaliste HFT |
-| Builder/Signing | 2/10 | non production |
-| Submit | 7/10 | correct au niveau réseau/réties, classification utile |
-| Ingestion | 6/10 | opérationnelle mais sans robustesse production |
-| Reconciliation | 3/10 | statut interne seulement |
-| Observabilité | 6/10 | métriques de base + HTTP ok, pas de SLO/P95/P99 |
+| Architecture | 8.5/10 | bonne base, propre et extensible |
+| Ingestion | 7/10 | crédible, encore minimale |
+| State plane | 6.5/10 | bonne plomberie, représentation marché trop pauvre |
+| Quoting / alpha | 3.5/10 | insuffisant pour profit live robuste |
+| Builder / signing | 8/10 | réel et exploitable, pas encore blindé |
+| Submit / reconciliation | 7.5/10 | base crédible public-prod |
+| Observabilité | 6.5/10 | meilleure que le scaffold, encore incomplète |
+| Validation | 7/10 | `cargo test --workspace` passe, pas de preuve live/perf |
 
-## Plan de remédiation priorisée
+## Priorités de remédiation
 
-### P0 – Bloquant production
-1. Implémenter transaction Solana réelle (message/versioned message + comptes/compilation) pour 2-leg.
-2. Remplacer signature simulée par signature Ed25519 vérifiable (wallet sécurisé).
-3. Activer refresh dynamique blockhash/slot/solde/ALT en tâche séparée.
-4. Ajouter suivi inclusion chain-side + transition tracker basée sur résultat réel.
+### P0
+1. Remplacer la quote fixe par un sizing adaptatif avec coût total complet.
+2. Enrichir `PoolSnapshot` et les décodeurs pour porter un état marché exécutable.
+3. Ajouter prévalidation runtime des comptes et calibration d'exécution hors hot path.
 
-### P1 – Robustesse marché / exécution
-1. Réconciliation gap/reconnect/auth token sur ShredStream.
-2. Ajouter buffering et fenêtre de reorder / dedupe avancée par slot/sequence.
-3. Contrôle de latence: p95/p99 latence de détection → sign → submit.
-4. Remplacer params de config inactifs ou supprimer la dette.
+### P1
+1. Instrumenter `source_latency` et les métriques `source_to_submit` / `submit_to_terminal`.
+2. Exporter percentiles et ratios d'inclusion au niveau control plane/Prometheus.
+3. Renforcer le feed avec redondance, reconnect et backoff.
 
-### P2 – Optimisation qualité alpha
-1. Quote AMM plus réaliste par venue (modèles dédiés par DEX).
-2. Risk/anti-gaming: inventory, MEV/arb conflict, protections timing.
-3. Observabilité externe (Prometheus/OTLP + alerting, tableaux PnL/ROI/exclusion).
-4. Contrôles de sécurité: key mgmt, secret handling, kill-switch distribué.
+### P2
+1. Ajouter validation live/staging et preuves de landing rate.
+2. Étendre la politique de submit/réconciliation par canal et par congestion.
 
 ## Références internes utilisées
 
-- [Architecture scaffold](./hft-bot-scaffold.md)
-- [Audit opérationnel](../bot/audit.md)
-- [Contrat NormalizedEvent](./normalized-event.md)
-- [Runtime](../..//crates/bot/src/runtime.rs)
-
+- [Runtime](../../crates/bot/src/runtime.rs)
+- [Builder](../../crates/builder/src/transaction_builder.rs)
+- [Signing](../../crates/signing/src/signer.rs)
+- [Refresh](../../crates/bot/src/refresh.rs)
+- [Reconciliation](../../crates/reconciliation/src/onchain.rs)

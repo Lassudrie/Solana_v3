@@ -1,8 +1,11 @@
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 use builder::{BuildRequest, BuildResult, BuildStatus, DynamicBuildParameters, TransactionBuilder};
-use detection::NormalizedEvent;
-use reconciliation::{ExecutionRecord, ExecutionTracker, OnChainReconciler};
+use detection::{EventSourceKind, NormalizedEvent};
+use reconciliation::{
+    ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, FailureClass,
+    OnChainReconciler,
+};
 use signing::{HotWallet, SignedTransactionEnvelope, Signer, SigningError, SigningRequest};
 use state::{
     StateError, StatePlane,
@@ -18,17 +21,20 @@ use crate::refresh::AsyncRefreshSnapshot;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathReport {
     pub state_outcome: Option<StateApplyOutcome>,
+    pub pool_snapshots: Vec<state::types::PoolSnapshot>,
     pub selection: SelectionOutcome,
     pub build_result: Option<BuildResult>,
     pub signed_envelope: Option<SignedTransactionEnvelope>,
     pub submit_result: Option<SubmitResult>,
     pub execution_record: Option<ExecutionRecord>,
+    pub pipeline_trace: PipelineTrace,
 }
 
 impl HotPathReport {
-    fn empty(state_outcome: Option<StateApplyOutcome>) -> Self {
+    fn empty(state_outcome: Option<StateApplyOutcome>, pipeline_trace: PipelineTrace) -> Self {
         Self {
             state_outcome,
+            pool_snapshots: Vec::new(),
             selection: SelectionOutcome {
                 decisions: Vec::new(),
                 best_candidate: None,
@@ -37,6 +43,53 @@ impl HotPathReport {
             signed_envelope: None,
             submit_result: None,
             execution_record: None,
+            pipeline_trace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineTrace {
+    pub source: EventSourceKind,
+    pub source_sequence: u64,
+    pub observed_slot: u64,
+    pub source_received_at: SystemTime,
+    pub normalized_at: SystemTime,
+    pub source_latency: Option<Duration>,
+    pub ingest_duration: Duration,
+    pub queue_wait_duration: Duration,
+    pub state_apply_duration: Duration,
+    pub select_duration: Option<Duration>,
+    pub build_duration: Option<Duration>,
+    pub sign_duration: Option<Duration>,
+    pub submit_duration: Option<Duration>,
+    pub total_to_submit: Option<Duration>,
+}
+
+impl PipelineTrace {
+    fn from_event(event: &NormalizedEvent) -> Self {
+        let ingest_duration = event
+            .latency
+            .normalized_at
+            .duration_since(event.latency.source_received_at)
+            .unwrap_or(Duration::ZERO);
+        let source_latency =
+            (!event.latency.source_latency.is_zero()).then_some(event.latency.source_latency);
+        Self {
+            source: event.source.source,
+            source_sequence: event.source.sequence,
+            observed_slot: event.source.observed_slot,
+            source_received_at: event.latency.source_received_at,
+            normalized_at: event.latency.normalized_at,
+            source_latency,
+            ingest_duration,
+            queue_wait_duration: Duration::ZERO,
+            state_apply_duration: Duration::ZERO,
+            select_duration: None,
+            build_duration: None,
+            sign_duration: None,
+            submit_duration: None,
+            total_to_submit: None,
         }
     }
 }
@@ -56,7 +109,7 @@ pub struct HotPathPipeline {
     strategy: StrategyPlane,
     builder: builder::AtomicArbTransactionBuilder,
     wallet: HotWallet,
-    signer: signing::LocalWalletSigner,
+    signer: Box<dyn Signer>,
     submitter: Box<dyn Submitter>,
 }
 
@@ -66,7 +119,7 @@ impl HotPathPipeline {
         strategy: StrategyPlane,
         builder: builder::AtomicArbTransactionBuilder,
         wallet: HotWallet,
-        signer: signing::LocalWalletSigner,
+        signer: Box<dyn Signer>,
         submitter: Box<dyn Submitter>,
     ) -> Self {
         Self {
@@ -118,6 +171,10 @@ impl ColdPathServices {
             self.blockhash.current_blockhash.clone(),
             self.blockhash.slot,
         );
+        hot_path
+            .state
+            .execution_state_mut()
+            .set_rpc_slot(self.blockhash.slot);
         hot_path
             .state
             .execution_state_mut()
@@ -199,10 +256,18 @@ impl BotRuntime {
                 .state
                 .execution_state_mut()
                 .set_blockhash(blockhash.blockhash, blockhash.slot);
+            self.hot_path
+                .state
+                .execution_state_mut()
+                .set_rpc_slot(blockhash.slot);
             self.hot_path.state.set_latest_slot(blockhash.slot);
         }
 
         if let Some(slot) = snapshot.slot {
+            self.hot_path
+                .state
+                .execution_state_mut()
+                .set_rpc_slot(slot.slot);
             self.hot_path.state.set_latest_slot(slot.slot);
         }
 
@@ -219,7 +284,7 @@ impl BotRuntime {
         }
 
         if let Some(wallet) = snapshot.wallet {
-            let signer_available = self.hot_path.signer.has_signer_material();
+            let signer_available = self.hot_path.signer.is_available();
             self.hot_path
                 .state
                 .execution_state_mut()
@@ -258,6 +323,24 @@ impl BotRuntime {
         self.tracker.pending_count()
     }
 
+    pub fn execution_record(
+        &self,
+        submission_id: &submit::SubmissionId,
+    ) -> Option<ExecutionRecord> {
+        self.tracker.get(submission_id).cloned()
+    }
+
+    pub fn reconcile(&mut self, observed_slot: u64) -> Vec<ExecutionTransition> {
+        let reconcile_started = Instant::now();
+        let transitions = self.reconciler.tick(&mut self.tracker, observed_slot);
+        self.telemetry
+            .record_stage(PipelineStage::Reconcile, reconcile_started.elapsed());
+        for transition in &transitions {
+            self.record_transition_metrics(transition);
+        }
+        transitions
+    }
+
     pub fn apply_kill_switch(&mut self, enabled: bool) {
         self.hot_path
             .state
@@ -266,29 +349,50 @@ impl BotRuntime {
     }
 
     pub fn process_event(&mut self, event: NormalizedEvent) -> Result<HotPathReport, RuntimeError> {
+        let mut pipeline_trace = PipelineTrace::from_event(&event);
+        let process_started_at = SystemTime::now();
+        pipeline_trace.queue_wait_duration = process_started_at
+            .duration_since(event.latency.normalized_at)
+            .unwrap_or(Duration::ZERO);
         self.telemetry.metrics.increment_detect();
         self.telemetry
             .log(LogLevel::Debug, "runtime", "event received");
-        self.reconciler
-            .tick(&mut self.tracker, event.source.observed_slot);
 
         let state_started = Instant::now();
         let state_outcome = self.hot_path.state.apply_event(&event)?;
+        let state_duration = state_started.elapsed();
+        pipeline_trace.state_apply_duration = state_duration;
         self.telemetry
-            .record_stage(PipelineStage::StateApply, state_started.elapsed());
+            .record_stage(PipelineStage::StateApply, state_duration);
 
         if let Some(outcome) = &state_outcome {
             if outcome.update_status == AccountUpdateStatus::StaleRejected {
                 self.telemetry.metrics.increment_stale();
-                return Ok(HotPathReport::empty(state_outcome));
+                return Ok(HotPathReport::empty(state_outcome, pipeline_trace));
             }
         } else {
-            return Ok(HotPathReport::empty(None));
+            return Ok(HotPathReport::empty(None, pipeline_trace));
         }
 
         let state_outcome = state_outcome.expect("checked above");
+        let pool_snapshots = self
+            .hot_path
+            .state
+            .pool_snapshots_for(&state_outcome.impacted_pools);
         if state_outcome.impacted_routes.is_empty() {
-            return Ok(HotPathReport::empty(Some(state_outcome)));
+            return Ok(HotPathReport {
+                state_outcome: Some(state_outcome),
+                pool_snapshots,
+                selection: SelectionOutcome {
+                    decisions: Vec::new(),
+                    best_candidate: None,
+                },
+                build_result: None,
+                signed_envelope: None,
+                submit_result: None,
+                execution_record: None,
+                pipeline_trace,
+            });
         }
 
         let strategy_started = Instant::now();
@@ -297,17 +401,21 @@ impl BotRuntime {
             &state_outcome.impacted_routes,
             self.tracker.pending_count(),
         );
+        let select_duration = strategy_started.elapsed();
+        pipeline_trace.select_duration = Some(select_duration);
         self.telemetry
-            .record_stage(PipelineStage::Select, strategy_started.elapsed());
+            .record_stage(PipelineStage::Select, select_duration);
         if selection.best_candidate.is_none() {
             self.telemetry.metrics.increment_rejection();
             return Ok(HotPathReport {
                 state_outcome: Some(state_outcome),
+                pool_snapshots,
                 selection,
                 build_result: None,
                 signed_envelope: None,
                 submit_result: None,
                 execution_record: None,
+                pipeline_trace,
             });
         }
 
@@ -330,17 +438,21 @@ impl BotRuntime {
                 resolved_lookup_tables: execution_state.lookup_tables.clone(),
             },
         });
+        let build_duration = build_started.elapsed();
+        pipeline_trace.build_duration = Some(build_duration);
         self.telemetry
-            .record_stage(PipelineStage::Build, build_started.elapsed());
+            .record_stage(PipelineStage::Build, build_duration);
         if build_result.status != BuildStatus::Built {
             self.telemetry.metrics.increment_rejection();
             return Ok(HotPathReport {
                 state_outcome: Some(state_outcome),
+                pool_snapshots,
                 selection,
                 build_result: Some(build_result),
                 signed_envelope: None,
                 submit_result: None,
                 execution_record: None,
+                pipeline_trace,
             });
         }
 
@@ -353,50 +465,100 @@ impl BotRuntime {
                 envelope: unsigned_envelope,
             },
         )?;
+        let sign_duration = sign_started.elapsed();
+        pipeline_trace.sign_duration = Some(sign_duration);
         self.telemetry
-            .record_stage(PipelineStage::Sign, sign_started.elapsed());
+            .record_stage(PipelineStage::Sign, sign_duration);
 
         let submit_started = Instant::now();
         let submit_result = self.hot_path.submitter.submit(SubmitRequest {
             envelope: signed_envelope.clone(),
             mode: self.submit_mode,
         })?;
+        let submit_duration = submit_started.elapsed();
+        pipeline_trace.submit_duration = Some(submit_duration);
+        pipeline_trace.total_to_submit = SystemTime::now()
+            .duration_since(event.latency.source_received_at)
+            .ok();
         self.telemetry
-            .record_stage(PipelineStage::Submit, submit_started.elapsed());
+            .record_stage(PipelineStage::Submit, submit_duration);
         self.telemetry.metrics.increment_submit();
 
         let execution_record = self.tracker.register_submission(
             signed_envelope.route_id.clone(),
+            signed_envelope.signature.clone(),
             signed_envelope.build_slot,
             self.submit_mode,
             submit_result.clone(),
         );
+        self.record_submission_metrics(&execution_record);
 
         Ok(HotPathReport {
             state_outcome: Some(state_outcome),
+            pool_snapshots,
             selection,
             build_result: Some(build_result),
             signed_envelope: Some(signed_envelope),
             submit_result: Some(submit_result),
             execution_record: Some(execution_record),
+            pipeline_trace,
         })
+    }
+
+    fn record_submission_metrics(&self, record: &ExecutionRecord) {
+        if matches!(
+            record.outcome,
+            ExecutionOutcome::Failed(FailureClass::SubmitRejected)
+        ) {
+            self.telemetry.metrics.increment_submit_rejected();
+        }
+    }
+
+    fn record_transition_metrics(&self, transition: &ExecutionTransition) {
+        match &transition.current_outcome {
+            ExecutionOutcome::Pending => {}
+            ExecutionOutcome::Included { .. } => self.telemetry.metrics.increment_inclusion(),
+            ExecutionOutcome::Failed(class) => match class {
+                FailureClass::SubmitRejected => self.telemetry.metrics.increment_submit_rejected(),
+                FailureClass::TransportFailed => {
+                    self.telemetry.metrics.increment_transport_failed()
+                }
+                FailureClass::Expired => self.telemetry.metrics.increment_expired(),
+                FailureClass::ChainDropped
+                | FailureClass::ChainExecutionFailed
+                | FailureClass::Unknown => self.telemetry.metrics.increment_chain_failed(),
+            },
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use detection::{AccountUpdate, EventSourceKind, NormalizedEvent};
-    use solana_sdk::signer::{Signer as SolanaCurveSigner, keypair::Keypair};
-    use solana_sdk::{hash::hashv, pubkey::Pubkey};
+    use signerd::{SecureSignerService, SecureSignerServiceConfig};
+    use solana_sdk::{
+        hash::hashv,
+        pubkey::Pubkey,
+        signer::{
+            Signer as SolanaCurveSigner,
+            keypair::{Keypair, write_keypair_file},
+        },
+    };
+    use std::{
+        env, fs,
+        path::PathBuf,
+        process, thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     use submit::SubmitStatus;
 
     use crate::{
         bootstrap::bootstrap,
         config::{
             AccountDependencyConfig, BotConfig, MessageModeConfig,
-            OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteConfig,
-            RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
-            SwapSideConfig,
+            OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig,
+            RouteClassConfig, RouteConfig, RouteExecutionConfig, RouteLegConfig,
+            RouteLegExecutionConfig, RoutesConfig, SigningProviderKind, SwapSideConfig,
         },
     };
 
@@ -431,16 +593,22 @@ mod tests {
 
     fn route_config() -> RouteConfig {
         RouteConfig {
+            enabled: true,
+            route_class: RouteClassConfig::AmmFastPath,
             route_id: "route-a".into(),
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            base_mint: None,
+            quote_mint: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
+            size_ladder: Vec::new(),
             legs: [
                 RouteLegConfig {
                     venue: "orca".into(),
                     pool_id: "pool-a".into(),
                     side: SwapSideConfig::BuyBase,
+                    fee_bps: None,
                     execution: RouteLegExecutionConfig::OrcaSimplePool(
                         OrcaSimplePoolLegExecutionConfig {
                             program_id: test_pubkey("orca-program"),
@@ -461,6 +629,7 @@ mod tests {
                     venue: "raydium".into(),
                     pool_id: "pool-b".into(),
                     side: SwapSideConfig::SellBase,
+                    fee_bps: None,
                     execution: RouteLegExecutionConfig::RaydiumSimplePool(
                         RaydiumSimplePoolLegExecutionConfig {
                             program_id: test_pubkey("raydium-program"),
@@ -506,6 +675,9 @@ mod tests {
         config.routes = RoutesConfig {
             definitions: vec![route_config()],
         };
+        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
         config.jito.endpoint = "mock://jito".into();
         config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
@@ -513,7 +685,7 @@ mod tests {
         let (owner_pubkey, keypair_base58) = test_signing_material();
         config.signing.owner_pubkey = owner_pubkey;
         config.signing.keypair_base58 = Some(keypair_base58);
-        let mut runtime = bootstrap(config);
+        let mut runtime = bootstrap(config).unwrap();
 
         let first = NormalizedEvent::account_update(
             EventSourceKind::Synthetic,
@@ -523,7 +695,7 @@ mod tests {
                 pubkey: "acct-a".into(),
                 owner: "owner".into(),
                 lamports: 0,
-                data: encode_pool(10_150, 4, 100_000),
+                data: encode_pool(12_000, 4, 100_000),
                 slot: 10,
                 write_version: 1,
             },
@@ -536,7 +708,7 @@ mod tests {
                 pubkey: "acct-b".into(),
                 owner: "owner".into(),
                 lamports: 0,
-                data: encode_pool(10_080, 4, 100_000),
+                data: encode_pool(12_000, 4, 100_000),
                 slot: 11,
                 write_version: 1,
             },
@@ -549,5 +721,87 @@ mod tests {
         let submit = second_report.submit_result.expect("submitted");
         assert_eq!(submit.status, SubmitStatus::Accepted);
         assert!(second_report.execution_record.is_some());
+    }
+
+    #[test]
+    fn secure_unix_pipeline_wiring_reaches_submit() {
+        let mut config = BotConfig::default();
+        config.routes = RoutesConfig {
+            definitions: vec![route_config()],
+        };
+        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
+        config.jito.endpoint = "mock://jito".into();
+        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        config.signing.provider = SigningProviderKind::SecureUnix;
+
+        let keypair = Keypair::new_from_array([21; 32]);
+        let keypair_path = temp_path("runtime-secure-signer", "json");
+        let socket_path = temp_path("runtime-secure-signer", "sock");
+        write_keypair_file(&keypair, &keypair_path).expect("write keypair file");
+        config.signing.owner_pubkey = keypair.pubkey().to_string();
+        config.signing.socket_path = Some(socket_path.to_string_lossy().into_owned());
+
+        let service = SecureSignerService::bind(SecureSignerServiceConfig {
+            socket_path: socket_path.clone(),
+            keypair_path: keypair_path.clone(),
+        })
+        .expect("bind secure signer service");
+        let signer_thread = thread::spawn(move || {
+            service.serve_one().expect("serve public key request");
+            service.serve_one().expect("serve sign request");
+        });
+
+        let mut runtime = bootstrap(config).unwrap();
+
+        let first = NormalizedEvent::account_update(
+            EventSourceKind::Synthetic,
+            1,
+            10,
+            AccountUpdate {
+                pubkey: "acct-a".into(),
+                owner: "owner".into(),
+                lamports: 0,
+                data: encode_pool(12_000, 4, 100_000),
+                slot: 10,
+                write_version: 1,
+            },
+        );
+        let second = NormalizedEvent::account_update(
+            EventSourceKind::Synthetic,
+            2,
+            11,
+            AccountUpdate {
+                pubkey: "acct-b".into(),
+                owner: "owner".into(),
+                lamports: 0,
+                data: encode_pool(12_000, 4, 100_000),
+                slot: 11,
+                write_version: 1,
+            },
+        );
+
+        let first_report = runtime.process_event(first).unwrap();
+        assert!(first_report.submit_result.is_none());
+
+        let second_report = runtime.process_event(second).unwrap();
+        let submit = second_report.submit_result.expect("submitted");
+        assert_eq!(submit.status, SubmitStatus::Accepted);
+        assert!(second_report.execution_record.is_some());
+
+        signer_thread.join().expect("secure signer thread");
+        let _ = fs::remove_file(keypair_path);
+        let _ = fs::remove_file(socket_path);
+    }
+
+    fn temp_path(label: &str, extension: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        env::temp_dir().join(format!("{label}-{}-{unique}.{extension}", process::id()))
     }
 }

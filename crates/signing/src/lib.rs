@@ -1,3 +1,4 @@
+pub mod protocol;
 pub mod signer;
 pub mod wallet;
 
@@ -6,7 +7,7 @@ use std::time::SystemTime;
 use builder::UnsignedTransactionEnvelope;
 use state::types::RouteId;
 
-pub use signer::{LocalWalletSigner, Signer, SigningError};
+pub use signer::{LocalWalletSigner, SecureUnixWalletSigner, Signer, SigningError};
 pub use wallet::{HotWallet, WalletPrecondition, WalletStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

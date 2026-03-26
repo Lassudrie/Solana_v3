@@ -57,6 +57,10 @@ pub struct RuntimeMetrics {
     pub build_count: u64,
     pub submit_count: u64,
     pub inclusion_count: u64,
+    pub submit_rejected_count: u64,
+    pub transport_failed_count: u64,
+    pub chain_failed_count: u64,
+    pub expired_count: u64,
     pub shredstream_events: u64,
     pub shredstream_sequence_gaps: u64,
     pub shredstream_sequence_reorders: u64,
@@ -78,6 +82,10 @@ impl RuntimeMetrics {
             build_count: snapshot.build_count,
             submit_count: snapshot.submit_count,
             inclusion_count: snapshot.inclusion_count,
+            submit_rejected_count: snapshot.submit_rejected_count,
+            transport_failed_count: snapshot.transport_failed_count,
+            chain_failed_count: snapshot.chain_failed_count,
+            expired_count: snapshot.expired_count,
             shredstream_events: snapshot.shredstream_events,
             shredstream_sequence_gaps: snapshot.shredstream_sequence_gaps,
             shredstream_sequence_reorders: snapshot.shredstream_sequence_reorders,
@@ -104,6 +112,7 @@ pub struct RuntimeStatus {
     pub issue: Option<RuntimeIssue>,
     pub kill_switch_active: bool,
     pub latest_slot: u64,
+    pub rpc_slot: Option<u64>,
     pub total_routes: usize,
     pub ready_routes: usize,
     pub inflight_submissions: usize,
@@ -125,6 +134,7 @@ impl Default for RuntimeStatus {
             issue: Some(RuntimeIssue::NoRoutesConfigured),
             kill_switch_active: false,
             latest_slot: 0,
+            rpc_slot: None,
             total_routes: 0,
             ready_routes: 0,
             inflight_submissions: 0,
@@ -139,6 +149,10 @@ impl Default for RuntimeStatus {
                 build_count: 0,
                 submit_count: 0,
                 inclusion_count: 0,
+                submit_rejected_count: 0,
+                transport_failed_count: 0,
+                chain_failed_count: 0,
+                expired_count: 0,
                 shredstream_events: 0,
                 shredstream_sequence_gaps: 0,
                 shredstream_sequence_reorders: 0,
@@ -170,6 +184,10 @@ impl RuntimeStatus {
         ));
         output.push_str("# TYPE bot_runtime_latest_slot gauge\n");
         output.push_str(&format!("bot_runtime_latest_slot {}\n", self.latest_slot));
+        if let Some(slot) = self.rpc_slot {
+            output.push_str("# TYPE bot_runtime_rpc_slot gauge\n");
+            output.push_str(&format!("bot_runtime_rpc_slot {}\n", slot));
+        }
         output.push_str("# TYPE bot_runtime_routes_total gauge\n");
         output.push_str(&format!("bot_runtime_routes_total {}\n", self.total_routes));
         output.push_str("# TYPE bot_runtime_routes_ready gauge\n");
@@ -266,6 +284,26 @@ impl RuntimeStatus {
         output.push_str(&format!(
             "bot_inclusion_total {}\n",
             self.metrics.inclusion_count
+        ));
+        output.push_str("# TYPE bot_submit_rejected_total counter\n");
+        output.push_str(&format!(
+            "bot_submit_rejected_total {}\n",
+            self.metrics.submit_rejected_count
+        ));
+        output.push_str("# TYPE bot_transport_failed_total counter\n");
+        output.push_str(&format!(
+            "bot_transport_failed_total {}\n",
+            self.metrics.transport_failed_count
+        ));
+        output.push_str("# TYPE bot_chain_failed_total counter\n");
+        output.push_str(&format!(
+            "bot_chain_failed_total {}\n",
+            self.metrics.chain_failed_count
+        ));
+        output.push_str("# TYPE bot_expired_total counter\n");
+        output.push_str(&format!(
+            "bot_expired_total {}\n",
+            self.metrics.expired_count
         ));
         output.push_str("# TYPE bot_stage_latency_nanos_total counter\n");
         for (stage, latency) in &self.metrics.stage_latency_nanos {
@@ -418,6 +456,7 @@ mod tests {
             issue: Some(RuntimeIssue::KillSwitchActive),
             kill_switch_active: true,
             latest_slot: 42,
+            rpc_slot: Some(41),
             total_routes: 1,
             ready_routes: 1,
             inflight_submissions: 0,
@@ -441,6 +480,10 @@ mod tests {
                 build_count: 3,
                 submit_count: 4,
                 inclusion_count: 5,
+                submit_rejected_count: 1,
+                transport_failed_count: 2,
+                chain_failed_count: 3,
+                expired_count: 4,
                 stage_latency_nanos: [("select".to_string(), 99)].into_iter().collect(),
             },
             last_error: None,
@@ -453,6 +496,10 @@ mod tests {
         assert!(output.contains("bot_shredstream_events_total 10"));
         assert!(output.contains("bot_shredstream_events_per_second 9"));
         assert!(output.contains("bot_shredstream_sequence_gaps_total 1"));
+        assert!(output.contains("bot_submit_rejected_total 1"));
+        assert!(output.contains("bot_transport_failed_total 2"));
+        assert!(output.contains("bot_chain_failed_total 3"));
+        assert!(output.contains("bot_expired_total 4"));
         assert!(output.contains("bot_stage_latency_nanos_total{stage=\"select\"} 99"));
     }
 }

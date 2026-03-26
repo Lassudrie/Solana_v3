@@ -30,6 +30,10 @@ pub struct PipelineMetrics {
     build_count: AtomicU64,
     submit_count: AtomicU64,
     inclusion_count: AtomicU64,
+    submit_rejected_count: AtomicU64,
+    transport_failed_count: AtomicU64,
+    chain_failed_count: AtomicU64,
+    expired_count: AtomicU64,
     stage_latency_nanos: Mutex<BTreeMap<PipelineStage, u128>>,
     shredstream_events: AtomicU64,
     shredstream_sequence_gaps: AtomicU64,
@@ -51,6 +55,10 @@ pub struct MetricsSnapshot {
     pub build_count: u64,
     pub submit_count: u64,
     pub inclusion_count: u64,
+    pub submit_rejected_count: u64,
+    pub transport_failed_count: u64,
+    pub chain_failed_count: u64,
+    pub expired_count: u64,
     pub stage_latency_nanos: BTreeMap<PipelineStage, u128>,
     pub shredstream_events: u64,
     pub shredstream_sequence_gaps: u64,
@@ -92,6 +100,22 @@ impl PipelineMetrics {
 
     pub fn increment_inclusion(&self) {
         self.inclusion_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_submit_rejected(&self) {
+        self.submit_rejected_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_transport_failed(&self) {
+        self.transport_failed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_chain_failed(&self) {
+        self.chain_failed_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_expired(&self) {
+        self.expired_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn increment_shredstream_sequence_gap(&self) {
@@ -171,6 +195,10 @@ impl PipelineMetrics {
             build_count: self.build_count.load(Ordering::Relaxed),
             submit_count: self.submit_count.load(Ordering::Relaxed),
             inclusion_count: self.inclusion_count.load(Ordering::Relaxed),
+            submit_rejected_count: self.submit_rejected_count.load(Ordering::Relaxed),
+            transport_failed_count: self.transport_failed_count.load(Ordering::Relaxed),
+            chain_failed_count: self.chain_failed_count.load(Ordering::Relaxed),
+            expired_count: self.expired_count.load(Ordering::Relaxed),
             stage_latency_nanos: self
                 .stage_latency_nanos
                 .lock()

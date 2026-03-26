@@ -1,5 +1,6 @@
 use state::types::RouteId;
 use strategy::opportunity::OpportunityCandidate;
+use strategy::route_registry::SwapSide;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicBuildParameters {
@@ -17,8 +18,10 @@ pub struct DynamicBuildParameters {
 pub struct AtomicLegPlan {
     pub venue: String,
     pub pool_id: state::types::PoolId,
+    pub side: SwapSide,
     pub input_amount: u64,
     pub min_output_amount: u64,
+    pub current_tick_index: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +105,7 @@ pub enum BuildRejectionReason {
     LookupTableStale,
     QuoteStaleForExecution,
     MessageCompilationFailed,
+    MissingExecutionHint,
     UnsupportedVenue,
 }
 

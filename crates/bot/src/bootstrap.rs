@@ -1,12 +1,13 @@
 use builder::{
     AtomicArbTransactionBuilder, ExecutionRegistry, LookupTableUsageConfig, MessageMode,
-    OrcaSimplePoolConfig, RaydiumSimplePoolConfig,
+    OrcaSimplePoolConfig, OrcaWhirlpoolConfig, RaydiumClmmConfig, RaydiumSimplePoolConfig,
     RouteExecutionConfig as BuilderRouteExecutionConfig, VenueExecutionConfig,
 };
 use reconciliation::{OnChainReconciler, OnChainReconciliationConfig};
+use signing::{Signer, SigningError};
 use state::{
     StatePlane,
-    decoder::PoolPriceAccountDecoder,
+    decoder::{OrcaWhirlpoolAccountDecoder, PoolPriceAccountDecoder, RaydiumClmmPoolDecoder},
     types::{AccountKey, PoolId, RouteId},
 };
 use strategy::{
@@ -15,10 +16,12 @@ use strategy::{
     route_registry::{RouteDefinition, RouteLeg, SwapSide},
 };
 use submit::{JitoConfig, JitoSubmitter, SubmitMode};
+use thiserror::Error;
 
 use crate::{
     config::{
-        BotConfig, MessageModeConfig, RouteLegExecutionConfig, SubmitModeConfig, SwapSideConfig,
+        BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteLegExecutionConfig,
+        RuntimeProfileConfig, SigningConfig, SigningProviderKind, SubmitModeConfig, SwapSideConfig,
     },
     runtime::{
         AltCacheService, BlockhashService, BotRuntime, ColdPathServices, HotPathPipeline,
@@ -26,11 +29,32 @@ use crate::{
     },
 };
 
-pub fn bootstrap(config: BotConfig) -> BotRuntime {
+const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
+const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
+
+#[derive(Debug, Error)]
+pub enum BootstrapError {
+    #[error(transparent)]
+    Signing(#[from] SigningError),
+}
+
+struct ResolvedSigner {
+    owner_pubkey: String,
+    signer_available: bool,
+    signer: Box<dyn Signer>,
+}
+
+pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
     let mut state = StatePlane::new(config.state.max_snapshot_slot_lag);
     state
         .decoder_registry_mut()
         .register(PoolPriceAccountDecoder);
+    state
+        .decoder_registry_mut()
+        .register(OrcaWhirlpoolAccountDecoder);
+    state
+        .decoder_registry_mut()
+        .register(RaydiumClmmPoolDecoder);
 
     let mut strategy = StrategyPlane::new(GuardrailConfig {
         min_profit_lamports: config.strategy.min_profit_lamports,
@@ -43,6 +67,10 @@ pub fn bootstrap(config: BotConfig) -> BotRuntime {
 
     let mut execution_registry = ExecutionRegistry::default();
     for route in &config.routes.definitions {
+        if !route_enabled_in_profile(route, config.runtime.profile) {
+            continue;
+        }
+
         let route_id = RouteId(route.route_id.clone());
         let pool_ids = route
             .legs
@@ -61,20 +89,31 @@ pub fn bootstrap(config: BotConfig) -> BotRuntime {
             route_id,
             input_mint: route.input_mint.clone(),
             output_mint: route.output_mint.clone(),
+            base_mint: route.base_mint.clone(),
+            quote_mint: route.quote_mint.clone(),
             legs: [
                 RouteLeg {
                     venue: route.legs[0].venue.clone(),
                     pool_id: PoolId(route.legs[0].pool_id.clone()),
                     side: map_swap_side(&route.legs[0].side),
+                    fee_bps: route.legs[0].fee_bps,
                 },
                 RouteLeg {
                     venue: route.legs[1].venue.clone(),
                     pool_id: PoolId(route.legs[1].pool_id.clone()),
                     side: map_swap_side(&route.legs[1].side),
+                    fee_bps: route.legs[1].fee_bps,
                 },
             ],
             default_trade_size: route.default_trade_size,
             max_trade_size: route.max_trade_size,
+            size_ladder: route.size_ladder.clone(),
+            estimated_execution_cost_lamports: estimate_execution_cost_lamports(
+                &config.builder,
+                route.execution.default_compute_unit_limit,
+                route.execution.default_compute_unit_price_micro_lamports,
+                route.execution.default_jito_tip_lamports,
+            ),
         });
         execution_registry.register(BuilderRouteExecutionConfig {
             route_id: RouteId(route.route_id.clone()),
@@ -105,11 +144,7 @@ pub fn bootstrap(config: BotConfig) -> BotRuntime {
         SubmitModeConfig::SingleTransaction => SubmitMode::SingleTransaction,
         SubmitModeConfig::Bundle => SubmitMode::Bundle,
     };
-    let signer = signing::LocalWalletSigner::new(
-        config.signing.wallet_id.clone(),
-        config.signing.keypair_path.clone(),
-        config.signing.keypair_base58.clone(),
-    );
+    let resolved_signer = resolve_signer(&config.signing)?;
     let cold_path = ColdPathServices {
         warmup: WarmupCoordinator::default(),
         blockhash: BlockhashService {
@@ -123,17 +158,12 @@ pub fn bootstrap(config: BotConfig) -> BotRuntime {
         wallet_refresh: WalletRefreshService {
             balance_lamports: config.signing.bootstrap_balance_lamports,
             ready: config.signing.wallet_ready,
-            signer_available: signer.has_signer_material(),
+            signer_available: resolved_signer.signer_available,
         },
-    };
-    let owner_pubkey = if config.signing.owner_pubkey.is_empty() {
-        signer.pubkey_string().unwrap_or_default()
-    } else {
-        config.signing.owner_pubkey.clone()
     };
     let wallet_status = if !config.signing.wallet_ready {
         signing::WalletStatus::Refreshing
-    } else if signer.has_signer_material() {
+    } else if resolved_signer.signer_available {
         signing::WalletStatus::Ready
     } else {
         signing::WalletStatus::MissingSigner
@@ -145,11 +175,11 @@ pub fn bootstrap(config: BotConfig) -> BotRuntime {
             AtomicArbTransactionBuilder::new(execution_registry),
             signing::HotWallet {
                 wallet_id: config.signing.wallet_id.clone(),
-                owner_pubkey,
+                owner_pubkey: resolved_signer.owner_pubkey,
                 balance_lamports: config.signing.bootstrap_balance_lamports,
                 status: wallet_status,
             },
-            signer,
+            resolved_signer.signer,
             Box::new(JitoSubmitter::new(JitoConfig {
                 endpoint: config.jito.endpoint.clone(),
                 ws_endpoint: config.jito.ws_endpoint.clone(),
@@ -178,7 +208,18 @@ pub fn bootstrap(config: BotConfig) -> BotRuntime {
         max_pending_slots: config.reconciliation.max_pending_slots,
     }));
     runtime.apply_cold_path_seed();
-    runtime
+    Ok(runtime)
+}
+
+fn route_enabled_in_profile(
+    route: &crate::config::RouteConfig,
+    profile: RuntimeProfileConfig,
+) -> bool {
+    route.enabled
+        && match profile {
+            RuntimeProfileConfig::Default => true,
+            RuntimeProfileConfig::UltraFast => route.route_class == RouteClassConfig::AmmFastPath,
+        }
 }
 
 fn map_swap_side(side: &SwapSideConfig) -> SwapSide {
@@ -193,6 +234,35 @@ fn map_message_mode(mode: &MessageModeConfig) -> MessageMode {
         MessageModeConfig::V0Required => MessageMode::V0Required,
         MessageModeConfig::V0OrLegacy => MessageMode::V0OrLegacy,
     }
+}
+
+fn estimate_execution_cost_lamports(
+    builder: &BuilderConfig,
+    route_compute_unit_limit: u32,
+    route_compute_unit_price_micro_lamports: u64,
+    route_jito_tip_lamports: u64,
+) -> u64 {
+    let compute_unit_limit = effective_u32(builder.compute_unit_limit, route_compute_unit_limit);
+    let compute_unit_price_micro_lamports = effective_u64(
+        builder.compute_unit_price_micro_lamports,
+        route_compute_unit_price_micro_lamports,
+    );
+    let jito_tip_lamports = effective_u64(builder.jito_tip_lamports, route_jito_tip_lamports);
+    let priority_fee_lamports = (compute_unit_limit as u64)
+        .saturating_mul(compute_unit_price_micro_lamports)
+        .saturating_add(MICRO_LAMPORTS_PER_LAMPORT - 1)
+        / MICRO_LAMPORTS_PER_LAMPORT;
+    BASE_FEE_LAMPORTS_PER_SIGNATURE
+        .saturating_add(priority_fee_lamports)
+        .saturating_add(jito_tip_lamports)
+}
+
+fn effective_u32(value: u32, default_value: u32) -> u32 {
+    if value == 0 { default_value } else { value }
+}
+
+fn effective_u64(value: u64, default_value: u64) -> u64 {
+    if value == 0 { default_value } else { value }
 }
 
 fn map_leg_execution(config: &RouteLegExecutionConfig) -> VenueExecutionConfig {
@@ -210,6 +280,19 @@ fn map_leg_execution(config: &RouteLegExecutionConfig) -> VenueExecutionConfig {
                 user_source_token_account: config.user_source_token_account.clone(),
                 user_destination_token_account: config.user_destination_token_account.clone(),
                 host_fee_account: config.host_fee_account.clone(),
+            })
+        }
+        RouteLegExecutionConfig::OrcaWhirlpool(config) => {
+            VenueExecutionConfig::OrcaWhirlpool(OrcaWhirlpoolConfig {
+                program_id: config.program_id.clone(),
+                token_program_id: config.token_program_id.clone(),
+                whirlpool: config.whirlpool.clone(),
+                token_mint_a: config.token_mint_a.clone(),
+                token_vault_a: config.token_vault_a.clone(),
+                token_mint_b: config.token_mint_b.clone(),
+                token_vault_b: config.token_vault_b.clone(),
+                tick_spacing: config.tick_spacing,
+                a_to_b: config.a_to_b,
             })
         }
         RouteLegExecutionConfig::RaydiumSimplePool(config) => {
@@ -231,6 +314,82 @@ fn map_leg_execution(config: &RouteLegExecutionConfig) -> VenueExecutionConfig {
                 market_vault_signer: config.market_vault_signer.clone(),
                 user_source_token_account: config.user_source_token_account.clone(),
                 user_destination_token_account: config.user_destination_token_account.clone(),
+            })
+        }
+        RouteLegExecutionConfig::RaydiumClmm(config) => {
+            VenueExecutionConfig::RaydiumClmm(RaydiumClmmConfig {
+                program_id: config.program_id.clone(),
+                token_program_id: config.token_program_id.clone(),
+                token_program_2022_id: config.token_program_2022_id.clone(),
+                memo_program_id: config.memo_program_id.clone(),
+                pool_state: config.pool_state.clone(),
+                amm_config: config.amm_config.clone(),
+                observation_state: config.observation_state.clone(),
+                ex_bitmap_account: config.ex_bitmap_account.clone(),
+                token_mint_0: config.token_mint_0.clone(),
+                token_vault_0: config.token_vault_0.clone(),
+                token_mint_1: config.token_mint_1.clone(),
+                token_vault_1: config.token_vault_1.clone(),
+                tick_spacing: config.tick_spacing,
+                zero_for_one: config.zero_for_one,
+            })
+        }
+    }
+}
+
+fn resolve_signer(config: &SigningConfig) -> Result<ResolvedSigner, SigningError> {
+    match config.provider {
+        SigningProviderKind::Local => {
+            let signer = signing::LocalWalletSigner::new(
+                config.wallet_id.clone(),
+                config.keypair_path.clone(),
+                config.keypair_base58.clone(),
+            );
+            let owner_pubkey = if config.owner_pubkey.is_empty() {
+                signer.pubkey_string().unwrap_or_default()
+            } else {
+                config.owner_pubkey.clone()
+            };
+            let signer_available = signer.is_available();
+            Ok(ResolvedSigner {
+                owner_pubkey,
+                signer_available,
+                signer: Box::new(signer),
+            })
+        }
+        SigningProviderKind::SecureUnix => {
+            if config.keypair_path.is_some() || config.keypair_base58.is_some() {
+                return Err(SigningError::InvalidSignerConfig(
+                    "secure_unix provider does not accept signing.keypair_path or signing.keypair_base58"
+                        .into(),
+                ));
+            }
+            let socket_path = config.socket_path.clone().ok_or_else(|| {
+                SigningError::InvalidSignerConfig(
+                    "signing.socket_path is required for secure_unix provider".into(),
+                )
+            })?;
+            let expected_pubkey = if config.owner_pubkey.is_empty() {
+                None
+            } else {
+                Some(config.owner_pubkey.clone())
+            };
+            let signer = signing::SecureUnixWalletSigner::new(
+                config.wallet_id.clone(),
+                socket_path,
+                expected_pubkey,
+                config.connect_timeout_ms,
+                config.read_timeout_ms,
+            )?;
+            let owner_pubkey = if config.owner_pubkey.is_empty() {
+                signer.pubkey_string()?
+            } else {
+                config.owner_pubkey.clone()
+            };
+            Ok(ResolvedSigner {
+                owner_pubkey,
+                signer_available: signer.is_available(),
+                signer: Box::new(signer),
             })
         }
     }
