@@ -429,7 +429,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use builder::{AtomicLegPlan, MessageFormat};
+    use builder::{AtomicLegPlan, MessageFormat, SwapAmountMode};
     use solana_sdk::{hash::hashv, signer::keypair::Keypair};
     use state::types::{PoolId, RouteId};
     use strategy::route_registry::SwapSide;
@@ -574,16 +574,18 @@ mod tests {
                     venue: "orca".into(),
                     pool_id: PoolId("pool-a".into()),
                     side: SwapSide::BuyBase,
-                    input_amount: 10,
-                    min_output_amount: 11,
+                    amount_mode: SwapAmountMode::ExactIn,
+                    specified_amount: 10,
+                    other_amount_threshold: 11,
                     current_tick_index: None,
                 },
                 AtomicLegPlan {
                     venue: "raydium".into(),
                     pool_id: PoolId("pool-b".into()),
                     side: SwapSide::SellBase,
-                    input_amount: 11,
-                    min_output_amount: 12,
+                    amount_mode: SwapAmountMode::ExactIn,
+                    specified_amount: 11,
+                    other_amount_threshold: 12,
                     current_tick_index: None,
                 },
             ],

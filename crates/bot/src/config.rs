@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +61,12 @@ pub enum ConfigError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to deserialize merged config {path}: {source}")]
+    Deserialize {
+        path: String,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 impl BotConfig {
@@ -70,14 +77,8 @@ impl BotConfig {
             source,
         })?;
         match path.extension().and_then(|extension| extension.to_str()) {
-            Some("toml") => toml::from_str(&text).map_err(|source| ConfigError::Toml {
-                path: path.display().to_string(),
-                source,
-            }),
-            Some("json") => serde_json::from_str(&text).map_err(|source| ConfigError::Json {
-                path: path.display().to_string(),
-                source,
-            }),
+            Some("toml") => Self::from_toml_str(path, &text),
+            Some("json") => Self::from_json_str(path, &text),
             _ => Err(ConfigError::UnsupportedFormat {
                 path: path.display().to_string(),
             }),
@@ -97,6 +98,64 @@ impl BotConfig {
         self.runtime.refresh.slot_refresh_millis = 100;
         self.runtime.refresh.alt_refresh_millis = 1_000;
         self.runtime.refresh.wallet_refresh_millis = 1_000;
+    }
+
+    fn from_toml_str(path: &Path, text: &str) -> Result<Self, ConfigError> {
+        match toml::from_str::<Self>(text) {
+            Ok(config) => Ok(config),
+            Err(_) => {
+                let overlay =
+                    toml::from_str::<toml::Value>(text).map_err(|source| ConfigError::Toml {
+                        path: path.display().to_string(),
+                        source,
+                    })?;
+                Self::from_merged_value(
+                    path,
+                    serde_json::to_value(overlay).expect("TOML value should serialize"),
+                )
+            }
+        }
+    }
+
+    fn from_json_str(path: &Path, text: &str) -> Result<Self, ConfigError> {
+        match serde_json::from_str::<Self>(text) {
+            Ok(config) => Ok(config),
+            Err(_) => {
+                let overlay = serde_json::from_str::<JsonValue>(text).map_err(|source| {
+                    ConfigError::Json {
+                        path: path.display().to_string(),
+                        source,
+                    }
+                })?;
+                Self::from_merged_value(path, overlay)
+            }
+        }
+    }
+
+    fn from_merged_value(path: &Path, overlay: JsonValue) -> Result<Self, ConfigError> {
+        let mut merged =
+            serde_json::to_value(Self::default()).expect("BotConfig::default should serialize");
+        merge_json_value(&mut merged, overlay);
+        serde_json::from_value(merged).map_err(|source| ConfigError::Deserialize {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+}
+
+fn merge_json_value(base: &mut JsonValue, overlay: JsonValue) {
+    match (base, overlay) {
+        (JsonValue::Object(base_map), JsonValue::Object(overlay_map)) => {
+            for (key, value) in overlay_map {
+                match base_map.get_mut(&key) {
+                    Some(existing) => merge_json_value(existing, value),
+                    None => {
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => *base_value = overlay_value,
     }
 }
 
@@ -205,7 +264,11 @@ pub struct RouteConfig {
     pub default_trade_size: u64,
     pub max_trade_size: u64,
     #[serde(default)]
+    pub min_trade_size: Option<u64>,
+    #[serde(default)]
     pub size_ladder: Vec<u64>,
+    #[serde(default)]
+    pub execution_protection: RouteExecutionProtectionConfig,
     pub legs: [RouteLegConfig; 2],
     pub account_dependencies: Vec<AccountDependencyConfig>,
     pub execution: RouteExecutionConfig,
@@ -213,6 +276,17 @@ pub struct RouteConfig {
 
 fn default_route_enabled() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RouteExecutionProtectionConfig {
+    pub enabled: bool,
+    pub tight_max_quote_slot_lag: u64,
+    pub base_extra_buy_leg_slippage_bps: u16,
+    pub failure_step_bps: u16,
+    pub max_extra_buy_leg_slippage_bps: u16,
+    pub recovery_success_count: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -357,7 +431,8 @@ fn default_max_alt_slot_lag() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StrategyConfig {
-    pub min_profit_lamports: i64,
+    #[serde(alias = "min_profit_lamports")]
+    pub min_profit_quote_atoms: i64,
     pub max_snapshot_slot_lag: u64,
     pub require_route_warm: bool,
     pub max_inflight_submissions: usize,
@@ -368,7 +443,7 @@ pub struct StrategyConfig {
 impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
-            min_profit_lamports: 10,
+            min_profit_quote_atoms: 10,
             max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
@@ -696,7 +771,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{BotConfig, EventSourceMode, RuntimeProfileConfig};
+    use super::{BotConfig, EventSourceMode, ReducerRolloutMode, RuntimeProfileConfig};
 
     #[test]
     fn loads_toml_config_from_path() {
@@ -724,6 +799,141 @@ mod tests {
         assert_eq!(config.reconciliation.poll_interval_millis, 25);
         assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 200);
         assert_eq!(config.runtime.refresh.slot_refresh_millis, 100);
+    }
+
+    #[test]
+    fn loads_partial_toml_config_from_path_by_merging_defaults() {
+        let path = temp_path("bot-config-partial", "toml");
+        fs::write(
+            &path,
+            r#"
+[runtime]
+profile = "ultra_fast"
+
+[shredstream.reducers]
+raydium_simple_pool = "active"
+orca_simple_pool = "disabled"
+
+[signing]
+owner_pubkey = "owner-pubkey"
+
+[routes]
+
+[[routes.definitions]]
+route_id = "route-a"
+input_mint = "mint-in"
+output_mint = "mint-out"
+default_trade_size = 10
+max_trade_size = 20
+account_dependencies = []
+
+[[routes.definitions.legs]]
+venue = "raydium"
+pool_id = "pool-a"
+side = "buy_base"
+
+[routes.definitions.legs.execution]
+kind = "raydium_simple_pool"
+program_id = "program-a"
+token_program_id = "token-program"
+amm_pool = "pool-a"
+amm_authority = "authority-a"
+amm_open_orders = "orders-a"
+amm_coin_vault = "coin-vault-a"
+amm_pc_vault = "pc-vault-a"
+market_program = "market-program-a"
+market = "market-a"
+market_bids = "bids-a"
+market_asks = "asks-a"
+market_event_queue = "queue-a"
+market_coin_vault = "market-coin-a"
+market_pc_vault = "market-pc-a"
+market_vault_signer = "signer-a"
+user_source_token_account = "user-source-a"
+user_destination_token_account = "user-destination-a"
+
+[[routes.definitions.legs]]
+venue = "raydium"
+pool_id = "pool-b"
+side = "sell_base"
+
+[routes.definitions.legs.execution]
+kind = "raydium_simple_pool"
+program_id = "program-b"
+token_program_id = "token-program"
+amm_pool = "pool-b"
+amm_authority = "authority-b"
+amm_open_orders = "orders-b"
+amm_coin_vault = "coin-vault-b"
+amm_pc_vault = "pc-vault-b"
+market_program = "market-program-b"
+market = "market-b"
+market_bids = "bids-b"
+market_asks = "asks-b"
+market_event_queue = "queue-b"
+market_coin_vault = "market-coin-b"
+market_pc_vault = "market-pc-b"
+market_vault_signer = "signer-b"
+user_source_token_account = "user-source-b"
+user_destination_token_account = "user-destination-b"
+
+[routes.definitions.execution]
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 25000
+default_jito_tip_lamports = 5000
+"#,
+        )
+        .unwrap();
+
+        let loaded = BotConfig::from_path(&path).unwrap();
+
+        assert_eq!(loaded.runtime.profile, RuntimeProfileConfig::UltraFast);
+        assert_eq!(
+            loaded.shredstream.reducers.raydium_simple_pool,
+            ReducerRolloutMode::Active
+        );
+        assert_eq!(
+            loaded.shredstream.reducers.orca_simple_pool,
+            ReducerRolloutMode::Disabled
+        );
+        assert_eq!(loaded.shredstream.grpc_endpoint, "http://127.0.0.1:50051");
+        assert_eq!(loaded.signing.owner_pubkey, "owner-pubkey");
+        assert_eq!(loaded.routes.definitions.len(), 1);
+        assert_eq!(loaded.routes.definitions[0].route_id, "route-a");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn loads_amm_fast_manifest_from_path_by_merging_defaults() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("sol_usdc_routes_amm_fast.toml");
+        let loaded = BotConfig::from_path(path).unwrap();
+
+        assert_eq!(loaded.runtime.profile, RuntimeProfileConfig::UltraFast);
+        assert_eq!(
+            loaded.shredstream.reducers.raydium_simple_pool,
+            ReducerRolloutMode::Active
+        );
+        assert_eq!(
+            loaded.shredstream.reducers.raydium_clmm,
+            ReducerRolloutMode::Active
+        );
+        assert_eq!(
+            loaded.shredstream.reducers.orca_whirlpool,
+            ReducerRolloutMode::Active
+        );
+        assert_eq!(
+            loaded.shredstream.reducers.orca_simple_pool,
+            ReducerRolloutMode::Disabled
+        );
+        assert_eq!(
+            loaded.signing.owner_pubkey,
+            "3KD9WKqrrErCsRp7oFoJ58RLqrNJfz8jS3Do8oJ3Gzx1"
+        );
+        assert_eq!(loaded.routes.definitions.len(), 8);
     }
 
     fn temp_path(prefix: &str, extension: &str) -> PathBuf {

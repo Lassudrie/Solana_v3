@@ -18,7 +18,7 @@ use crate::{
     types::{
         AccountSource, AtomicLegPlan, BuildRejectionReason, BuildRequest, BuildResult, BuildStatus,
         DynamicBuildParameters, InstructionAccount, InstructionTemplate, MessageFormat,
-        ResolvedAddressLookupTable, UnsignedTransactionEnvelope,
+        ResolvedAddressLookupTable, SwapAmountMode, UnsignedTransactionEnvelope,
     },
 };
 
@@ -29,6 +29,7 @@ const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget11111111111111111111111111
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
+const RAYDIUM_SWAP_BASE_OUT_TAG: u8 = 11;
 const ORCA_WHIRLPOOL_TICK_ARRAY_SIZE: i32 = 88;
 const RAYDIUM_CLMM_TICK_ARRAY_SIZE: i32 = 60;
 
@@ -88,7 +89,9 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             return rejected(BuildRejectionReason::QuoteStaleForExecution);
         }
 
-        let leg_plans = self.template.materialize_leg_plans(&request.candidate);
+        let leg_plans = self
+            .template
+            .materialize_leg_plans(&request.candidate, route_execution);
         if !route_matches_execution(route_execution, &leg_plans) {
             return rejected(BuildRejectionReason::UnsupportedVenue);
         }
@@ -294,10 +297,13 @@ fn compile_orca_simple_pool(
     fee_payer: Pubkey,
     leg_plan: &AtomicLegPlan,
 ) -> Result<Instruction, BuildRejectionReason> {
+    if leg_plan.amount_mode != SwapAmountMode::ExactIn {
+        return Err(BuildRejectionReason::UnsupportedVenue);
+    }
     let mut data = Vec::with_capacity(17);
     data.push(ORCA_SWAP_INSTRUCTION_TAG);
-    data.extend_from_slice(&leg_plan.input_amount.to_le_bytes());
-    data.extend_from_slice(&leg_plan.min_output_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
 
     let mut accounts = vec![
         AccountMeta::new_readonly(parse_pubkey(&config.swap_account)?, false),
@@ -328,9 +334,18 @@ fn compile_raydium_simple_pool(
     leg_plan: &AtomicLegPlan,
 ) -> Result<Instruction, BuildRejectionReason> {
     let mut data = Vec::with_capacity(17);
-    data.push(RAYDIUM_SWAP_BASE_IN_TAG);
-    data.extend_from_slice(&leg_plan.input_amount.to_le_bytes());
-    data.extend_from_slice(&leg_plan.min_output_amount.to_le_bytes());
+    let tag = match leg_plan.amount_mode {
+        SwapAmountMode::ExactIn => RAYDIUM_SWAP_BASE_IN_TAG,
+        SwapAmountMode::ExactOut
+            if leg_plan.side == strategy::route_registry::SwapSide::BuyBase =>
+        {
+            RAYDIUM_SWAP_BASE_OUT_TAG
+        }
+        SwapAmountMode::ExactOut => return Err(BuildRejectionReason::UnsupportedVenue),
+    };
+    data.push(tag);
+    data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
 
     Ok(Instruction {
         program_id: parse_pubkey(&config.program_id)?,
@@ -384,10 +399,10 @@ fn compile_orca_whirlpool(
     let oracle = derive_orca_oracle(program_id, whirlpool);
 
     let mut data = anchor_instruction_data("swap");
-    data.extend_from_slice(&leg_plan.input_amount.to_le_bytes());
-    data.extend_from_slice(&leg_plan.min_output_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes());
-    data.push(1);
+    data.push(u8::from(leg_plan.amount_mode == SwapAmountMode::ExactIn));
     data.push(u8::from(config.a_to_b));
 
     Ok(Instruction {
@@ -461,10 +476,10 @@ fn compile_raydium_clmm(
     );
 
     let mut data = anchor_instruction_data("swap_v2");
-    data.extend_from_slice(&leg_plan.input_amount.to_le_bytes());
-    data.extend_from_slice(&leg_plan.min_output_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
+    data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
     data.extend_from_slice(&0u128.to_le_bytes());
-    data.push(1);
+    data.push(u8::from(leg_plan.amount_mode == SwapAmountMode::ExactIn));
 
     let mut accounts = vec![
         AccountMeta::new_readonly(fee_payer, true),
@@ -575,6 +590,141 @@ fn used_lookup_tables(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use solana_sdk::{hash::hashv, pubkey::Pubkey};
+
+    use crate::types::SwapAmountMode;
+
+    use super::*;
+
+    fn test_pubkey(label: &str) -> String {
+        Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
+    }
+
+    fn read_u64(data: &[u8], offset: usize) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&data[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn orca_whirlpool_exact_out_instruction_sets_exact_out_flag() {
+        let config = OrcaWhirlpoolConfig {
+            program_id: test_pubkey("orca-program"),
+            token_program_id: test_pubkey("spl-token-program"),
+            whirlpool: test_pubkey("whirlpool"),
+            token_mint_a: test_pubkey("mint-a"),
+            token_vault_a: test_pubkey("vault-a"),
+            token_mint_b: test_pubkey("mint-b"),
+            token_vault_b: test_pubkey("vault-b"),
+            tick_spacing: 64,
+            a_to_b: true,
+        };
+        let fee_payer = parse_static_pubkey(&test_pubkey("fee-payer"));
+        let instruction = compile_orca_whirlpool(
+            &config,
+            fee_payer,
+            &AtomicLegPlan {
+                venue: "orca_whirlpool".into(),
+                pool_id: state::types::PoolId("pool-a".into()),
+                side: strategy::route_registry::SwapSide::BuyBase,
+                amount_mode: SwapAmountMode::ExactOut,
+                specified_amount: 123,
+                other_amount_threshold: 456,
+                current_tick_index: Some(0),
+            },
+        )
+        .expect("orca whirlpool exact-out instruction");
+
+        assert_eq!(read_u64(&instruction.data, 8), 123);
+        assert_eq!(read_u64(&instruction.data, 16), 456);
+        assert_eq!(instruction.data[40], 0);
+        assert_eq!(instruction.data[41], 1);
+    }
+
+    #[test]
+    fn raydium_clmm_exact_out_instruction_sets_exact_out_flag() {
+        let config = RaydiumClmmConfig {
+            program_id: test_pubkey("raydium-clmm-program"),
+            token_program_id: test_pubkey("spl-token-program"),
+            token_program_2022_id: test_pubkey("spl-token-2022"),
+            memo_program_id: test_pubkey("memo-program"),
+            pool_state: test_pubkey("pool-state"),
+            amm_config: test_pubkey("amm-config"),
+            observation_state: test_pubkey("observation-state"),
+            ex_bitmap_account: None,
+            token_mint_0: test_pubkey("mint-0"),
+            token_vault_0: test_pubkey("vault-0"),
+            token_mint_1: test_pubkey("mint-1"),
+            token_vault_1: test_pubkey("vault-1"),
+            tick_spacing: 60,
+            zero_for_one: true,
+        };
+        let fee_payer = parse_static_pubkey(&test_pubkey("fee-payer"));
+        let instruction = compile_raydium_clmm(
+            &config,
+            fee_payer,
+            &AtomicLegPlan {
+                venue: "raydium_clmm".into(),
+                pool_id: state::types::PoolId("pool-b".into()),
+                side: strategy::route_registry::SwapSide::BuyBase,
+                amount_mode: SwapAmountMode::ExactOut,
+                specified_amount: 321,
+                other_amount_threshold: 654,
+                current_tick_index: Some(0),
+            },
+        )
+        .expect("raydium clmm exact-out instruction");
+
+        assert_eq!(read_u64(&instruction.data, 8), 321);
+        assert_eq!(read_u64(&instruction.data, 16), 654);
+        assert_eq!(instruction.data[40], 0);
+    }
+
+    #[test]
+    fn raydium_simple_buy_base_exact_out_uses_base_out_tag() {
+        let config = RaydiumSimplePoolConfig {
+            program_id: test_pubkey("raydium-program"),
+            token_program_id: test_pubkey("spl-token-program"),
+            amm_pool: test_pubkey("amm-pool"),
+            amm_authority: test_pubkey("amm-authority"),
+            amm_open_orders: test_pubkey("amm-open-orders"),
+            amm_coin_vault: test_pubkey("amm-coin-vault"),
+            amm_pc_vault: test_pubkey("amm-pc-vault"),
+            market_program: test_pubkey("market-program"),
+            market: test_pubkey("market"),
+            market_bids: test_pubkey("market-bids"),
+            market_asks: test_pubkey("market-asks"),
+            market_event_queue: test_pubkey("market-event-queue"),
+            market_coin_vault: test_pubkey("market-coin-vault"),
+            market_pc_vault: test_pubkey("market-pc-vault"),
+            market_vault_signer: test_pubkey("market-vault-signer"),
+            user_source_token_account: test_pubkey("user-source"),
+            user_destination_token_account: test_pubkey("user-destination"),
+        };
+        let fee_payer = parse_static_pubkey(&test_pubkey("fee-payer"));
+        let instruction = compile_raydium_simple_pool(
+            &config,
+            fee_payer,
+            &AtomicLegPlan {
+                venue: "raydium".into(),
+                pool_id: state::types::PoolId("pool-c".into()),
+                side: strategy::route_registry::SwapSide::BuyBase,
+                amount_mode: SwapAmountMode::ExactOut,
+                specified_amount: 777,
+                other_amount_threshold: 888,
+                current_tick_index: None,
+            },
+        )
+        .expect("raydium simple exact-out instruction");
+
+        assert_eq!(instruction.data[0], RAYDIUM_SWAP_BASE_OUT_TAG);
+        assert_eq!(read_u64(&instruction.data, 1), 777);
+        assert_eq!(read_u64(&instruction.data, 9), 888);
+    }
 }
 
 fn parse_pubkey(value: &str) -> Result<Pubkey, BuildRejectionReason> {

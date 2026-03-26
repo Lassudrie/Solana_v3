@@ -7,7 +7,8 @@ pub use classifier::{FailureClass, OutcomeClassifier};
 pub use history::ExecutionHistory;
 pub use onchain::{OnChainReconciler, ReconciliationConfig as OnChainReconciliationConfig};
 pub use tracker::{
-    ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, InclusionStatus,
+    ExecutionFailureDetail, ExecutionOutcome, ExecutionRecord, ExecutionTracker,
+    ExecutionTransition, InclusionStatus,
 };
 
 #[cfg(test)]
@@ -337,6 +338,92 @@ mod tests {
         assert_eq!(
             updated.outcome,
             ExecutionOutcome::Failed(super::FailureClass::TransportFailed)
+        );
+    }
+
+    #[test]
+    fn onchain_reconciler_classifies_too_little_output_with_failure_detail() {
+        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getSignatureStatuses" => json!({
+                    "result": {
+                        "value": [{
+                            "slot": 88,
+                            "err": { "InstructionError": [2, { "Custom": 6022 }] }
+                        }]
+                    }
+                })
+                .to_string(),
+                "getTransaction" => json!({
+                    "result": {
+                        "meta": {
+                            "err": { "InstructionError": [2, { "Custom": 6022 }] },
+                            "logMessages": [
+                                "Program log: AnchorError thrown in programs/amm/src/instructions/swap_v2.rs:362. Error Code: TooLittleOutputReceived. Error Number: 6022. Error Message: Too little output received."
+                            ]
+                        },
+                        "transaction": {
+                            "message": {
+                                "instructions": [
+                                    { "programId": "ComputeBudget111111111111111111111111111111" },
+                                    { "programId": "ComputeBudget111111111111111111111111111111" },
+                                    { "programId": "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" }
+                                ]
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let mut tracker = ExecutionTracker::default();
+        let record = tracker.register_submission(
+            RouteId("route-a".into()),
+            "chain-sig".into(),
+            10,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-1".into()),
+                endpoint: rpc_endpoint.clone(),
+                rejection: None,
+            },
+        );
+        let mut reconciler = OnChainReconciler::new(OnChainReconciliationConfig {
+            enabled: true,
+            rpc_http_endpoint: rpc_endpoint,
+            rpc_ws_endpoint: "mock://solana-ws".into(),
+            websocket_enabled: false,
+            websocket_timeout_ms: 5,
+            search_transaction_history: true,
+            max_pending_slots: 5,
+        });
+
+        let transitions = reconciler.tick(&mut tracker, 10);
+
+        assert_eq!(transitions.len(), 1);
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(
+            updated.inclusion_status,
+            InclusionStatus::Failed(super::FailureClass::ChainExecutionTooLittleOutput)
+        );
+        assert_eq!(
+            updated.outcome,
+            ExecutionOutcome::Failed(super::FailureClass::ChainExecutionTooLittleOutput)
+        );
+        let detail = updated.failure_detail.as_ref().expect("failure detail");
+        assert_eq!(detail.instruction_index, Some(2));
+        assert_eq!(
+            detail.program_id.as_deref(),
+            Some("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK")
+        );
+        assert_eq!(detail.custom_code, Some(6_022));
+        assert_eq!(
+            detail.error_name.as_deref(),
+            Some("TooLittleOutputReceived")
         );
     }
 

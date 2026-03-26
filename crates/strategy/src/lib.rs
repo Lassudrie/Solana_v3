@@ -5,6 +5,8 @@ pub mod reasons;
 pub mod route_registry;
 pub mod selector;
 
+use std::collections::HashMap;
+
 use guards::{GuardrailConfig, GuardrailSet};
 use opportunity::SelectionOutcome;
 use quote::LocalTwoLegQuoteEngine;
@@ -12,10 +14,17 @@ use route_registry::{RouteDefinition, RouteRegistry};
 use selector::OpportunitySelector;
 use state::{StatePlane, types::RouteId};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RouteExecutionProtectionState {
+    current_extra_buy_leg_slippage_bps: u16,
+    consecutive_successes: u16,
+}
+
 #[derive(Debug)]
 pub struct StrategyPlane {
     registry: RouteRegistry,
     selector: OpportunitySelector,
+    execution_protection: HashMap<RouteId, RouteExecutionProtectionState>,
 }
 
 impl StrategyPlane {
@@ -26,21 +35,86 @@ impl StrategyPlane {
                 LocalTwoLegQuoteEngine,
                 GuardrailSet::new(guardrails),
             ),
+            execution_protection: HashMap::new(),
         }
     }
 
     pub fn register_route(&mut self, route: RouteDefinition) {
+        if let Some(policy) = &route.execution_protection {
+            self.execution_protection.insert(
+                route.route_id.clone(),
+                RouteExecutionProtectionState {
+                    current_extra_buy_leg_slippage_bps: policy.base_extra_buy_leg_slippage_bps,
+                    consecutive_successes: 0,
+                },
+            );
+        }
         self.registry.register(route);
     }
 
     pub fn evaluate(
-        &self,
+        &mut self,
         state: &StatePlane,
         impacted_routes: &[RouteId],
         inflight_submissions: usize,
     ) -> SelectionOutcome {
-        self.selector
-            .evaluate(&self.registry, state, impacted_routes, inflight_submissions)
+        let route_execution_buffers = self
+            .execution_protection
+            .iter()
+            .map(|(route_id, state)| (route_id.clone(), state.current_extra_buy_leg_slippage_bps))
+            .collect::<HashMap<_, _>>();
+        self.selector.evaluate(
+            &self.registry,
+            state,
+            impacted_routes,
+            inflight_submissions,
+            &route_execution_buffers,
+        )
+    }
+
+    pub fn record_execution_too_little_output(&mut self, route_id: &RouteId) {
+        let Some(route) = self.registry.get(route_id) else {
+            return;
+        };
+        let Some(policy) = &route.execution_protection else {
+            return;
+        };
+        let Some(state) = self.execution_protection.get_mut(route_id) else {
+            return;
+        };
+        state.current_extra_buy_leg_slippage_bps = state
+            .current_extra_buy_leg_slippage_bps
+            .saturating_add(policy.failure_step_bps)
+            .min(policy.max_extra_buy_leg_slippage_bps);
+        state.consecutive_successes = 0;
+    }
+
+    pub fn record_execution_success(&mut self, route_id: &RouteId) {
+        let Some(route) = self.registry.get(route_id) else {
+            return;
+        };
+        let Some(policy) = &route.execution_protection else {
+            return;
+        };
+        let Some(state) = self.execution_protection.get_mut(route_id) else {
+            return;
+        };
+        state.consecutive_successes = state.consecutive_successes.saturating_add(1);
+        if state.consecutive_successes < policy.recovery_success_count.max(1) {
+            return;
+        }
+
+        state.current_extra_buy_leg_slippage_bps = state
+            .current_extra_buy_leg_slippage_bps
+            .saturating_sub(policy.failure_step_bps)
+            .max(policy.base_extra_buy_leg_slippage_bps);
+        state.consecutive_successes = 0;
+    }
+
+    pub fn active_execution_buffer_bps(&self, route_id: &RouteId) -> Option<u16> {
+        self.execution_protection
+            .get(route_id)
+            .map(|state| state.current_extra_buy_leg_slippage_bps)
     }
 }
 
@@ -53,7 +127,7 @@ mod tests {
         guards::GuardrailConfig,
         opportunity::OpportunityDecision,
         reasons::RejectionReason,
-        route_registry::{RouteDefinition, RouteLeg, SwapSide},
+        route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
     };
     use state::{
         StatePlane,
@@ -90,11 +164,61 @@ mod tests {
                     fee_bps: None,
                 },
             ],
+            min_trade_size: 10_000,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
             estimated_execution_cost_lamports: 0,
+            execution_protection: None,
         }
+    }
+
+    fn protected_route_definition() -> RouteDefinition {
+        let mut route = route_definition();
+        route.execution_protection = Some(ExecutionProtectionPolicy {
+            tight_max_quote_slot_lag: 4,
+            base_extra_buy_leg_slippage_bps: 50,
+            failure_step_bps: 25,
+            max_extra_buy_leg_slippage_bps: 150,
+            recovery_success_count: 3,
+        });
+        route
+    }
+
+    fn apply_exact_snapshot(
+        state: &mut StatePlane,
+        sequence: u64,
+        pool_id: &str,
+        slot: u64,
+        reserve_a: u64,
+        reserve_b: u64,
+    ) {
+        state
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::Synthetic,
+                sequence,
+                slot,
+                detection::PoolSnapshotUpdate {
+                    pool_id: pool_id.into(),
+                    price_bps: ((u128::from(reserve_b) * 10_000u128) / u128::from(reserve_a))
+                        as u64,
+                    fee_bps: 4,
+                    reserve_depth: reserve_a.min(reserve_b),
+                    reserve_a: Some(reserve_a),
+                    reserve_b: Some(reserve_b),
+                    active_liquidity: Some(reserve_a.min(reserve_b)),
+                    sqrt_price_x64: None,
+                    exact: Some(true),
+                    repair_pending: Some(false),
+                    token_mint_a: "SOL".into(),
+                    token_mint_b: "USDC".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
     }
 
     #[test]
@@ -125,7 +249,7 @@ mod tests {
     fn produces_structured_opportunity_candidate() {
         let route = route_definition();
         let mut strategy = StrategyPlane::new(GuardrailConfig {
-            min_profit_lamports: 10,
+            min_profit_quote_atoms: 10,
             max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
@@ -190,7 +314,7 @@ mod tests {
         let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
         let candidate = outcome.best_candidate.expect("candidate");
         assert_eq!(candidate.route_id, route.route_id);
-        assert!(candidate.expected_net_profit > 0);
+        assert!(candidate.expected_net_profit_quote_atoms > 0);
         assert_eq!(candidate.leg_quotes.len(), 2);
     }
 
@@ -199,7 +323,7 @@ mod tests {
         let mut route = route_definition();
         route.estimated_execution_cost_lamports = 5_000;
         let mut strategy = StrategyPlane::new(GuardrailConfig {
-            min_profit_lamports: 10,
+            min_profit_quote_atoms: 10,
             max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
@@ -232,52 +356,25 @@ mod tests {
         state.execution_state_mut().set_rpc_slot(12);
         state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
-        state
-            .apply_event(&NormalizedEvent::account_update(
-                EventSourceKind::Synthetic,
-                1,
-                10,
-                AccountUpdate {
-                    pubkey: "acct-a".into(),
-                    owner: "owner".into(),
-                    lamports: 0,
-                    data: encode_pool(12_000, 4, 100_000),
-                    slot: 10,
-                    write_version: 1,
-                },
-            ))
-            .unwrap();
-        state
-            .apply_event(&NormalizedEvent::account_update(
-                EventSourceKind::Synthetic,
-                2,
-                11,
-                AccountUpdate {
-                    pubkey: "acct-b".into(),
-                    owner: "owner".into(),
-                    lamports: 0,
-                    data: encode_pool(12_000, 4, 100_000),
-                    slot: 11,
-                    write_version: 1,
-                },
-            ))
-            .unwrap();
+        apply_exact_snapshot(&mut state, 1, "pool-a", 10, 1_000_000, 700_000);
+        apply_exact_snapshot(&mut state, 2, "pool-b", 11, 1_000_000, 1_300_000);
 
         let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
         let candidate = outcome.best_candidate.expect("candidate");
         assert_eq!(candidate.trade_size, route.max_trade_size);
         assert!(
-            candidate.expected_gross_profit > candidate.estimated_execution_cost_lamports as i64
+            candidate.expected_gross_profit_quote_atoms
+                > candidate.estimated_execution_cost_quote_atoms as i64
         );
-        assert!(candidate.expected_net_profit > 0);
+        assert!(candidate.expected_net_profit_quote_atoms > 0);
     }
 
     #[test]
     fn rejects_route_when_execution_cost_exceeds_edge() {
         let mut route = route_definition();
-        route.estimated_execution_cost_lamports = 10_000;
+        route.estimated_execution_cost_lamports = 40_000;
         let mut strategy = StrategyPlane::new(GuardrailConfig {
-            min_profit_lamports: 10,
+            min_profit_quote_atoms: 10,
             max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
@@ -310,36 +407,8 @@ mod tests {
         state.execution_state_mut().set_rpc_slot(12);
         state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
-        state
-            .apply_event(&NormalizedEvent::account_update(
-                EventSourceKind::Synthetic,
-                1,
-                10,
-                AccountUpdate {
-                    pubkey: "acct-a".into(),
-                    owner: "owner".into(),
-                    lamports: 0,
-                    data: encode_pool(10_150, 4, 100_000),
-                    slot: 10,
-                    write_version: 1,
-                },
-            ))
-            .unwrap();
-        state
-            .apply_event(&NormalizedEvent::account_update(
-                EventSourceKind::Synthetic,
-                2,
-                11,
-                AccountUpdate {
-                    pubkey: "acct-b".into(),
-                    owner: "owner".into(),
-                    lamports: 0,
-                    data: encode_pool(10_080, 4, 100_000),
-                    slot: 11,
-                    write_version: 1,
-                },
-            ))
-            .unwrap();
+        apply_exact_snapshot(&mut state, 1, "pool-a", 10, 1_000_000, 700_000);
+        apply_exact_snapshot(&mut state, 2, "pool-b", 11, 1_000_000, 1_300_000);
 
         let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
         assert!(matches!(
@@ -424,10 +493,112 @@ mod tests {
         assert!(matches!(
             outcome.decisions.first(),
             Some(OpportunityDecision::Rejected {
+                reason: RejectionReason::PoolRepairPending { .. },
+                ..
+            })
+        ));
+        assert!(outcome.best_candidate.is_none());
+    }
+
+    #[test]
+    fn rejects_route_when_snapshot_is_probable_without_active_repair() {
+        let route = route_definition();
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        strategy.register_route(route.clone());
+
+        let mut state = StatePlane::new(2);
+        state.register_route(
+            route.route_id.clone(),
+            vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
+        );
+        state
+            .execution_state_mut()
+            .set_wallet_state(1_000_000, true);
+        state.execution_state_mut().set_rpc_slot(12);
+        state.execution_state_mut().set_blockhash("blockhash-1", 12);
+
+        state
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                1,
+                10,
+                detection::PoolSnapshotUpdate {
+                    pool_id: "pool-a".into(),
+                    price_bps: 10_000,
+                    fee_bps: 4,
+                    reserve_depth: 100_000,
+                    reserve_a: Some(100_000),
+                    reserve_b: Some(100_000),
+                    active_liquidity: Some(100_000),
+                    sqrt_price_x64: None,
+                    exact: Some(false),
+                    repair_pending: Some(false),
+                    token_mint_a: "SOL".into(),
+                    token_mint_b: "USDC".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+        state
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                2,
+                10,
+                detection::PoolSnapshotUpdate {
+                    pool_id: "pool-b".into(),
+                    price_bps: 10_000,
+                    fee_bps: 4,
+                    reserve_depth: 100_000,
+                    reserve_a: Some(100_000),
+                    reserve_b: Some(100_000),
+                    active_liquidity: Some(100_000),
+                    sqrt_price_x64: None,
+                    exact: Some(true),
+                    repair_pending: Some(false),
+                    token_mint_a: "SOL".into(),
+                    token_mint_b: "USDC".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+
+        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        assert!(matches!(
+            outcome.decisions.first(),
+            Some(OpportunityDecision::Rejected {
                 reason: RejectionReason::PoolStateNotExact { .. },
                 ..
             })
         ));
         assert!(outcome.best_candidate.is_none());
+    }
+
+    #[test]
+    fn execution_protection_state_steps_up_and_recovers() {
+        let route = protected_route_definition();
+        let route_id = route.route_id.clone();
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        strategy.register_route(route);
+
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(50));
+
+        strategy.record_execution_too_little_output(&route_id);
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(75));
+
+        strategy.record_execution_too_little_output(&route_id);
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(100));
+
+        strategy.record_execution_success(&route_id);
+        strategy.record_execution_success(&route_id);
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(100));
+
+        strategy.record_execution_success(&route_id);
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(75));
     }
 }

@@ -76,6 +76,22 @@ impl MarketEventSource for ShredStreamSource {
     }
 
     fn poll_next(&mut self) -> Result<Option<NormalizedEvent>, IngestError> {
+        self.next_event(None)
+    }
+
+    fn wait_next(&mut self, timeout: Duration) -> Result<Option<NormalizedEvent>, IngestError> {
+        if timeout.is_zero() {
+            return self.poll_next();
+        }
+        self.next_event(Some(timeout))
+    }
+}
+
+impl ShredStreamSource {
+    fn next_event(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<NormalizedEvent>, IngestError> {
         if let Some(event) = self.queue.pop_front() {
             return Ok(Some(event));
         }
@@ -103,37 +119,82 @@ impl MarketEventSource for ShredStreamSource {
             }
         }
 
+        let Some((payload, sender)) = self.recv_wire_datagram(timeout)? else {
+            return Ok(None);
+        };
+
+        let event = parse_wire_event(
+            &payload,
+            self.source_kind(),
+            &mut self.generated_sequence,
+            self.config.auth_token.as_deref(),
+        )?;
+        self.ingest_event(event, sender)
+    }
+
+    fn recv_wire_datagram(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> Result<Option<(String, SocketAddr)>, IngestError> {
+        let kind = self.source_kind();
         let Some(socket) = self.socket.as_mut() else {
             return Ok(None);
         };
 
+        if let Some(timeout) = timeout {
+            socket
+                .set_nonblocking(false)
+                .map_err(|error| IngestError::SourceFailure {
+                    kind,
+                    detail: error.to_string(),
+                })?;
+            socket
+                .set_read_timeout(Some(timeout))
+                .map_err(|error| IngestError::SourceFailure {
+                    kind,
+                    detail: error.to_string(),
+                })?;
+        }
+
         let mut buffer = [0u8; 65_535];
-        match socket.recv_from(&mut buffer) {
+        let recv_result = socket.recv_from(&mut buffer);
+
+        if timeout.is_some() {
+            let restore_timeout = socket.set_read_timeout(None);
+            let restore_nonblocking = socket.set_nonblocking(true);
+            if let Err(error) = restore_timeout.and(restore_nonblocking) {
+                return Err(IngestError::SourceFailure {
+                    kind,
+                    detail: error.to_string(),
+                });
+            }
+        }
+
+        match recv_result {
             Ok((bytes, sender)) => {
                 let payload = std::str::from_utf8(&buffer[..bytes]).map_err(|error| {
                     IngestError::SourceFailure {
-                        kind: self.source_kind(),
+                        kind,
                         detail: error.to_string(),
                     }
                 })?;
-                let event = parse_wire_event(
-                    payload,
-                    self.source_kind(),
-                    &mut self.generated_sequence,
-                    self.config.auth_token.as_deref(),
-                )?;
-                self.ingest_event(event, sender)
+                Ok(Some((payload.to_owned(), sender)))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
             Err(error) => Err(IngestError::SourceFailure {
-                kind: self.source_kind(),
+                kind,
                 detail: error.to_string(),
             }),
         }
     }
-}
 
-impl ShredStreamSource {
     fn ingest_event(
         &mut self,
         event: NormalizedEvent,

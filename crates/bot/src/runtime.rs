@@ -319,6 +319,10 @@ impl BotRuntime {
         self.hot_path.state.ready_route_count()
     }
 
+    pub fn tradable_route_count(&self) -> usize {
+        self.hot_path.state.tradable_route_count()
+    }
+
     pub fn pending_submissions(&self) -> usize {
         self.tracker.pending_count()
     }
@@ -336,6 +340,19 @@ impl BotRuntime {
         self.telemetry
             .record_stage(PipelineStage::Reconcile, reconcile_started.elapsed());
         for transition in &transitions {
+            if let Some(record) = self.tracker.get(&transition.submission_id) {
+                match &transition.current_outcome {
+                    ExecutionOutcome::Included { .. } => self
+                        .hot_path
+                        .strategy
+                        .record_execution_success(&record.route_id),
+                    ExecutionOutcome::Failed(FailureClass::ChainExecutionTooLittleOutput) => self
+                        .hot_path
+                        .strategy
+                        .record_execution_too_little_output(&record.route_id),
+                    _ => {}
+                }
+            }
             self.record_transition_metrics(transition);
         }
         transitions
@@ -348,7 +365,11 @@ impl BotRuntime {
             .set_kill_switch(enabled);
     }
 
-    pub fn process_event(&mut self, event: NormalizedEvent) -> Result<HotPathReport, RuntimeError> {
+    pub fn prepare_event(
+        &mut self,
+        event: NormalizedEvent,
+        additional_pending_submissions: usize,
+    ) -> Result<HotPathReport, RuntimeError> {
         let mut pipeline_trace = PipelineTrace::from_event(&event);
         let process_started_at = SystemTime::now();
         pipeline_trace.queue_wait_duration = process_started_at
@@ -399,7 +420,9 @@ impl BotRuntime {
         let selection = self.hot_path.strategy.evaluate(
             &self.hot_path.state,
             &state_outcome.impacted_routes,
-            self.tracker.pending_count(),
+            self.tracker
+                .pending_count()
+                .saturating_add(additional_pending_submissions),
         );
         let select_duration = strategy_started.elapsed();
         pipeline_trace.select_duration = Some(select_duration);
@@ -470,20 +493,37 @@ impl BotRuntime {
         self.telemetry
             .record_stage(PipelineStage::Sign, sign_duration);
 
-        let submit_started = Instant::now();
-        let submit_result = self.hot_path.submitter.submit(SubmitRequest {
-            envelope: signed_envelope.clone(),
-            mode: self.submit_mode,
-        })?;
-        let submit_duration = submit_started.elapsed();
-        pipeline_trace.submit_duration = Some(submit_duration);
-        pipeline_trace.total_to_submit = SystemTime::now()
-            .duration_since(event.latency.source_received_at)
+        Ok(HotPathReport {
+            state_outcome: Some(state_outcome),
+            pool_snapshots,
+            selection,
+            build_result: Some(build_result),
+            signed_envelope: Some(signed_envelope),
+            submit_result: None,
+            execution_record: None,
+            pipeline_trace,
+        })
+    }
+
+    pub fn finalize_submission(
+        &mut self,
+        mut report: HotPathReport,
+        submit_result: SubmitResult,
+        submit_duration: Duration,
+        submitted_at: SystemTime,
+    ) -> HotPathReport {
+        report.pipeline_trace.submit_duration = Some(submit_duration);
+        report.pipeline_trace.total_to_submit = submitted_at
+            .duration_since(report.pipeline_trace.source_received_at)
             .ok();
         self.telemetry
             .record_stage(PipelineStage::Submit, submit_duration);
         self.telemetry.metrics.increment_submit();
 
+        let signed_envelope = report
+            .signed_envelope
+            .clone()
+            .expect("submission finalization requires a signed envelope");
         let execution_record = self.tracker.register_submission(
             signed_envelope.route_id.clone(),
             signed_envelope.signature.clone(),
@@ -492,17 +532,28 @@ impl BotRuntime {
             submit_result.clone(),
         );
         self.record_submission_metrics(&execution_record);
+        report.submit_result = Some(submit_result);
+        report.execution_record = Some(execution_record);
+        report
+    }
 
-        Ok(HotPathReport {
-            state_outcome: Some(state_outcome),
-            pool_snapshots,
-            selection,
-            build_result: Some(build_result),
-            signed_envelope: Some(signed_envelope),
-            submit_result: Some(submit_result),
-            execution_record: Some(execution_record),
-            pipeline_trace,
-        })
+    pub fn process_event(&mut self, event: NormalizedEvent) -> Result<HotPathReport, RuntimeError> {
+        let report = self.prepare_event(event, 0)?;
+        let Some(signed_envelope) = report.signed_envelope.clone() else {
+            return Ok(report);
+        };
+
+        let submit_started = Instant::now();
+        let submit_result = self.hot_path.submitter.submit(SubmitRequest {
+            envelope: signed_envelope,
+            mode: self.submit_mode,
+        })?;
+        Ok(self.finalize_submission(
+            report,
+            submit_result,
+            submit_started.elapsed(),
+            SystemTime::now(),
+        ))
     }
 
     fn record_submission_metrics(&self, record: &ExecutionRecord) {
@@ -525,6 +576,7 @@ impl BotRuntime {
                 }
                 FailureClass::Expired => self.telemetry.metrics.increment_expired(),
                 FailureClass::ChainDropped
+                | FailureClass::ChainExecutionTooLittleOutput
                 | FailureClass::ChainExecutionFailed
                 | FailureClass::Unknown => self.telemetry.metrics.increment_chain_failed(),
             },
@@ -600,9 +652,11 @@ mod tests {
             output_mint: "USDC".into(),
             base_mint: None,
             quote_mint: None,
+            min_trade_size: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
+            execution_protection: Default::default(),
             legs: [
                 RouteLegConfig {
                     venue: "orca".into(),

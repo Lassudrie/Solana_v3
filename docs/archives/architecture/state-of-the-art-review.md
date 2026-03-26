@@ -1,5 +1,7 @@
 # Revue "State of the Art" de l’architecture bot Solana
 
+> Archive: revue synthetique remplacee par l'audit detaille du 2026-03-25.
+
 Date: 2026-03-25  
 Version: révision après remise au vert de `cargo test --workspace`
 
@@ -22,34 +24,34 @@ L'écart principal n'est donc plus "avoir une transaction réelle", mais **avoir
 ## Ce qui est solide aujourd'hui
 
 - séparation claire par crates et hot path sans RPC synchrone dans quote/build;
-- builder venue-native dans [transaction_builder.rs](../../crates/builder/src/transaction_builder.rs):
+- builder venue-native dans [transaction_builder.rs](../../../crates/builder/src/transaction_builder.rs):
   - compute budget;
   - tip Jito;
   - compilation `VersionedMessage::V0` ou fallback legacy;
   - instructions Orca simple pool, Orca Whirlpool, Raydium simple pool et Raydium CLMM;
-- signature réelle dans [signer.rs](../../crates/signing/src/signer.rs):
+- signature réelle dans [signer.rs](../../../crates/signing/src/signer.rs):
   - chargement keypair fichier ou base58;
   - vérification locale de la signature;
   - support d'un signer Unix sécurisé;
-- refresh asynchrone réel dans [refresh.rs](../../crates/bot/src/refresh.rs):
+- refresh asynchrone réel dans [refresh.rs](../../../crates/bot/src/refresh.rs):
   - `getLatestBlockhash`;
   - `getSlot`;
   - `getMultipleAccounts` pour les ALT;
   - `getBalance`;
-- reconciliation réelle dans [onchain.rs](../../crates/reconciliation/src/onchain.rs):
+- reconciliation réelle dans [onchain.rs](../../../crates/reconciliation/src/onchain.rs):
   - expiration des pending;
   - `getSignatureStatuses`;
   - `getInflightBundleStatuses`;
   - `signatureSubscribe`;
 - observabilité opératoire utile:
   - `/status`, `/ready`, `/live`, `/metrics`;
-  - historique mémoire de signaux avec `p50/p95/p99` dans [observer.rs](../../crates/bot/src/observer.rs).
+  - historique mémoire de signaux avec `p50/p95/p99` dans [observer.rs](../../../crates/bot/src/observer.rs).
 
 ## Écarts encore bloquants
 
 ### 1) Quote / sizing encore trop simplifiés
 
-- Le moteur de quote dans [quote.rs](../../crates/strategy/src/quote.rs) reste affine:
+- Le moteur de quote dans [quote.rs](../../../crates/strategy/src/quote.rs) reste affine:
   - une seule taille = `default_trade_size`;
   - pas de ladder de tailles;
   - pas de coût complet `CU + tip + probabilité d'échec`;
@@ -58,12 +60,12 @@ L'écart principal n'est donc plus "avoir une transaction réelle", mais **avoir
 
 ### 2) State marché trop pauvre
 
-- `PoolSnapshot` dans [types.rs](../../crates/state/src/types.rs) ne porte qu'un sous-ensemble de l'information réellement utile au pricing:
+- `PoolSnapshot` dans [types.rs](../../../crates/state/src/types.rs) ne porte qu'un sous-ensemble de l'information réellement utile au pricing:
   - `price_bps`;
   - `fee_bps`;
   - `reserve_depth`;
   - mints, tick spacing, current tick.
-- Les décodeurs `orca-whirlpool-v1` et `raydium-clmm-v1` existent dans [decoder.rs](../../crates/state/src/decoder.rs), mais le snapshot agrégé reste trop réduit pour un sizing fiable.
+- Les décodeurs `orca-whirlpool-v1` et `raydium-clmm-v1` existent dans [decoder.rs](../../../crates/state/src/decoder.rs), mais le snapshot agrégé reste trop réduit pour un sizing fiable.
 - Il manque encore la composition multi-comptes réellement exploitable pour la décision live.
 
 ### 3) Sécurité d'exécution incomplète
@@ -75,7 +77,7 @@ L'écart principal n'est donc plus "avoir une transaction réelle", mais **avoir
 
 ### 4) Ingestion et mesure d'avance encore minimales
 
-- `auth_token` et `replay_on_gap` sont bien actifs dans [shredstream.rs](../../crates/detection/src/shredstream.rs).
+- `auth_token` et `replay_on_gap` sont bien actifs dans [shredstream.rs](../../../crates/detection/src/shredstream.rs).
 - En revanche:
   - `source_latency` reste à `Duration::ZERO`;
   - pas de redondance multi-source/région;
@@ -121,8 +123,8 @@ L'écart principal n'est donc plus "avoir une transaction réelle", mais **avoir
 
 ## Références internes utilisées
 
-- [Runtime](../../crates/bot/src/runtime.rs)
-- [Builder](../../crates/builder/src/transaction_builder.rs)
-- [Signing](../../crates/signing/src/signer.rs)
-- [Refresh](../../crates/bot/src/refresh.rs)
-- [Reconciliation](../../crates/reconciliation/src/onchain.rs)
+- [Runtime](../../../crates/bot/src/runtime.rs)
+- [Builder](../../../crates/builder/src/transaction_builder.rs)
+- [Signing](../../../crates/signing/src/signer.rs)
+- [Refresh](../../../crates/bot/src/refresh.rs)
+- [Reconciliation](../../../crates/reconciliation/src/onchain.rs)

@@ -7,6 +7,7 @@ pub mod observer;
 pub mod refresh;
 pub mod runtime;
 pub mod sources;
+mod submit_dispatch;
 
 pub use bootstrap::{BootstrapError, bootstrap};
 pub use config::{BotConfig, ConfigError, MonitorServerConfig};

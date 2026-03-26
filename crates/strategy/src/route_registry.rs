@@ -17,6 +17,15 @@ pub struct RouteLeg {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionProtectionPolicy {
+    pub tight_max_quote_slot_lag: u64,
+    pub base_extra_buy_leg_slippage_bps: u16,
+    pub failure_step_bps: u16,
+    pub max_extra_buy_leg_slippage_bps: u16,
+    pub recovery_success_count: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteDefinition {
     pub route_id: RouteId,
     pub input_mint: String,
@@ -24,10 +33,12 @@ pub struct RouteDefinition {
     pub base_mint: Option<String>,
     pub quote_mint: Option<String>,
     pub legs: [RouteLeg; 2],
+    pub min_trade_size: u64,
     pub default_trade_size: u64,
     pub max_trade_size: u64,
     pub size_ladder: Vec<u64>,
     pub estimated_execution_cost_lamports: u64,
+    pub execution_protection: Option<ExecutionProtectionPolicy>,
 }
 
 #[derive(Debug, Default)]

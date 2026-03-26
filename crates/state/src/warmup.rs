@@ -89,4 +89,8 @@ impl WarmupManager {
             .filter(|route| route.status == WarmupStatus::Ready)
             .count()
     }
+
+    pub fn route_ids(&self) -> Vec<RouteId> {
+        self.routes.keys().cloned().collect()
+    }
 }

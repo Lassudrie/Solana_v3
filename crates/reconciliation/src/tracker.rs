@@ -23,6 +23,14 @@ pub enum ExecutionOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionFailureDetail {
+    pub instruction_index: Option<u8>,
+    pub program_id: Option<String>,
+    pub custom_code: Option<u32>,
+    pub error_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionTransition {
     pub submission_id: SubmissionId,
     pub previous_inclusion_status: InclusionStatus,
@@ -42,6 +50,7 @@ pub struct ExecutionRecord {
     pub build_slot: u64,
     pub inclusion_status: InclusionStatus,
     pub outcome: ExecutionOutcome,
+    pub failure_detail: Option<ExecutionFailureDetail>,
     pub created_at: SystemTime,
     pub last_updated_at: SystemTime,
 }
@@ -78,6 +87,7 @@ impl ExecutionTracker {
             build_slot,
             inclusion_status,
             outcome,
+            failure_detail: None,
             created_at: now,
             last_updated_at: now,
         };
@@ -113,6 +123,19 @@ impl ExecutionTracker {
 
     pub fn get(&self, submission_id: &SubmissionId) -> Option<&ExecutionRecord> {
         self.history.get(submission_id)
+    }
+
+    pub fn set_failure_detail(
+        &mut self,
+        submission_id: &SubmissionId,
+        detail: ExecutionFailureDetail,
+    ) -> bool {
+        let Some(record) = self.history.get_mut(submission_id) else {
+            return false;
+        };
+        record.failure_detail = Some(detail);
+        record.last_updated_at = SystemTime::now();
+        true
     }
 
     pub fn pending_count(&self) -> usize {

@@ -15,7 +15,10 @@ use tungstenite::{
 
 use crate::{
     classifier::FailureClass,
-    tracker::{ExecutionRecord, ExecutionTracker, ExecutionTransition, InclusionStatus},
+    tracker::{
+        ExecutionFailureDetail, ExecutionRecord, ExecutionTracker, ExecutionTransition,
+        InclusionStatus,
+    },
 };
 
 const MOCK_SCHEME: &str = "mock://";
@@ -149,9 +152,14 @@ impl OnChainReconciler {
             for (record, status) in batch.iter().zip(statuses.into_iter()) {
                 match status {
                     Some(status) if status.err.is_some() => {
+                        let (failure_class, failure_detail) =
+                            self.classify_chain_failure(&record.chain_signature);
+                        if let Some(detail) = failure_detail {
+                            tracker.set_failure_detail(&record.submission_id, detail);
+                        }
                         if let Some(transition) = tracker.transition(
                             &record.submission_id,
-                            InclusionStatus::Failed(FailureClass::ChainExecutionFailed),
+                            InclusionStatus::Failed(failure_class),
                         ) {
                             transitions.push(transition);
                         }
@@ -233,6 +241,23 @@ impl OnChainReconciler {
             }
         }
         transitions
+    }
+
+    fn classify_chain_failure(
+        &self,
+        chain_signature: &str,
+    ) -> (FailureClass, Option<ExecutionFailureDetail>) {
+        let detail = self.rpc.get_transaction_failure_detail(chain_signature);
+        let failure_class = match &detail {
+            Some(detail)
+                if detail.error_name.as_deref() == Some("TooLittleOutputReceived")
+                    || detail.custom_code == Some(6_022) =>
+            {
+                FailureClass::ChainExecutionTooLittleOutput
+            }
+            _ => FailureClass::ChainExecutionFailed,
+        };
+        (failure_class, detail)
     }
 }
 
@@ -316,6 +341,37 @@ impl RpcStatusClient {
 
         let body = response.json::<JitoInflightBundleEnvelope>().ok()?;
         Some(body.result.map(|result| result.value).unwrap_or_default())
+    }
+
+    fn get_transaction_failure_detail(&self, signature: &str) -> Option<ExecutionFailureDetail> {
+        if signature.is_empty() || self.is_mock(&self.endpoint) {
+            return None;
+        }
+
+        let response = self
+            .http
+            .post(&self.endpoint)
+            .json(&json!({
+                "jsonrpc": JSON_RPC_VERSION,
+                "id": 1,
+                "method": "getTransaction",
+                "params": [
+                    signature,
+                    {
+                        "encoding": "jsonParsed",
+                        "maxSupportedTransactionVersion": 0,
+                        "commitment": "confirmed"
+                    }
+                ],
+            }))
+            .send()
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+
+        let body = response.json::<Value>().ok()?;
+        parse_transaction_failure_detail(&body)
     }
 }
 
@@ -483,10 +539,7 @@ impl SignatureWsClient {
             WsSignatureValue::Processed { err: Some(_) } => {
                 self.subscriptions.remove(&params.subscription);
                 self.tracked_submissions.remove(&submission_id);
-                tracker.transition(
-                    &submission_id,
-                    InclusionStatus::Failed(FailureClass::ChainExecutionFailed),
-                )
+                tracker.transition(&submission_id, InclusionStatus::Pending)
             }
             WsSignatureValue::Processed { err: None } => {
                 self.subscriptions.remove(&params.subscription);
@@ -582,6 +635,117 @@ enum WsSignatureValue {
         #[serde(default)]
         err: Option<Value>,
     },
+}
+
+fn parse_transaction_failure_detail(body: &Value) -> Option<ExecutionFailureDetail> {
+    let result = body.get("result")?;
+    let meta = result.get("meta")?;
+    let err = meta.get("err")?;
+    let instruction_index = instruction_error_index(err);
+    let mut custom_code = instruction_error_custom_code(err);
+    let log_messages = meta
+        .get("logMessages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut error_name = parse_error_name(&log_messages);
+    if custom_code.is_none() {
+        custom_code = parse_custom_code_from_logs(&log_messages);
+    }
+    if error_name.is_none() && custom_code == Some(6_022) {
+        error_name = Some("TooLittleOutputReceived".into());
+    }
+    let detail = ExecutionFailureDetail {
+        instruction_index,
+        program_id: instruction_index.and_then(|index| instruction_program_id(result, index)),
+        custom_code,
+        error_name,
+    };
+
+    (detail.instruction_index.is_some()
+        || detail.program_id.is_some()
+        || detail.custom_code.is_some()
+        || detail.error_name.is_some())
+    .then_some(detail)
+}
+
+fn instruction_error_index(err: &Value) -> Option<u8> {
+    err.get("InstructionError")?
+        .as_array()?
+        .first()?
+        .as_u64()
+        .and_then(|index| u8::try_from(index).ok())
+}
+
+fn instruction_error_custom_code(err: &Value) -> Option<u32> {
+    err.get("InstructionError")?
+        .as_array()?
+        .get(1)?
+        .get("Custom")?
+        .as_u64()
+        .and_then(|code| u32::try_from(code).ok())
+}
+
+fn parse_error_name(log_messages: &[String]) -> Option<String> {
+    for message in log_messages {
+        if message.contains("TooLittleOutputReceived")
+            || message
+                .to_ascii_lowercase()
+                .contains("too little output received")
+        {
+            return Some("TooLittleOutputReceived".into());
+        }
+    }
+    None
+}
+
+fn parse_custom_code_from_logs(log_messages: &[String]) -> Option<u32> {
+    for message in log_messages {
+        if let Some(number) = message.split("Error Number: ").nth(1) {
+            let digits = number
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(code) = digits.parse::<u32>() {
+                return Some(code);
+            }
+        }
+        if let Some(hex_value) = message.split("custom program error: 0x").nth(1) {
+            let hex = hex_value
+                .chars()
+                .take_while(|character| character.is_ascii_hexdigit())
+                .collect::<String>();
+            if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                return Some(code);
+            }
+        }
+    }
+    None
+}
+
+fn instruction_program_id(result: &Value, instruction_index: u8) -> Option<String> {
+    let message = result.get("transaction")?.get("message")?;
+    let instruction = message
+        .get("instructions")?
+        .as_array()?
+        .get(instruction_index as usize)?;
+    if let Some(program_id) = instruction.get("programId").and_then(Value::as_str) {
+        return Some(program_id.into());
+    }
+
+    let program_index = instruction.get("programIdIndex")?.as_u64()? as usize;
+    let account_key = message.get("accountKeys")?.as_array()?.get(program_index)?;
+    account_key
+        .get("pubkey")
+        .and_then(Value::as_str)
+        .or_else(|| account_key.as_str())
+        .map(str::to_string)
 }
 
 fn bundle_status_url(endpoint: &str) -> String {

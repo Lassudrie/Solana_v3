@@ -21,19 +21,34 @@ pub struct RouteQuote {
     pub input_amount: u64,
     pub gross_output_amount: u64,
     pub net_output_amount: u64,
-    pub expected_gross_profit: i64,
+    pub expected_gross_profit_quote_atoms: i64,
     pub estimated_execution_cost_lamports: u64,
-    pub expected_net_profit: i64,
+    pub estimated_execution_cost_quote_atoms: u64,
+    pub expected_net_profit_quote_atoms: i64,
     pub leg_quotes: [LegQuote; 2],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuoteExecutionAdjustments {
+    pub extra_leg_slippage_bps: [u16; 2],
+}
+
 impl RouteQuote {
-    pub fn with_estimated_execution_cost(mut self, estimated_execution_cost_lamports: u64) -> Self {
+    pub fn with_estimated_execution_cost(
+        mut self,
+        route: &RouteDefinition,
+        snapshots: [&PoolSnapshot; 2],
+        estimated_execution_cost_lamports: u64,
+    ) -> Result<Self, QuoteError> {
+        let estimated_execution_cost_quote_atoms =
+            execution_cost_quote_atoms(route, snapshots, estimated_execution_cost_lamports)?;
         self.estimated_execution_cost_lamports = estimated_execution_cost_lamports;
-        self.expected_net_profit = clamp_i128(
-            self.expected_gross_profit as i128 - estimated_execution_cost_lamports as i128,
+        self.estimated_execution_cost_quote_atoms = estimated_execution_cost_quote_atoms;
+        self.expected_net_profit_quote_atoms = clamp_i128(
+            self.expected_gross_profit_quote_atoms as i128
+                - estimated_execution_cost_quote_atoms as i128,
         );
-        self
+        Ok(self)
     }
 }
 
@@ -47,6 +62,8 @@ pub enum QuoteError {
     InvalidSnapshotPrice,
     #[error("invalid snapshot liquidity")]
     InvalidSnapshotLiquidity,
+    #[error("unable to convert execution cost into quote atoms")]
+    ExecutionCostNotConvertible,
 }
 
 pub trait QuoteEngine: Send + Sync {
@@ -56,6 +73,7 @@ pub trait QuoteEngine: Send + Sync {
         snapshots: [&PoolSnapshot; 2],
         quoted_slot: u64,
         input_amount: u64,
+        adjustments: &QuoteExecutionAdjustments,
     ) -> Result<RouteQuote, QuoteError>;
 }
 
@@ -69,9 +87,16 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
         snapshots: [&PoolSnapshot; 2],
         quoted_slot: u64,
         input_amount: u64,
+        adjustments: &QuoteExecutionAdjustments,
     ) -> Result<RouteQuote, QuoteError> {
-        let first = apply_route_price(route, &route.legs[0], input_amount, snapshots[0])?;
-        let second = apply_route_price(route, &route.legs[1], first.net_output, snapshots[1])?;
+        let first = apply_additional_leg_slippage(
+            apply_route_price(route, &route.legs[0], input_amount, snapshots[0])?,
+            adjustments.extra_leg_slippage_bps[0],
+        )?;
+        let second = apply_additional_leg_slippage(
+            apply_route_price(route, &route.legs[1], first.net_output, snapshots[1])?,
+            adjustments.extra_leg_slippage_bps[1],
+        )?;
         let expected_gross_profit = second
             .net_output
             .checked_sub(input_amount)
@@ -83,9 +108,10 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
             input_amount,
             gross_output_amount: second.gross_output,
             net_output_amount: second.net_output,
-            expected_gross_profit,
+            expected_gross_profit_quote_atoms: expected_gross_profit,
             estimated_execution_cost_lamports: 0,
-            expected_net_profit: expected_gross_profit,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: expected_gross_profit,
             leg_quotes: [
                 LegQuote {
                     venue: route.legs[0].venue.clone(),
@@ -110,10 +136,75 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
     }
 }
 
+fn execution_cost_quote_atoms(
+    route: &RouteDefinition,
+    snapshots: [&PoolSnapshot; 2],
+    estimated_execution_cost_lamports: u64,
+) -> Result<u64, QuoteError> {
+    if estimated_execution_cost_lamports == 0 {
+        return Ok(0);
+    }
+
+    let Some(base_mint) = route.base_mint.as_deref() else {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    };
+    let Some(quote_mint) = route.quote_mint.as_deref() else {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    };
+    if route.input_mint != route.output_mint || route.input_mint != quote_mint {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    }
+
+    for snapshot in snapshots {
+        if snapshot.price_bps == 0 {
+            continue;
+        }
+        if snapshot.token_mint_a == base_mint && snapshot.token_mint_b == quote_mint {
+            return mul_div_u64(
+                estimated_execution_cost_lamports,
+                snapshot.price_bps,
+                10_000,
+            );
+        }
+        if snapshot.token_mint_a == quote_mint && snapshot.token_mint_b == base_mint {
+            return mul_div_u64(
+                estimated_execution_cost_lamports,
+                10_000,
+                snapshot.price_bps,
+            );
+        }
+    }
+
+    Err(QuoteError::ExecutionCostNotConvertible)
+}
+
 struct PricedAmount {
     gross_output: u64,
     net_output: u64,
     fee_paid: u64,
+}
+
+fn apply_additional_leg_slippage(
+    priced: PricedAmount,
+    extra_slippage_bps: u16,
+) -> Result<PricedAmount, QuoteError> {
+    if extra_slippage_bps == 0 {
+        return Ok(priced);
+    }
+
+    let extra_paid: u64 = ((priced.gross_output as u128) * u128::from(extra_slippage_bps)
+        / 10_000u128)
+        .try_into()
+        .map_err(|_| QuoteError::ArithmeticOverflow)?;
+    let net_output = priced
+        .net_output
+        .checked_sub(extra_paid)
+        .ok_or(QuoteError::ArithmeticOverflow)?;
+
+    Ok(PricedAmount {
+        net_output,
+        ..priced
+    })
 }
 
 fn apply_price(
@@ -190,6 +281,16 @@ fn apply_constant_product_price(
 
 fn clamp_i128(value: i128) -> i64 {
     value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+fn mul_div_u64(value: u64, numerator: u64, denominator: u64) -> Result<u64, QuoteError> {
+    if denominator == 0 {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    }
+
+    (u128::from(value) * u128::from(numerator) / u128::from(denominator))
+        .try_into()
+        .map_err(|_| QuoteError::ArithmeticOverflow)
 }
 
 fn apply_route_price(

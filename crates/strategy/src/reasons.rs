@@ -13,6 +13,9 @@ pub enum RejectionReason {
         pool_id: PoolId,
         slot_lag: u64,
     },
+    PoolRepairPending {
+        pool_id: PoolId,
+    },
     PoolStateNotExact {
         pool_id: PoolId,
     },
@@ -45,6 +48,9 @@ pub enum RejectionReason {
     },
     KillSwitchActive,
     QuoteFailed {
+        detail: String,
+    },
+    ExecutionCostNotConvertible {
         detail: String,
     },
     NoImpactedRoutes,

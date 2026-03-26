@@ -13,7 +13,7 @@ pub use transaction_builder::{AtomicArbTransactionBuilder, TransactionBuilder};
 pub use types::{
     AccountSource, AtomicLegPlan, BuildRejectionReason, BuildRequest, BuildResult, BuildStatus,
     DynamicBuildParameters, InstructionAccount, InstructionTemplate, MessageFormat,
-    ResolvedAddressLookupTable, UnsignedTransactionEnvelope,
+    ResolvedAddressLookupTable, SwapAmountMode, UnsignedTransactionEnvelope,
 };
 
 #[cfg(test)]
@@ -53,10 +53,12 @@ mod tests {
             route_id: RouteId("route-a".into()),
             quoted_slot: 42,
             trade_size: 10_000,
+            active_execution_buffer_bps: None,
             expected_net_output: 10_250,
-            expected_gross_profit: 250,
+            expected_gross_profit_quote_atoms: 250,
             estimated_execution_cost_lamports: 0,
-            expected_net_profit: 250,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: 250,
             leg_quotes: [
                 LegQuote {
                     venue: "orca".into(),

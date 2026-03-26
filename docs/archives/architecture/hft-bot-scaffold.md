@@ -1,5 +1,7 @@
 # HFT Bot Scaffold
 
+> Archive: decrit l'etat initial du depot au stade scaffold.
+
 ## Vue d’ensemble
 
 Ce workspace pose la fondation d’un bot Solana d’arbitrage atomique 2-leg orienté low-latency. Le design part d’un principe simple : le hot path ne doit lire que des données locales en RAM et transformer un événement normalisé en décision d’exécution sans RPC synchrone.

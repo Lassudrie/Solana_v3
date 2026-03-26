@@ -109,6 +109,14 @@ impl StatePlane {
         self.warmup.ready_route_count()
     }
 
+    pub fn tradable_route_count(&self) -> usize {
+        self.warmup
+            .route_ids()
+            .into_iter()
+            .filter(|route_id| self.route_is_tradable(route_id))
+            .count()
+    }
+
     pub fn route_pool_ids(&self, route_id: &crate::types::RouteId) -> &[PoolId] {
         self.dependency_graph.route_pools(route_id)
     }
@@ -126,6 +134,21 @@ impl StatePlane {
 
     pub fn route_state(&self, route_id: &crate::types::RouteId) -> crate::types::RouteState {
         self.warmup.route_state(route_id)
+    }
+
+    fn route_is_tradable(&self, route_id: &crate::types::RouteId) -> bool {
+        if self.route_warmup_status(route_id) != WarmupStatus::Ready {
+            return false;
+        }
+
+        let pool_ids = self.dependency_graph.route_pools(route_id);
+        !pool_ids.is_empty()
+            && pool_ids.iter().all(|pool_id| {
+                self.pool_snapshots
+                    .get(pool_id)
+                    .map(|snapshot| snapshot.is_exact() && !snapshot.freshness.is_stale)
+                    .unwrap_or(false)
+            })
     }
 
     pub fn apply_event(
@@ -459,5 +482,58 @@ mod tests {
         plane.apply_event(&invalidation).unwrap();
 
         assert!(plane.pool_snapshot(&pool_id).unwrap().freshness.is_stale);
+    }
+
+    #[test]
+    fn tradable_route_count_excludes_exact_but_stale_routes() {
+        let route_id = RouteId("route-stale".into());
+        let pool_a = PoolId("pool-a".into());
+        let pool_b = PoolId("pool-b".into());
+        let mut plane = StatePlane::new(2);
+        plane.register_route(route_id, vec![pool_a.clone(), pool_b.clone()]);
+
+        for (sequence, pool_id) in [(1, &pool_a), (2, &pool_b)] {
+            plane
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::ShredStream,
+                    sequence,
+                    10,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.0.clone(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 1_000,
+                        reserve_a: Some(1_000),
+                        reserve_b: Some(1_000),
+                        active_liquidity: Some(1_000),
+                        sqrt_price_x64: None,
+                        exact: Some(true),
+                        repair_pending: Some(false),
+                        token_mint_a: "mint-a".into(),
+                        token_mint_b: "mint-b".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot: 10,
+                        write_version: 1,
+                    },
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(plane.tradable_route_count(), 1);
+
+        plane
+            .apply_event(&NormalizedEvent::with_payload(
+                EventSourceKind::ShredStream,
+                3,
+                13,
+                detection::MarketEvent::SlotBoundary(detection::SlotBoundary {
+                    slot: 13,
+                    leader: None,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(plane.tradable_route_count(), 0);
     }
 }

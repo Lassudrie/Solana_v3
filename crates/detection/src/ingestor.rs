@@ -1,4 +1,5 @@
 use crate::events::{EventSourceKind, NormalizedEvent};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -15,4 +16,5 @@ pub enum IngestError {
 pub trait MarketEventSource: Send {
     fn source_kind(&self) -> EventSourceKind;
     fn poll_next(&mut self) -> Result<Option<NormalizedEvent>, IngestError>;
+    fn wait_next(&mut self, timeout: Duration) -> Result<Option<NormalizedEvent>, IngestError>;
 }

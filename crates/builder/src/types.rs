@@ -14,13 +14,20 @@ pub struct DynamicBuildParameters {
     pub resolved_lookup_tables: Vec<state::types::LookupTableSnapshot>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapAmountMode {
+    ExactIn,
+    ExactOut,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomicLegPlan {
     pub venue: String,
     pub pool_id: state::types::PoolId,
     pub side: SwapSide,
-    pub input_amount: u64,
-    pub min_output_amount: u64,
+    pub amount_mode: SwapAmountMode,
+    pub specified_amount: u64,
+    pub other_amount_threshold: u64,
     pub current_tick_index: Option<i32>,
 }
 

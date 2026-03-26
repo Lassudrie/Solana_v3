@@ -3,9 +3,9 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -34,7 +34,21 @@ pub struct PoolMonitorView {
     pub reserve_depth: u64,
     pub last_update_slot: u64,
     pub slot_lag: u64,
+    pub age_slots: u64,
     pub stale: bool,
+    pub confidence: String,
+    pub refresh_pending: bool,
+    pub refresh_attempt_count: u64,
+    pub refresh_failure_count: u64,
+    pub refresh_success_count: u64,
+    pub last_refresh_latency_ms: Option<u64>,
+    pub refresh_deadline_slot_lag: Option<u64>,
+    pub repair_pending: bool,
+    pub repair_attempt_count: u64,
+    pub repair_failure_count: u64,
+    pub repair_success_count: u64,
+    pub last_repair_latency_ms: Option<u64>,
+    pub last_repair_invalidation_ms: Option<u64>,
     pub last_seen_unix_millis: u128,
 }
 
@@ -86,7 +100,7 @@ pub struct RejectionEvent {
     pub reason_code: String,
     pub reason_detail: String,
     pub observed_slot: u64,
-    pub expected_profit_lamports: Option<i64>,
+    pub expected_profit_quote_atoms: Option<i64>,
     pub occurred_at_unix_millis: u128,
 }
 
@@ -103,11 +117,17 @@ pub struct MonitorTradeEvent {
     pub signature: String,
     pub submit_status: String,
     pub outcome: String,
-    pub expected_edge_lamports: i64,
+    pub expected_edge_quote_atoms: i64,
     pub estimated_cost_lamports: Option<u64>,
-    pub expected_pnl_lamports: Option<i64>,
-    pub realized_pnl_lamports: Option<i64>,
+    pub estimated_cost_quote_atoms: Option<u64>,
+    pub expected_pnl_quote_atoms: Option<i64>,
+    pub realized_pnl_quote_atoms: Option<i64>,
     pub jito_tip_lamports: Option<u64>,
+    pub active_execution_buffer_bps: Option<u16>,
+    pub failure_program_id: Option<String>,
+    pub failure_instruction_index: Option<u8>,
+    pub failure_custom_code: Option<u32>,
+    pub failure_error_name: Option<String>,
     pub endpoint: String,
     pub build_slot: u64,
     pub created_at_unix_millis: u128,
@@ -131,7 +151,8 @@ pub struct MonitorOverview {
     pub kill_switch_active: bool,
     pub latest_slot: u64,
     pub rpc_slot: Option<u64>,
-    pub ready_routes: usize,
+    pub warm_routes: usize,
+    pub tradable_routes: usize,
     pub total_routes: usize,
     pub inflight_submissions: usize,
     pub wallet_ready: bool,
@@ -146,8 +167,8 @@ pub struct MonitorOverview {
     pub shredstream_events_per_second: u64,
     pub landed_rate_bps: u64,
     pub reject_rate_bps: u64,
-    pub expected_session_pnl_lamports: i64,
-    pub realized_session_pnl_lamports: i64,
+    pub expected_session_pnl_quote_atoms: i64,
+    pub realized_session_pnl_quote_atoms: i64,
     pub observer_drop_count: u64,
     pub poll_interval_millis: u64,
     pub updated_at_unix_millis: u128,
@@ -168,11 +189,48 @@ struct PoolStaticMetadata {
     route_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct PoolRepairStats {
+    refresh_pending: bool,
+    refresh_deadline_slot: Option<u64>,
+    refresh_attempt_count: u64,
+    refresh_failure_count: u64,
+    refresh_success_count: u64,
+    last_refresh_latency_ms: Option<u64>,
+    repair_attempt_count: u64,
+    repair_failure_count: u64,
+    repair_success_count: u64,
+    last_repair_latency_ms: Option<u64>,
+    last_repair_invalidation_ms: Option<u64>,
+    invalidated_at_unix_millis: Option<u128>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RepairEvent {
+    pub pool_id: String,
+    pub kind: RepairEventKind,
+    pub occurred_at: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum RepairEventKind {
+    RefreshScheduled { deadline_slot: u64 },
+    RefreshAttemptStarted,
+    RefreshAttemptFailed,
+    RefreshAttemptSucceeded { latency_ms: u64 },
+    RefreshCleared,
+    RepairAttemptStarted,
+    RepairAttemptFailed,
+    RepairAttemptSucceeded { latency_ms: u64 },
+}
+
 #[derive(Debug)]
 struct ObserverState {
     config: MonitorServerConfig,
+    max_snapshot_slot_lag: u64,
     runtime_status: RuntimeStatus,
     pool_metadata: BTreeMap<String, PoolStaticMetadata>,
+    repair_stats: BTreeMap<String, PoolRepairStats>,
     pools: BTreeMap<String, PoolMonitorView>,
     signals: VecDeque<MonitorSignalSample>,
     rejections: VecDeque<RejectionEvent>,
@@ -187,11 +245,14 @@ impl ObserverState {
     fn new(
         config: MonitorServerConfig,
         pool_metadata: BTreeMap<String, PoolStaticMetadata>,
+        max_snapshot_slot_lag: u64,
     ) -> Self {
         Self {
             config,
+            max_snapshot_slot_lag,
             runtime_status: RuntimeStatus::default(),
             pool_metadata,
+            repair_stats: BTreeMap::new(),
             pools: BTreeMap::new(),
             signals: VecDeque::new(),
             rejections: VecDeque::new(),
@@ -211,6 +272,20 @@ impl ObserverState {
 
     fn apply_status(&mut self, status: RuntimeStatus) {
         self.runtime_status = status;
+        let latest_slot = self.runtime_status.latest_slot;
+        let max_slot_lag = self.max_snapshot_slot_lag;
+        for pool in self.pools.values_mut() {
+            let slot_lag = latest_slot.saturating_sub(pool.last_update_slot);
+            pool.slot_lag = slot_lag;
+            pool.age_slots = slot_lag;
+            pool.stale = slot_lag > max_slot_lag;
+            pool.refresh_deadline_slot_lag =
+                self.repair_stats.get(&pool.pool_id).and_then(|stats| {
+                    stats
+                        .refresh_deadline_slot
+                        .map(|deadline| deadline.saturating_sub(latest_slot))
+                });
+        }
     }
 
     fn apply_hot_path(&mut self, report: HotPathReport) {
@@ -229,6 +304,22 @@ impl ObserverState {
             return;
         };
         existing.outcome = outcome_label(&record.outcome).to_string();
+        existing.failure_program_id = record
+            .failure_detail
+            .as_ref()
+            .and_then(|detail| detail.program_id.clone());
+        existing.failure_instruction_index = record
+            .failure_detail
+            .as_ref()
+            .and_then(|detail| detail.instruction_index);
+        existing.failure_custom_code = record
+            .failure_detail
+            .as_ref()
+            .and_then(|detail| detail.custom_code);
+        existing.failure_error_name = record
+            .failure_detail
+            .as_ref()
+            .and_then(|detail| detail.error_name.clone());
         existing.updated_at_unix_millis = unix_millis(record.last_updated_at);
         existing.submit_to_terminal_nanos = duration_nanos(
             record
@@ -244,6 +335,21 @@ impl ObserverState {
 
     fn upsert_pool(&mut self, snapshot: PoolSnapshot) {
         let pool_id = snapshot.pool_id.0.clone();
+        let last_seen_unix_millis = unix_millis(snapshot.derived_at);
+        let repair_stats = self.repair_stats.entry(pool_id.clone()).or_default();
+        if snapshot.repair_pending {
+            repair_stats
+                .invalidated_at_unix_millis
+                .get_or_insert(last_seen_unix_millis);
+        } else if snapshot.is_exact() {
+            if let Some(invalidated_at) = repair_stats.invalidated_at_unix_millis.take() {
+                repair_stats.last_repair_invalidation_ms = Some(
+                    last_seen_unix_millis
+                        .saturating_sub(invalidated_at)
+                        .min(u128::from(u64::MAX)) as u64,
+                );
+            }
+        }
         let metadata = self.pool_metadata.get(&pool_id);
         self.pools.insert(
             pool_id.clone(),
@@ -260,10 +366,86 @@ impl ObserverState {
                 reserve_depth: snapshot.reserve_depth,
                 last_update_slot: snapshot.last_update_slot,
                 slot_lag: snapshot.freshness.slot_lag,
+                age_slots: snapshot
+                    .freshness
+                    .head_slot
+                    .saturating_sub(snapshot.last_update_slot),
                 stale: snapshot.freshness.is_stale,
-                last_seen_unix_millis: unix_millis(snapshot.derived_at),
+                confidence: pool_confidence_label(snapshot.confidence).into(),
+                refresh_pending: repair_stats.refresh_pending,
+                refresh_attempt_count: repair_stats.refresh_attempt_count,
+                refresh_failure_count: repair_stats.refresh_failure_count,
+                refresh_success_count: repair_stats.refresh_success_count,
+                last_refresh_latency_ms: repair_stats.last_refresh_latency_ms,
+                refresh_deadline_slot_lag: repair_stats
+                    .refresh_deadline_slot
+                    .map(|deadline| deadline.saturating_sub(self.runtime_status.latest_slot)),
+                repair_pending: snapshot.repair_pending,
+                repair_attempt_count: repair_stats.repair_attempt_count,
+                repair_failure_count: repair_stats.repair_failure_count,
+                repair_success_count: repair_stats.repair_success_count,
+                last_repair_latency_ms: repair_stats.last_repair_latency_ms,
+                last_repair_invalidation_ms: repair_stats.last_repair_invalidation_ms,
+                last_seen_unix_millis,
             },
         );
+    }
+
+    fn apply_repair(&mut self, event: RepairEvent) {
+        let stats = self.repair_stats.entry(event.pool_id.clone()).or_default();
+        match event.kind {
+            RepairEventKind::RefreshScheduled { deadline_slot } => {
+                stats.refresh_pending = true;
+                stats.refresh_deadline_slot = Some(deadline_slot);
+            }
+            RepairEventKind::RefreshAttemptStarted => {
+                stats.refresh_pending = true;
+                stats.refresh_attempt_count = stats.refresh_attempt_count.saturating_add(1);
+            }
+            RepairEventKind::RefreshAttemptFailed => {
+                stats.refresh_pending = true;
+                stats.refresh_failure_count = stats.refresh_failure_count.saturating_add(1);
+            }
+            RepairEventKind::RefreshAttemptSucceeded { latency_ms } => {
+                stats.refresh_pending = false;
+                stats.refresh_deadline_slot = None;
+                stats.refresh_success_count = stats.refresh_success_count.saturating_add(1);
+                stats.last_refresh_latency_ms = Some(latency_ms);
+            }
+            RepairEventKind::RefreshCleared => {
+                stats.refresh_pending = false;
+                stats.refresh_deadline_slot = None;
+            }
+            RepairEventKind::RepairAttemptStarted => {
+                stats.refresh_pending = false;
+                stats.refresh_deadline_slot = None;
+                stats.repair_attempt_count = stats.repair_attempt_count.saturating_add(1);
+            }
+            RepairEventKind::RepairAttemptFailed => {
+                stats.repair_failure_count = stats.repair_failure_count.saturating_add(1);
+            }
+            RepairEventKind::RepairAttemptSucceeded { latency_ms } => {
+                stats.repair_success_count = stats.repair_success_count.saturating_add(1);
+                stats.last_repair_latency_ms = Some(latency_ms);
+            }
+        }
+
+        if let Some(pool) = self.pools.get_mut(&event.pool_id) {
+            pool.refresh_pending = stats.refresh_pending;
+            pool.refresh_attempt_count = stats.refresh_attempt_count;
+            pool.refresh_failure_count = stats.refresh_failure_count;
+            pool.refresh_success_count = stats.refresh_success_count;
+            pool.last_refresh_latency_ms = stats.last_refresh_latency_ms;
+            pool.refresh_deadline_slot_lag = stats
+                .refresh_deadline_slot
+                .map(|deadline| deadline.saturating_sub(self.runtime_status.latest_slot));
+            pool.repair_attempt_count = stats.repair_attempt_count;
+            pool.repair_failure_count = stats.repair_failure_count;
+            pool.repair_success_count = stats.repair_success_count;
+            pool.last_repair_latency_ms = stats.last_repair_latency_ms;
+            pool.last_repair_invalidation_ms = stats.last_repair_invalidation_ms;
+            pool.last_seen_unix_millis = unix_millis(event.occurred_at);
+        }
     }
 
     fn push_signal(&mut self, trace: PipelineTrace) {
@@ -303,7 +485,7 @@ impl ObserverState {
                 reason_code: strategy_reason_code(reason).into(),
                 reason_detail: strategy_reason_detail(reason),
                 observed_slot: report.pipeline_trace.observed_slot,
-                expected_profit_lamports: strategy_expected_profit(reason),
+                expected_profit_quote_atoms: strategy_expected_profit(reason),
                 occurred_at_unix_millis: unix_millis(SystemTime::now()),
             });
         }
@@ -327,7 +509,7 @@ impl ObserverState {
             reason_code: build_reason_code(reason).into(),
             reason_detail: build_reason_detail(reason),
             observed_slot: report.pipeline_trace.observed_slot,
-            expected_profit_lamports: Some(candidate.expected_net_profit),
+            expected_profit_quote_atoms: Some(candidate.expected_net_profit_quote_atoms),
             occurred_at_unix_millis: unix_millis(SystemTime::now()),
         });
     }
@@ -359,11 +541,11 @@ impl ObserverState {
             reason_code: submit_reason_code(reason).into(),
             reason_detail: submit_reason_detail(reason),
             observed_slot: report.pipeline_trace.observed_slot,
-            expected_profit_lamports: report
+            expected_profit_quote_atoms: report
                 .selection
                 .best_candidate
                 .as_ref()
-                .map(|candidate| candidate.expected_net_profit),
+                .map(|candidate| candidate.expected_net_profit_quote_atoms),
             occurred_at_unix_millis: unix_millis(SystemTime::now()),
         });
     }
@@ -383,14 +565,23 @@ impl ObserverState {
             .selection
             .best_candidate
             .as_ref()
-            .map(|candidate| candidate.expected_gross_profit)
+            .map(|candidate| candidate.expected_gross_profit_quote_atoms)
             .unwrap_or(0);
+        let estimated_cost_quote_atoms = report
+            .selection
+            .best_candidate
+            .as_ref()
+            .map(|candidate| candidate.estimated_execution_cost_quote_atoms);
         let estimated_cost = report
             .build_result
             .as_ref()
             .and_then(|build| build.envelope.as_ref())
             .map(|envelope| envelope.estimated_total_cost_lamports);
-        let expected_pnl = estimated_cost.map(|cost| compute_expected_pnl(expected_edge, cost));
+        let expected_pnl = report
+            .selection
+            .best_candidate
+            .as_ref()
+            .map(|candidate| candidate.expected_net_profit_quote_atoms);
         let source_to_submit_nanos = duration_nanos_opt(report.pipeline_trace.total_to_submit);
         let submit_to_terminal_nanos = matches!(record.outcome, ExecutionOutcome::Pending)
             .then_some(None)
@@ -402,15 +593,37 @@ impl ObserverState {
             signature: record.chain_signature.clone(),
             submit_status: submit_status_label(record.submit_status).into(),
             outcome: outcome_label(&record.outcome).into(),
-            expected_edge_lamports: expected_edge,
+            expected_edge_quote_atoms: expected_edge,
             estimated_cost_lamports: estimated_cost,
-            expected_pnl_lamports: expected_pnl,
-            realized_pnl_lamports: None,
+            estimated_cost_quote_atoms,
+            expected_pnl_quote_atoms: expected_pnl,
+            realized_pnl_quote_atoms: None,
             jito_tip_lamports: report
                 .build_result
                 .as_ref()
                 .and_then(|build| build.envelope.as_ref())
                 .map(|envelope| envelope.jito_tip_lamports),
+            active_execution_buffer_bps: report
+                .selection
+                .best_candidate
+                .as_ref()
+                .and_then(|candidate| candidate.active_execution_buffer_bps),
+            failure_program_id: record
+                .failure_detail
+                .as_ref()
+                .and_then(|detail| detail.program_id.clone()),
+            failure_instruction_index: record
+                .failure_detail
+                .as_ref()
+                .and_then(|detail| detail.instruction_index),
+            failure_custom_code: record
+                .failure_detail
+                .as_ref()
+                .and_then(|detail| detail.custom_code),
+            failure_error_name: record
+                .failure_detail
+                .as_ref()
+                .and_then(|detail| detail.error_name.clone()),
             endpoint: record.submit_endpoint.clone(),
             build_slot: record.build_slot,
             created_at_unix_millis: unix_millis(record.created_at),
@@ -428,7 +641,7 @@ impl ObserverState {
             .is_none()
         {
             self.trade_order.push_back(record.submission_id.0.clone());
-            if let Some(expected) = entry.expected_pnl_lamports {
+            if let Some(expected) = entry.expected_pnl_quote_atoms {
                 self.cumulative_expected_pnl += expected as i128;
             }
         }
@@ -466,7 +679,8 @@ impl ObserverState {
             kill_switch_active: self.runtime_status.kill_switch_active,
             latest_slot: self.runtime_status.latest_slot,
             rpc_slot: self.runtime_status.rpc_slot,
-            ready_routes: self.runtime_status.ready_routes,
+            warm_routes: self.runtime_status.warm_routes,
+            tradable_routes: self.runtime_status.tradable_routes,
             total_routes: self.runtime_status.total_routes,
             inflight_submissions: self.runtime_status.inflight_submissions,
             wallet_ready: self.runtime_status.wallet_ready,
@@ -484,8 +698,8 @@ impl ObserverState {
                 .shredstream_events_per_second,
             landed_rate_bps,
             reject_rate_bps,
-            expected_session_pnl_lamports: clamp_i128(self.cumulative_expected_pnl),
-            realized_session_pnl_lamports: clamp_i128(self.cumulative_realized_pnl),
+            expected_session_pnl_quote_atoms: clamp_i128(self.cumulative_expected_pnl),
+            realized_session_pnl_quote_atoms: clamp_i128(self.cumulative_realized_pnl),
             observer_drop_count: drop_count,
             poll_interval_millis: self.config.poll_interval_millis,
             updated_at_unix_millis: self.runtime_status.updated_at_unix_millis,
@@ -615,6 +829,7 @@ enum ObserverEvent {
     Status(RuntimeStatus),
     HotPath(HotPathReport),
     TradeUpdate(ExecutionRecord),
+    Repair(RepairEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +914,7 @@ impl ObserverHandle {
             inner: Arc::new(Mutex::new(ObserverState::new(
                 config.clone(),
                 pool_metadata,
+                bot_config.state.max_snapshot_slot_lag,
             ))),
             drop_count: Arc::new(AtomicU64::new(0)),
         };
@@ -713,6 +929,7 @@ impl ObserverHandle {
                         ObserverEvent::Status(status) => guard.apply_status(status),
                         ObserverEvent::HotPath(report) => guard.apply_hot_path(report),
                         ObserverEvent::TradeUpdate(record) => guard.apply_trade_update(record),
+                        ObserverEvent::Repair(event) => guard.apply_repair(event),
                     }
                 }
             })
@@ -736,6 +953,10 @@ impl ObserverHandle {
 
     pub fn publish_trade_update(&self, record: ExecutionRecord) {
         self.try_send(ObserverEvent::TradeUpdate(record));
+    }
+
+    pub(crate) fn publish_repair(&self, event: RepairEvent) {
+        self.try_send(ObserverEvent::Repair(event));
     }
 
     fn try_send(&self, event: ObserverEvent) {
@@ -935,7 +1156,12 @@ fn status_matches(item: &MonitorTradeEvent, status: Option<&str>) -> bool {
         "all" => true,
         "pending" => item.outcome == "pending",
         "included" => item.outcome == "included",
-        "failed" => item.outcome == "submit_rejected" || item.outcome == "failed",
+        "failed" => {
+            matches!(
+                item.outcome.as_str(),
+                "submit_rejected" | "failed" | "chain_too_little_output"
+            )
+        }
         other => item.submit_status == other || item.outcome == other,
     }
 }
@@ -1007,6 +1233,9 @@ fn outcome_label(outcome: &ExecutionOutcome) -> &'static str {
         ExecutionOutcome::Pending => "pending",
         ExecutionOutcome::Included { .. } => "included",
         ExecutionOutcome::Failed(FailureClass::SubmitRejected) => "submit_rejected",
+        ExecutionOutcome::Failed(FailureClass::ChainExecutionTooLittleOutput) => {
+            "chain_too_little_output"
+        }
         ExecutionOutcome::Failed(_) => "failed",
     }
 }
@@ -1017,6 +1246,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::RouteNotWarm { .. } => "route_not_warm",
         RejectionReason::MissingSnapshot { .. } => "missing_snapshot",
         RejectionReason::SnapshotStale { .. } => "snapshot_stale",
+        RejectionReason::PoolRepairPending { .. } => "pool_repair_pending",
         RejectionReason::PoolStateNotExact { .. } => "pool_state_not_exact",
         RejectionReason::ReserveUsageTooHigh { .. } => "reserve_usage_too_high",
         RejectionReason::BlockhashUnavailable => "blockhash_unavailable",
@@ -1028,6 +1258,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::TooManyInflight { .. } => "too_many_inflight",
         RejectionReason::KillSwitchActive => "kill_switch_active",
         RejectionReason::QuoteFailed { .. } => "quote_failed",
+        RejectionReason::ExecutionCostNotConvertible { .. } => "execution_cost_not_convertible",
         RejectionReason::NoImpactedRoutes => "no_impacted_routes",
         RejectionReason::RouteFilteredOut { .. } => "route_filtered_out",
     }
@@ -1040,6 +1271,7 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
         RejectionReason::SnapshotStale { pool_id, slot_lag } => {
             format!("pool_id={}, slot_lag={slot_lag}", pool_id.0)
         }
+        RejectionReason::PoolRepairPending { pool_id } => format!("pool_id={}", pool_id.0),
         RejectionReason::PoolStateNotExact { pool_id } => format!("pool_id={}", pool_id.0),
         RejectionReason::ReserveUsageTooHigh {
             pool_id,
@@ -1065,6 +1297,7 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
             format!("current={current}, maximum={maximum}")
         }
         RejectionReason::QuoteFailed { detail } => detail.clone(),
+        RejectionReason::ExecutionCostNotConvertible { detail } => detail.clone(),
         RejectionReason::RouteFilteredOut { route_id } => format!("route_id={}", route_id.0),
         _ => format!("{reason:?}"),
     }
@@ -1115,8 +1348,12 @@ fn submit_reason_detail(reason: &SubmitRejectionReason) -> String {
     format!("{reason:?}")
 }
 
-fn compute_expected_pnl(expected_edge: i64, estimated_cost: u64) -> i64 {
-    clamp_i128(expected_edge as i128 - estimated_cost as i128)
+fn pool_confidence_label(confidence: state::types::PoolConfidence) -> &'static str {
+    match confidence {
+        state::types::PoolConfidence::Exact => "exact",
+        state::types::PoolConfidence::Probable => "probable",
+        state::types::PoolConfidence::Invalid => "invalid",
+    }
 }
 
 fn duration_nanos(duration: Duration) -> Option<u64> {
@@ -1145,13 +1382,13 @@ fn clamp_i128(value: i128) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MonitorServerConfig, ObserverState, PoolStaticMetadata, build_reason_code, parse_window,
-        strategy_reason_code,
+        build_reason_code, parse_window, strategy_reason_code, MonitorServerConfig, ObserverState,
+        PoolStaticMetadata, RepairEvent, RepairEventKind,
     };
     use builder::BuildRejectionReason;
     use detection::EventSourceKind;
     use reconciliation::{ExecutionOutcome, ExecutionRecord, InclusionStatus};
-    use state::types::RouteId;
+    use state::types::{PoolConfidence, PoolId, RouteId};
     use std::{
         collections::BTreeMap,
         time::{Duration, UNIX_EPOCH},
@@ -1182,6 +1419,12 @@ mod tests {
             strategy_reason_code(&RejectionReason::BlockhashUnavailable),
             "blockhash_unavailable"
         );
+        assert_eq!(
+            strategy_reason_code(&RejectionReason::PoolRepairPending {
+                pool_id: PoolId("pool-a".into()),
+            }),
+            "pool_repair_pending"
+        );
     }
 
     #[test]
@@ -1200,8 +1443,11 @@ mod tests {
 
     #[test]
     fn trims_signal_history() {
-        let mut state =
-            ObserverState::new(test_config(), BTreeMap::<String, PoolStaticMetadata>::new());
+        let mut state = ObserverState::new(
+            test_config(),
+            BTreeMap::<String, PoolStaticMetadata>::new(),
+            2,
+        );
         state.next_seq = 1;
         state.signals.push_back(super::MonitorSignalSample {
             seq: 1,
@@ -1263,8 +1509,11 @@ mod tests {
 
     #[test]
     fn recomputes_source_to_terminal_latency_when_trade_completes() {
-        let mut state =
-            ObserverState::new(test_config(), BTreeMap::<String, PoolStaticMetadata>::new());
+        let mut state = ObserverState::new(
+            test_config(),
+            BTreeMap::<String, PoolStaticMetadata>::new(),
+            2,
+        );
         let created_at = UNIX_EPOCH.checked_add(Duration::from_secs(1)).unwrap();
         let record = ExecutionRecord {
             route_id: RouteId("route-a".into()),
@@ -1276,6 +1525,7 @@ mod tests {
             build_slot: 42,
             inclusion_status: InclusionStatus::Submitted,
             outcome: ExecutionOutcome::Pending,
+            failure_detail: None,
             created_at,
             last_updated_at: created_at,
         };
@@ -1325,5 +1575,204 @@ mod tests {
         let completed = state.trades.get("submission-a").unwrap();
         assert_eq!(completed.submit_to_terminal_nanos, Some(5_000_000));
         assert_eq!(completed.source_to_terminal_nanos, Some(12_000_000));
+    }
+
+    #[test]
+    fn apply_status_refreshes_pool_freshness() {
+        let mut state = ObserverState::new(
+            test_config(),
+            BTreeMap::<String, PoolStaticMetadata>::new(),
+            2,
+        );
+
+        state.upsert_pool(state::types::PoolSnapshot {
+            pool_id: PoolId("pool-a".into()),
+            price_bps: 10_000,
+            fee_bps: 4,
+            reserve_depth: 100_000,
+            reserve_a: Some(100_000),
+            reserve_b: Some(100_000),
+            active_liquidity: 100_000,
+            sqrt_price_x64: None,
+            venue: None,
+            confidence: PoolConfidence::Exact,
+            repair_pending: false,
+            liquidity_model: state::types::LiquidityModel::ConstantProduct,
+            slippage_factor_bps: 10_000,
+            token_mint_a: "SOL".into(),
+            token_mint_b: "USDC".into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 11,
+            derived_at: UNIX_EPOCH.checked_add(Duration::from_millis(180)).unwrap(),
+            freshness: state::types::FreshnessState::at(11, 11, 2),
+        });
+
+        let mut status = crate::control::RuntimeStatus::default();
+        status.latest_slot = 20;
+        state.apply_status(status);
+
+        let pool = state.pools.get("pool-a").expect("pool view should exist");
+        assert_eq!(pool.slot_lag, 9);
+        assert_eq!(pool.age_slots, 9);
+        assert!(pool.stale);
+    }
+
+    #[test]
+    fn tracks_repair_metrics_across_pending_and_exact_snapshots() {
+        let mut state = ObserverState::new(
+            test_config(),
+            BTreeMap::<String, PoolStaticMetadata>::new(),
+            2,
+        );
+
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RepairAttemptStarted,
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(10)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RepairAttemptFailed,
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(20)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RepairAttemptStarted,
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(30)).unwrap(),
+        });
+        state.upsert_pool(state::types::PoolSnapshot {
+            pool_id: PoolId("pool-a".into()),
+            price_bps: 10_000,
+            fee_bps: 4,
+            reserve_depth: 100_000,
+            reserve_a: Some(100_000),
+            reserve_b: Some(100_000),
+            active_liquidity: 100_000,
+            sqrt_price_x64: None,
+            venue: None,
+            confidence: PoolConfidence::Invalid,
+            repair_pending: true,
+            liquidity_model: state::types::LiquidityModel::ConstantProduct,
+            slippage_factor_bps: 10_000,
+            token_mint_a: "SOL".into(),
+            token_mint_b: "USDC".into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 10,
+            derived_at: UNIX_EPOCH.checked_add(Duration::from_millis(100)).unwrap(),
+            freshness: state::types::FreshnessState::at(10, 10, 2),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RepairAttemptSucceeded { latency_ms: 45 },
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(150)).unwrap(),
+        });
+        state.upsert_pool(state::types::PoolSnapshot {
+            pool_id: PoolId("pool-a".into()),
+            price_bps: 10_000,
+            fee_bps: 4,
+            reserve_depth: 100_000,
+            reserve_a: Some(100_000),
+            reserve_b: Some(100_000),
+            active_liquidity: 100_000,
+            sqrt_price_x64: None,
+            venue: None,
+            confidence: PoolConfidence::Exact,
+            repair_pending: false,
+            liquidity_model: state::types::LiquidityModel::ConstantProduct,
+            slippage_factor_bps: 10_000,
+            token_mint_a: "SOL".into(),
+            token_mint_b: "USDC".into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 11,
+            derived_at: UNIX_EPOCH.checked_add(Duration::from_millis(180)).unwrap(),
+            freshness: state::types::FreshnessState::at(11, 11, 2),
+        });
+
+        let pool = state.pools.get("pool-a").expect("pool view should exist");
+        assert!(!pool.refresh_pending);
+        assert_eq!(pool.refresh_attempt_count, 0);
+        assert_eq!(pool.repair_attempt_count, 2);
+        assert_eq!(pool.repair_failure_count, 1);
+        assert_eq!(pool.repair_success_count, 1);
+        assert_eq!(pool.last_repair_latency_ms, Some(45));
+        assert_eq!(pool.last_repair_invalidation_ms, Some(80));
+    }
+
+    #[test]
+    fn tracks_refresh_metrics_separately_from_repair_metrics() {
+        let mut state = ObserverState::new(
+            test_config(),
+            BTreeMap::<String, PoolStaticMetadata>::new(),
+            2,
+        );
+
+        state.apply_status(crate::control::RuntimeStatus {
+            latest_slot: 10,
+            ..Default::default()
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RefreshScheduled { deadline_slot: 18 },
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(10)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RefreshAttemptStarted,
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(20)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RefreshAttemptFailed,
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(30)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RefreshScheduled { deadline_slot: 19 },
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(40)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RefreshAttemptStarted,
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(50)).unwrap(),
+        });
+        state.apply_repair(RepairEvent {
+            pool_id: "pool-a".into(),
+            kind: RepairEventKind::RefreshAttemptSucceeded { latency_ms: 12 },
+            occurred_at: UNIX_EPOCH.checked_add(Duration::from_millis(60)).unwrap(),
+        });
+        state.upsert_pool(state::types::PoolSnapshot {
+            pool_id: PoolId("pool-a".into()),
+            price_bps: 10_000,
+            fee_bps: 4,
+            reserve_depth: 100_000,
+            reserve_a: Some(100_000),
+            reserve_b: Some(100_000),
+            active_liquidity: 100_000,
+            sqrt_price_x64: None,
+            venue: None,
+            confidence: PoolConfidence::Exact,
+            repair_pending: false,
+            liquidity_model: state::types::LiquidityModel::ConstantProduct,
+            slippage_factor_bps: 10_000,
+            token_mint_a: "SOL".into(),
+            token_mint_b: "USDC".into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 11,
+            derived_at: UNIX_EPOCH.checked_add(Duration::from_millis(80)).unwrap(),
+            freshness: state::types::FreshnessState::at(11, 11, 2),
+        });
+
+        let pool = state.pools.get("pool-a").expect("pool view should exist");
+        assert!(!pool.refresh_pending);
+        assert_eq!(pool.refresh_attempt_count, 2);
+        assert_eq!(pool.refresh_failure_count, 1);
+        assert_eq!(pool.refresh_success_count, 1);
+        assert_eq!(pool.last_refresh_latency_ms, Some(12));
+        assert_eq!(pool.refresh_deadline_slot_lag, None);
+        assert_eq!(pool.repair_attempt_count, 0);
     }
 }

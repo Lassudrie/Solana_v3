@@ -7,6 +7,7 @@ pub enum FailureClass {
     TransportFailed,
     ChainDropped,
     ChainExecutionFailed,
+    ChainExecutionTooLittleOutput,
     Expired,
     Unknown,
 }

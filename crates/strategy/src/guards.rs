@@ -6,7 +6,7 @@ use state::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardrailConfig {
-    pub min_profit_lamports: i64,
+    pub min_profit_quote_atoms: i64,
     pub max_snapshot_slot_lag: u64,
     pub require_route_warm: bool,
     pub max_inflight_submissions: usize,
@@ -17,7 +17,7 @@ pub struct GuardrailConfig {
 impl Default for GuardrailConfig {
     fn default() -> Self {
         Self {
-            min_profit_lamports: 1,
+            min_profit_quote_atoms: 1,
             max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
@@ -51,15 +51,23 @@ impl GuardrailSet {
 
     pub fn evaluate_snapshots(&self, snapshots: [&PoolSnapshot; 2]) -> Result<(), RejectionReason> {
         for snapshot in snapshots {
-            if snapshot.freshness.slot_lag > self.config.max_snapshot_slot_lag
-                || snapshot.freshness.is_stale
-            {
+            if snapshot.freshness.is_stale {
+                if snapshot.repair_pending {
+                    return Err(RejectionReason::PoolRepairPending {
+                        pool_id: snapshot.pool_id.clone(),
+                    });
+                }
                 return Err(RejectionReason::SnapshotStale {
                     pool_id: snapshot.pool_id.clone(),
                     slot_lag: snapshot.freshness.slot_lag,
                 });
             }
             if !snapshot.is_exact() {
+                if snapshot.repair_pending {
+                    return Err(RejectionReason::PoolRepairPending {
+                        pool_id: snapshot.pool_id.clone(),
+                    });
+                }
                 return Err(RejectionReason::PoolStateNotExact {
                     pool_id: snapshot.pool_id.clone(),
                 });
@@ -108,10 +116,10 @@ impl GuardrailSet {
                 maximum: route.max_trade_size,
             });
         }
-        if quote.expected_net_profit < self.config.min_profit_lamports {
+        if quote.expected_net_profit_quote_atoms < self.config.min_profit_quote_atoms {
             return Err(RejectionReason::ProfitBelowThreshold {
-                expected: quote.expected_net_profit,
-                minimum: self.config.min_profit_lamports,
+                expected: quote.expected_net_profit_quote_atoms,
+                minimum: self.config.min_profit_quote_atoms,
             });
         }
         Ok(())
@@ -120,7 +128,10 @@ impl GuardrailSet {
 
 #[cfg(test)]
 mod tests {
-    use state::types::{ExecutionStateSnapshot, PoolId, RouteId};
+    use state::types::{
+        ExecutionStateSnapshot, FreshnessState, LiquidityModel, PoolConfidence, PoolId,
+        PoolSnapshot, RouteId,
+    };
 
     use crate::{
         guards::{GuardrailConfig, GuardrailSet},
@@ -128,6 +139,35 @@ mod tests {
         reasons::RejectionReason,
         route_registry::{RouteDefinition, RouteLeg, SwapSide},
     };
+
+    fn exact_snapshot(pool_id: &str, slot_lag: u64) -> PoolSnapshot {
+        PoolSnapshot {
+            pool_id: PoolId(pool_id.into()),
+            price_bps: 10_000,
+            fee_bps: 4,
+            reserve_depth: 100_000,
+            reserve_a: Some(100_000),
+            reserve_b: Some(100_000),
+            active_liquidity: 100_000,
+            sqrt_price_x64: None,
+            venue: None,
+            confidence: PoolConfidence::Exact,
+            repair_pending: false,
+            liquidity_model: LiquidityModel::ConstantProduct,
+            slippage_factor_bps: 100,
+            token_mint_a: "SOL".into(),
+            token_mint_b: "USDC".into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 10u64.saturating_sub(slot_lag),
+            derived_at: std::time::SystemTime::UNIX_EPOCH,
+            freshness: FreshnessState {
+                head_slot: 10,
+                slot_lag,
+                is_stale: slot_lag > 2,
+            },
+        }
+    }
 
     fn route_definition() -> RouteDefinition {
         RouteDefinition {
@@ -150,11 +190,32 @@ mod tests {
                     fee_bps: None,
                 },
             ],
+            min_trade_size: 10_000,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
             estimated_execution_cost_lamports: 0,
+            execution_protection: None,
         }
+    }
+
+    #[test]
+    fn rejects_exact_but_stale_snapshot() {
+        let guards = GuardrailSet::new(GuardrailConfig::default());
+        let first = exact_snapshot("pool-a", 3);
+        let second = exact_snapshot("pool-b", 0);
+
+        let rejection = guards
+            .evaluate_snapshots([&first, &second])
+            .expect_err("stale snapshots should be rejected");
+
+        assert_eq!(
+            rejection,
+            RejectionReason::SnapshotStale {
+                pool_id: PoolId("pool-a".into()),
+                slot_lag: 3,
+            }
+        );
     }
 
     fn profitable_quote() -> RouteQuote {
@@ -163,9 +224,10 @@ mod tests {
             input_amount: 10_000,
             gross_output_amount: 10_200,
             net_output_amount: 10_150,
-            expected_gross_profit: 150,
+            expected_gross_profit_quote_atoms: 150,
             estimated_execution_cost_lamports: 0,
-            expected_net_profit: 150,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: 150,
             leg_quotes: [
                 LegQuote {
                     venue: "venue-a".into(),

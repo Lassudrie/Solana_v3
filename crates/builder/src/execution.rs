@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use state::types::RouteId;
+use strategy::route_registry::SwapSide;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageMode {
@@ -41,6 +42,14 @@ impl VenueExecutionConfig {
             Self::OrcaWhirlpool(_) => "orca_whirlpool",
             Self::RaydiumSimplePool(_) => "raydium",
             Self::RaydiumClmm(_) => "raydium_clmm",
+        }
+    }
+
+    pub fn supports_exact_out_leg1(&self, side: SwapSide) -> bool {
+        match self {
+            Self::OrcaSimplePool(_) => false,
+            Self::OrcaWhirlpool(_) | Self::RaydiumClmm(_) => true,
+            Self::RaydiumSimplePool(_) => side == SwapSide::BuyBase,
         }
     }
 }

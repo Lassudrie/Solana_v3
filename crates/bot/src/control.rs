@@ -27,7 +27,11 @@ pub enum RuntimeIssue {
     KillSwitchActive,
     NoRoutesConfigured,
     RoutesNotWarm {
-        ready_routes: usize,
+        warm_routes: usize,
+        total_routes: usize,
+    },
+    NoTradableRoutes {
+        warm_routes: usize,
         total_routes: usize,
     },
     WalletNotReady,
@@ -114,7 +118,8 @@ pub struct RuntimeStatus {
     pub latest_slot: u64,
     pub rpc_slot: Option<u64>,
     pub total_routes: usize,
-    pub ready_routes: usize,
+    pub warm_routes: usize,
+    pub tradable_routes: usize,
     pub inflight_submissions: usize,
     pub wallet_ready: bool,
     pub wallet_balance_lamports: u64,
@@ -136,7 +141,8 @@ impl Default for RuntimeStatus {
             latest_slot: 0,
             rpc_slot: None,
             total_routes: 0,
-            ready_routes: 0,
+            warm_routes: 0,
+            tradable_routes: 0,
             inflight_submissions: 0,
             wallet_ready: false,
             wallet_balance_lamports: 0,
@@ -190,8 +196,13 @@ impl RuntimeStatus {
         }
         output.push_str("# TYPE bot_runtime_routes_total gauge\n");
         output.push_str(&format!("bot_runtime_routes_total {}\n", self.total_routes));
-        output.push_str("# TYPE bot_runtime_routes_ready gauge\n");
-        output.push_str(&format!("bot_runtime_routes_ready {}\n", self.ready_routes));
+        output.push_str("# TYPE bot_runtime_routes_warm gauge\n");
+        output.push_str(&format!("bot_runtime_routes_warm {}\n", self.warm_routes));
+        output.push_str("# TYPE bot_runtime_routes_tradable gauge\n");
+        output.push_str(&format!(
+            "bot_runtime_routes_tradable {}\n",
+            self.tradable_routes
+        ));
         output.push_str("# TYPE bot_runtime_inflight_submissions gauge\n");
         output.push_str(&format!(
             "bot_runtime_inflight_submissions {}\n",
@@ -458,7 +469,8 @@ mod tests {
             latest_slot: 42,
             rpc_slot: Some(41),
             total_routes: 1,
-            ready_routes: 1,
+            warm_routes: 1,
+            tradable_routes: 1,
             inflight_submissions: 0,
             wallet_ready: true,
             wallet_balance_lamports: 5,
@@ -492,6 +504,8 @@ mod tests {
         .prometheus_metrics();
 
         assert!(output.contains("bot_runtime_ready 1"));
+        assert!(output.contains("bot_runtime_routes_warm 1"));
+        assert!(output.contains("bot_runtime_routes_tradable 1"));
         assert!(output.contains("bot_detect_events_total 7"));
         assert!(output.contains("bot_shredstream_events_total 10"));
         assert!(output.contains("bot_shredstream_events_per_second 9"));

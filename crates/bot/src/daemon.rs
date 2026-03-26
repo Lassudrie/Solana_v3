@@ -1,11 +1,11 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use detection::{EventSourceKind, IngestError, MarketEventSource, NormalizedEvent};
+use submit::SubmitRejectionReason;
 use thiserror::Error;
 
 use crate::{
@@ -16,6 +16,7 @@ use crate::{
     refresh::AsyncStateRefresher,
     runtime::BotRuntime,
     sources::{EventSourceConfigError, build_event_source},
+    submit_dispatch::{EnqueueError, SubmitDispatcher},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,10 +36,16 @@ pub enum DaemonError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to start submit dispatcher: {source}")]
+    SubmitDispatcher {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub struct BotDaemon {
     runtime: BotRuntime,
+    submit_dispatcher: SubmitDispatcher,
     refresher: AsyncStateRefresher,
     source: Box<dyn MarketEventSource>,
     status: SharedRuntimeStatus,
@@ -57,7 +64,23 @@ impl BotDaemon {
     pub fn from_config(config: BotConfig) -> Result<Self, DaemonError> {
         let mut config = config;
         config.apply_runtime_profile_defaults();
-        let source = build_event_source(&config)?;
+        let status = SharedRuntimeStatus::new(RuntimeStatus::default());
+        if let Err(source) = status.spawn_http_server(&config.runtime.health_server) {
+            return Err(DaemonError::HealthServer {
+                bind_address: config.runtime.health_server.bind_address.clone(),
+                source,
+            });
+        }
+        let observer =
+            ObserverHandle::spawn(&config.runtime.monitor_server, &config).map_err(|source| {
+                DaemonError::HealthServer {
+                    bind_address: config.runtime.monitor_server.bind_address.clone(),
+                    source,
+                }
+            })?;
+        let submit_dispatcher = SubmitDispatcher::from_config(&config)
+            .map_err(|source| DaemonError::SubmitDispatcher { source })?;
+        let source = build_event_source(&config, observer.clone())?;
         let mut runtime = bootstrap(config.clone())?;
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
         let lookup_table_keys = config
@@ -81,23 +104,9 @@ impl BotDaemon {
             &lookup_table_keys,
         );
 
-        let status = SharedRuntimeStatus::new(RuntimeStatus::default());
-        if let Err(source) = status.spawn_http_server(&config.runtime.health_server) {
-            return Err(DaemonError::HealthServer {
-                bind_address: config.runtime.health_server.bind_address.clone(),
-                source,
-            });
-        }
-        let observer =
-            ObserverHandle::spawn(&config.runtime.monitor_server, &config).map_err(|source| {
-                DaemonError::HealthServer {
-                    bind_address: config.runtime.monitor_server.bind_address.clone(),
-                    source,
-                }
-            })?;
-
         let daemon = Self {
             runtime,
+            submit_dispatcher,
             refresher,
             source,
             status,
@@ -127,9 +136,13 @@ impl BotDaemon {
     }
 
     pub fn run(&mut self) -> Result<DaemonExit, DaemonError> {
+        let max_events_per_tick = self.control.max_events_per_tick.max(1);
+        let idle_wait = Duration::from_millis(self.control.idle_sleep_millis);
+
         loop {
             self.runtime
                 .apply_async_refresh(self.refresher.drain_snapshot());
+            self.drain_submit_completions();
             self.reconcile_if_due();
             let kill_switch_active = self.refresh_kill_switch();
             if kill_switch_active {
@@ -138,33 +151,31 @@ impl BotDaemon {
                 self.refresh_status(None, None, None);
             }
 
-            let mut processed = 0usize;
-            for _ in 0..self.control.max_events_per_tick {
+            match self.source.wait_next(idle_wait) {
+                Ok(Some(event)) => self.process_source_event(event),
+                Ok(None) => continue,
+                Err(IngestError::Exhausted { .. }) => {
+                    self.flush_submit_dispatcher();
+                    self.reconcile_now();
+                    self.refresh_status(
+                        Some(RuntimeMode::Stopped),
+                        Some(RuntimeIssue::EventSourceExhausted),
+                        None,
+                    );
+                    return Ok(DaemonExit::SourceExhausted);
+                }
+                Err(error) => {
+                    self.record_source_failure(error);
+                    continue;
+                }
+            }
+
+            for _ in 1..max_events_per_tick {
                 match self.source.poll_next() {
-                    Ok(Some(event)) => {
-                        processed += 1;
-                        if event.source.source == EventSourceKind::ShredStream {
-                            self.record_shredstream_metrics(&event);
-                        }
-                        match self.runtime.process_event(event) {
-                            Ok(report) => {
-                                self.observer.publish_hot_path(report);
-                                self.refresh_status(None, None, None);
-                            }
-                            Err(error) => {
-                                let detail = error.to_string();
-                                self.refresh_status(
-                                    Some(RuntimeMode::Degraded),
-                                    Some(RuntimeIssue::RuntimeFailure {
-                                        detail: detail.clone(),
-                                    }),
-                                    Some(detail),
-                                );
-                            }
-                        }
-                    }
+                    Ok(Some(event)) => self.process_source_event(event),
                     Ok(None) => break,
                     Err(IngestError::Exhausted { .. }) => {
+                        self.flush_submit_dispatcher();
                         self.reconcile_now();
                         self.refresh_status(
                             Some(RuntimeMode::Stopped),
@@ -174,27 +185,129 @@ impl BotDaemon {
                         return Ok(DaemonExit::SourceExhausted);
                     }
                     Err(error) => {
-                        let detail = error.to_string();
-                        self.refresh_status(
-                            Some(RuntimeMode::Degraded),
-                            Some(RuntimeIssue::EventSourceFailure {
-                                detail: detail.clone(),
-                            }),
-                            Some(detail),
-                        );
+                        self.record_source_failure(error);
                         break;
                     }
                 }
             }
 
-            if processed == 0 {
-                if self.control.idle_sleep_millis == 0 {
-                    thread::yield_now();
+            self.drain_submit_completions();
+        }
+    }
+
+    fn process_source_event(&mut self, event: NormalizedEvent) {
+        if event.source.source == EventSourceKind::ShredStream {
+            self.record_shredstream_metrics(&event);
+        }
+
+        match self
+            .runtime
+            .prepare_event(event, self.submit_dispatcher.pending_count())
+        {
+            Ok(report) => {
+                if report.signed_envelope.is_some() {
+                    self.dispatch_submission(report);
                 } else {
-                    thread::sleep(Duration::from_millis(self.control.idle_sleep_millis));
+                    self.observer.publish_hot_path(report);
+                    self.refresh_status(None, None, None);
                 }
             }
+            Err(error) => {
+                let detail = error.to_string();
+                self.refresh_status(
+                    Some(RuntimeMode::Degraded),
+                    Some(RuntimeIssue::RuntimeFailure {
+                        detail: detail.clone(),
+                    }),
+                    Some(detail),
+                );
+            }
         }
+    }
+
+    fn dispatch_submission(&mut self, report: crate::runtime::HotPathReport) {
+        match self.submit_dispatcher.try_enqueue(report) {
+            Ok(()) => self.refresh_status(None, None, None),
+            Err(EnqueueError::Full(report) | EnqueueError::Disconnected(report)) => {
+                let rejected = self
+                    .submit_dispatcher
+                    .queue_rejection(&report, SubmitRejectionReason::ChannelUnavailable);
+                let report = self.runtime.finalize_submission(
+                    report,
+                    rejected,
+                    Duration::ZERO,
+                    SystemTime::now(),
+                );
+                self.observer.publish_hot_path(report);
+                self.refresh_status(None, None, None);
+            }
+        }
+    }
+
+    fn drain_submit_completions(&mut self) {
+        let mut drained = false;
+        while let Some(completion) = self.submit_dispatcher.try_next_completion() {
+            drained = true;
+            let submit_result = match completion.result {
+                Ok(result) => result,
+                Err(_) => self.submit_dispatcher.queue_rejection(
+                    &completion.report,
+                    SubmitRejectionReason::ChannelUnavailable,
+                ),
+            };
+            let report = self.runtime.finalize_submission(
+                completion.report,
+                submit_result,
+                completion.submit_duration,
+                completion.finished_at,
+            );
+            self.observer.publish_hot_path(report);
+        }
+        if drained {
+            self.refresh_status(None, None, None);
+        }
+    }
+
+    fn flush_submit_dispatcher(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.submit_dispatcher.pending_count() > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let timeout = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let Some(completion) = self.submit_dispatcher.wait_for_completion(timeout) else {
+                continue;
+            };
+            let submit_result = match completion.result {
+                Ok(result) => result,
+                Err(_) => self.submit_dispatcher.queue_rejection(
+                    &completion.report,
+                    SubmitRejectionReason::ChannelUnavailable,
+                ),
+            };
+            let report = self.runtime.finalize_submission(
+                completion.report,
+                submit_result,
+                completion.submit_duration,
+                completion.finished_at,
+            );
+            self.observer.publish_hot_path(report);
+        }
+        self.refresh_status(None, None, None);
+    }
+
+    fn record_source_failure(&self, error: IngestError) {
+        let detail = error.to_string();
+        self.refresh_status(
+            Some(RuntimeMode::Degraded),
+            Some(RuntimeIssue::EventSourceFailure {
+                detail: detail.clone(),
+            }),
+            Some(detail),
+        );
     }
 
     fn reconcile_if_due(&mut self) {
@@ -287,7 +400,12 @@ impl BotDaemon {
     ) {
         let execution_state = self.runtime.execution_state();
         let total_routes = self.runtime.route_count();
-        let ready_routes = self.runtime.ready_route_count();
+        let warm_routes = self.runtime.ready_route_count();
+        let tradable_routes = self.runtime.tradable_route_count();
+        let inflight_submissions = self
+            .runtime
+            .pending_submissions()
+            .saturating_add(self.submit_dispatcher.pending_count());
         let blockhash_slot_lag = execution_state.blockhash_slot_lag();
         let derived_issue = issue_override.or_else(|| {
             if execution_state.kill_switch_enabled {
@@ -296,9 +414,15 @@ impl BotDaemon {
             if total_routes == 0 {
                 return Some(RuntimeIssue::NoRoutesConfigured);
             }
-            if ready_routes < total_routes {
+            if warm_routes < total_routes {
                 return Some(RuntimeIssue::RoutesNotWarm {
-                    ready_routes,
+                    warm_routes,
+                    total_routes,
+                });
+            }
+            if tradable_routes == 0 {
+                return Some(RuntimeIssue::NoTradableRoutes {
+                    warm_routes,
                     total_routes,
                 });
             }
@@ -349,8 +473,9 @@ impl BotDaemon {
             latest_slot: self.runtime.latest_slot(),
             rpc_slot: execution_state.rpc_slot,
             total_routes,
-            ready_routes,
-            inflight_submissions: self.runtime.pending_submissions(),
+            warm_routes,
+            tradable_routes,
+            inflight_submissions,
             wallet_ready: execution_state.wallet_ready,
             wallet_balance_lamports: execution_state.wallet_balance_lamports,
             blockhash_slot: execution_state.blockhash_slot,
@@ -413,7 +538,8 @@ mod tests {
 
         assert_eq!(exit, DaemonExit::SourceExhausted);
         assert_eq!(status.total_routes, 1);
-        assert_eq!(status.ready_routes, 1);
+        assert_eq!(status.warm_routes, 1);
+        assert_eq!(status.tradable_routes, 1);
         assert_eq!(status.metrics.detect_events, 2);
         assert_eq!(status.metrics.submit_count, 1);
 
@@ -515,9 +641,11 @@ mod tests {
                 output_mint: "USDC".into(),
                 base_mint: None,
                 quote_mint: None,
+                min_trade_size: None,
                 default_trade_size: 10_000,
                 max_trade_size: 20_000,
                 size_ladder: Vec::new(),
+                execution_protection: Default::default(),
                 legs: [
                     RouteLegConfig {
                         venue: "orca".into(),

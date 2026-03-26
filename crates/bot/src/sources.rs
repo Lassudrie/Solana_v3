@@ -17,6 +17,7 @@ use thiserror::Error;
 use crate::{
     config::{BotConfig, EventSourceMode},
     live::GrpcEntriesEventSource,
+    observer::ObserverHandle,
 };
 
 #[derive(Debug, Error)]
@@ -45,6 +46,7 @@ pub enum EventSourceConfigError {
 
 pub fn build_event_source(
     config: &BotConfig,
+    observer: ObserverHandle,
 ) -> Result<Box<dyn MarketEventSource>, EventSourceConfigError> {
     match config.runtime.event_source.mode {
         EventSourceMode::Disabled => Err(EventSourceConfigError::Disabled),
@@ -57,7 +59,7 @@ pub fn build_event_source(
                 .ok_or(EventSourceConfigError::MissingPath)?;
             Ok(Box::new(JsonlFileEventSource::open(path)?))
         }
-        EventSourceMode::Shredstream => GrpcEntriesEventSource::spawn(config)
+        EventSourceMode::Shredstream => GrpcEntriesEventSource::spawn(config, observer)
             .map(|source| Box::new(source) as Box<dyn MarketEventSource>)
             .map_err(|detail| EventSourceConfigError::LiveShredstream { detail }),
         EventSourceMode::UdpJson => {
@@ -119,6 +121,11 @@ impl MarketEventSource for JsonlFileEventSource {
                 });
         }
     }
+
+    fn wait_next(&mut self, timeout: Duration) -> Result<Option<NormalizedEvent>, IngestError> {
+        let _ = timeout;
+        self.poll_next()
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +171,59 @@ impl MarketEventSource for UdpJsonEventSource {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
             Err(error) => Err(IngestError::SourceFailure {
                 kind: self.source_kind(),
+                detail: error.to_string(),
+            }),
+        }
+    }
+
+    fn wait_next(&mut self, timeout: Duration) -> Result<Option<NormalizedEvent>, IngestError> {
+        if timeout.is_zero() {
+            return self.poll_next();
+        }
+
+        let kind = self.source_kind();
+        self.socket
+            .set_nonblocking(false)
+            .map_err(|error| IngestError::SourceFailure {
+                kind,
+                detail: error.to_string(),
+            })?;
+        self.socket
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| IngestError::SourceFailure {
+                kind,
+                detail: error.to_string(),
+            })?;
+
+        let mut buffer = [0u8; 65_535];
+        let recv_result = self.socket.recv(&mut buffer);
+
+        let restore_timeout = self.socket.set_read_timeout(None);
+        let restore_nonblocking = self.socket.set_nonblocking(true);
+        if let Err(error) = restore_timeout.and(restore_nonblocking) {
+            return Err(IngestError::SourceFailure {
+                kind,
+                detail: error.to_string(),
+            });
+        }
+
+        match recv_result {
+            Ok(bytes) => {
+                let payload = String::from_utf8_lossy(&buffer[..bytes]);
+                parse_wire_event(&payload, kind, &mut self.next_sequence)
+                    .map(Some)
+                    .map_err(|detail| IngestError::SourceFailure { kind, detail })
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(IngestError::SourceFailure {
+                kind,
                 detail: error.to_string(),
             }),
         }
