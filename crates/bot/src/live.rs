@@ -108,14 +108,7 @@ impl GrpcEntriesEventSource {
             route_health.clone(),
         );
 
-        for pool_id in registry.pool_ids() {
-            let _ = repair_tx.send(RepairRequest {
-                pool_id,
-                mode: SyncRequestMode::RepairAfterInvalidation,
-                priority: RepairPriority::Immediate,
-                observed_slot: 0,
-            });
-        }
+        seed_initial_repairs(registry.pool_ids(), &sync_tracker, &repair_tx);
 
         spawn_stream_worker(
             config,
@@ -775,6 +768,29 @@ impl PoolSyncTracker {
             self.clear_refresh(pool_id);
         }
         expired
+    }
+}
+
+fn seed_initial_repairs(
+    pool_ids: Vec<String>,
+    sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
+    repair_tx: &mpsc::Sender<RepairRequest>,
+) {
+    for pool_id in pool_ids {
+        let queued = sync_tracker
+            .lock()
+            .ok()
+            .map(|mut tracker| tracker.repair_requested(&pool_id))
+            .unwrap_or(false);
+        if !queued {
+            continue;
+        }
+        let _ = repair_tx.send(RepairRequest {
+            pool_id,
+            mode: SyncRequestMode::RepairAfterInvalidation,
+            priority: RepairPriority::Immediate,
+            observed_slot: 0,
+        });
     }
 }
 
@@ -2697,7 +2713,7 @@ mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
         path::PathBuf,
-        sync::{Arc, RwLock},
+        sync::{Arc, Mutex, RwLock, mpsc},
         time::{Duration, UNIX_EPOCH},
     };
 
@@ -2719,7 +2735,8 @@ mod tests {
         anchor_instruction_discriminator, associated_token_address,
         build_executable_state_from_accounts, constant_product_amount_in_for_output,
         constant_product_amount_out, parse_legacy_pubkey, reduce_orca_simple_swap,
-        reduce_raydium_simple_swap, resolve_transaction, timestamp_to_system_time,
+        reduce_raydium_simple_swap, resolve_transaction, seed_initial_repairs,
+        timestamp_to_system_time,
     };
     use crate::config::{BotConfig, ReducerRolloutMode, RouteLegExecutionConfig};
 
@@ -3522,6 +3539,37 @@ mod tests {
             vec!["pool-a".to_string()]
         );
         assert!(!tracker.refresh_required("pool-a"));
+    }
+
+    #[test]
+    fn seed_initial_repairs_marks_tracker_and_enqueues_once_per_pool() {
+        let sync_tracker = Arc::new(Mutex::new(PoolSyncTracker::default()));
+        let (repair_tx, repair_rx) = mpsc::channel();
+
+        seed_initial_repairs(
+            vec!["pool-a".into(), "pool-b".into(), "pool-a".into()],
+            &sync_tracker,
+            &repair_tx,
+        );
+
+        let first = repair_rx.recv().expect("first repair request");
+        let second = repair_rx.recv().expect("second repair request");
+        assert!(repair_rx.try_recv().is_err());
+
+        let received = BTreeSet::from([first.pool_id, second.pool_id]);
+        assert_eq!(received, BTreeSet::from(["pool-a".into(), "pool-b".into()]));
+        assert!(
+            sync_tracker
+                .lock()
+                .expect("tracker lock")
+                .repair_required("pool-a")
+        );
+        assert!(
+            sync_tracker
+                .lock()
+                .expect("tracker lock")
+                .repair_required("pool-b")
+        );
     }
 
     #[test]
