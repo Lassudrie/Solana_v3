@@ -142,8 +142,10 @@ pub struct MonitorTradeEvent {
     pub failure_custom_code: Option<u32>,
     pub failure_error_name: Option<String>,
     pub endpoint: String,
-    pub build_slot: u64,
-    pub created_at_unix_millis: u128,
+    pub quoted_slot: u64,
+    pub blockhash_slot: Option<u64>,
+    pub submitted_slot: Option<u64>,
+    pub submitted_at_unix_millis: u128,
     pub updated_at_unix_millis: u128,
     pub source_to_submit_nanos: Option<u64>,
     pub submit_to_terminal_nanos: Option<u64>,
@@ -343,10 +345,11 @@ impl ObserverState {
             .as_ref()
             .and_then(|detail| detail.error_name.clone());
         existing.updated_at_unix_millis = unix_millis(record.last_updated_at);
+        existing.submitted_slot = record.submitted_slot;
         existing.submit_to_terminal_nanos = duration_nanos(
             record
                 .last_updated_at
-                .duration_since(record.created_at)
+                .duration_since(record.submitted_at)
                 .unwrap_or(Duration::ZERO),
         );
         existing.source_to_terminal_nanos = combine_latencies(
@@ -653,8 +656,10 @@ impl ObserverState {
                 .as_ref()
                 .and_then(|detail| detail.error_name.clone()),
             endpoint: record.submit_endpoint.clone(),
-            build_slot: record.build_slot,
-            created_at_unix_millis: unix_millis(record.created_at),
+            quoted_slot: record.quoted_slot,
+            blockhash_slot: record.blockhash_slot,
+            submitted_slot: record.submitted_slot,
+            submitted_at_unix_millis: unix_millis(record.submitted_at),
             updated_at_unix_millis: unix_millis(record.last_updated_at),
             source_to_submit_nanos,
             submit_to_terminal_nanos,
@@ -1450,6 +1455,8 @@ fn build_reason_code(reason: &BuildRejectionReason) -> &'static str {
         BuildRejectionReason::MissingBlockhash => "missing_blockhash",
         BuildRejectionReason::MissingFeePayer => "missing_fee_payer",
         BuildRejectionReason::KillSwitchActive => "kill_switch_active",
+        BuildRejectionReason::ExecutionPathCongested => "execution_path_congested",
+        BuildRejectionReason::ExecutionPathUnavailable => "execution_path_unavailable",
         BuildRejectionReason::UnsupportedRouteShape => "unsupported_route_shape",
         BuildRejectionReason::MissingRouteExecution => "missing_route_execution",
         BuildRejectionReason::MissingLookupTable => "missing_lookup_table",
@@ -1458,11 +1465,23 @@ fn build_reason_code(reason: &BuildRejectionReason) -> &'static str {
         BuildRejectionReason::MessageCompilationFailed => "message_compilation_failed",
         BuildRejectionReason::UnsupportedVenue => "unsupported_venue",
         BuildRejectionReason::MissingExecutionHint => "missing_execution_hint",
+        BuildRejectionReason::TransactionTooLarge { .. } => "transaction_too_large",
+        BuildRejectionReason::TooManyAccountLocks { .. } => "too_many_account_locks",
     }
 }
 
 fn build_reason_detail(reason: &BuildRejectionReason) -> String {
-    format!("{reason:?}")
+    match reason {
+        BuildRejectionReason::TransactionTooLarge {
+            serialized_bytes,
+            maximum,
+        } => format!("serialized_bytes={serialized_bytes}, maximum={maximum}"),
+        BuildRejectionReason::TooManyAccountLocks {
+            account_locks,
+            maximum,
+        } => format!("account_locks={account_locks}, maximum={maximum}"),
+        _ => format!("{reason:?}"),
+    }
 }
 
 fn submit_reason_code(reason: &SubmitRejectionReason) -> &'static str {
@@ -1595,6 +1614,13 @@ mod tests {
             build_reason_code(&BuildRejectionReason::MissingLookupTable),
             "missing_lookup_table"
         );
+        assert_eq!(
+            build_reason_code(&BuildRejectionReason::TransactionTooLarge {
+                serialized_bytes: 1400,
+                maximum: 1232,
+            }),
+            "transaction_too_large"
+        );
     }
 
     #[test]
@@ -1686,11 +1712,13 @@ mod tests {
             submit_mode: SubmitMode::SingleTransaction,
             submit_endpoint: "http://127.0.0.1:3000".into(),
             submit_status: SubmitStatus::Accepted,
-            build_slot: 42,
+            quoted_slot: 42,
+            blockhash_slot: Some(43),
+            submitted_slot: Some(44),
             inclusion_status: InclusionStatus::Submitted,
             outcome: ExecutionOutcome::Pending,
             failure_detail: None,
-            created_at,
+            submitted_at: created_at,
             last_updated_at: created_at,
         };
         let report = HotPathReport {
@@ -1704,6 +1732,7 @@ mod tests {
             signed_envelope: None,
             submit_result: None,
             execution_record: Some(record.clone()),
+            submit_leader: None,
             pipeline_trace: PipelineTrace {
                 source: EventSourceKind::ShredStream,
                 source_sequence: 7,
@@ -1727,6 +1756,9 @@ mod tests {
         assert_eq!(pending.source_to_submit_nanos, Some(7_000_000));
         assert_eq!(pending.submit_to_terminal_nanos, None);
         assert_eq!(pending.source_to_terminal_nanos, None);
+        assert_eq!(pending.quoted_slot, 42);
+        assert_eq!(pending.blockhash_slot, Some(43));
+        assert_eq!(pending.submitted_slot, Some(44));
 
         let completed_at = created_at.checked_add(Duration::from_millis(5)).unwrap();
         state.apply_trade_update(ExecutionRecord {

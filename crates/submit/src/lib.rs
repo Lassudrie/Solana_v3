@@ -1,8 +1,12 @@
 pub mod jito;
+pub mod router;
+pub mod rpc;
 pub mod submitter;
 pub mod types;
 
 pub use jito::{JitoConfig, JitoSubmitter};
+pub use router::{RoutedSubmitter, SingleTransactionRoutingPolicy};
+pub use rpc::{RpcConfig, RpcSubmitter};
 pub use submitter::{
     SubmitAttemptOutcome, SubmitError, SubmitRetryPolicy, Submitter, submit_with_retry_policy,
 };
@@ -18,7 +22,9 @@ mod tests {
     use signing::SignedTransactionEnvelope;
 
     use crate::{
-        JitoConfig, JitoSubmitter, SubmitAttemptOutcome, SubmitRetryPolicy,
+        JitoConfig, JitoSubmitter, RoutedSubmitter, RpcConfig, RpcSubmitter,
+        SingleTransactionRoutingPolicy, SubmissionId, SubmitAttemptOutcome, SubmitRejectionReason,
+        SubmitResult, SubmitRetryPolicy,
         submitter::Submitter,
         types::{SubmitMode, SubmitRequest, SubmitStatus},
     };
@@ -48,11 +54,26 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct StaticSubmitter {
+        attempts: AtomicUsize,
+        outcome: Result<SubmitAttemptOutcome, crate::SubmitError>,
+    }
+
+    impl Submitter for StaticSubmitter {
+        fn submit_attempt(
+            &self,
+            _request: SubmitRequest,
+        ) -> Result<SubmitAttemptOutcome, crate::SubmitError> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            self.outcome.clone()
+        }
+    }
+
     #[test]
     fn submitter_mock_returns_structured_result() {
         let submitter = JitoSubmitter::new(JitoConfig {
             endpoint: "mock://jito".into(),
-            ws_endpoint: "mock://jito-tip-stream".into(),
             ..JitoConfig::default()
         });
         let result = submitter
@@ -63,10 +84,12 @@ mod tests {
                     signature: "sig".into(),
                     signer_id: "wallet".into(),
                     signed_message: vec![1, 2, 3],
-                    build_slot: 10,
+                    quoted_slot: 10,
+                    blockhash_slot: Some(11),
                     signed_at: SystemTime::now(),
                 },
                 mode: SubmitMode::SingleTransaction,
+                leader: None,
             })
             .unwrap();
 
@@ -78,7 +101,6 @@ mod tests {
     fn submitter_minimally_deduplicates_same_signature() {
         let submitter = JitoSubmitter::new(JitoConfig {
             endpoint: "mock://jito".into(),
-            ws_endpoint: "mock://jito-tip-stream".into(),
             ..JitoConfig::default()
         });
         let request = SubmitRequest {
@@ -88,16 +110,93 @@ mod tests {
                 signature: "sig".into(),
                 signer_id: "wallet".into(),
                 signed_message: vec![1, 2, 3],
-                build_slot: 10,
+                quoted_slot: 10,
+                blockhash_slot: Some(11),
                 signed_at: SystemTime::now(),
             },
             mode: SubmitMode::SingleTransaction,
+            leader: None,
         };
 
         let first = submitter.submit(request.clone()).unwrap();
         let second = submitter.submit(request).unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rpc_submitter_mock_returns_structured_result() {
+        let submitter = RpcSubmitter::new(RpcConfig {
+            endpoint: "mock://solana-rpc".into(),
+            ..RpcConfig::default()
+        });
+        let result = submitter
+            .submit(SubmitRequest {
+                envelope: SignedTransactionEnvelope {
+                    route_id: RouteId("route-a".into()),
+                    recent_blockhash: "blockhash-1".into(),
+                    signature: "sig".into(),
+                    signer_id: "wallet".into(),
+                    signed_message: vec![1, 2, 3],
+                    quoted_slot: 10,
+                    blockhash_slot: Some(11),
+                    signed_at: SystemTime::now(),
+                },
+                mode: SubmitMode::SingleTransaction,
+                leader: None,
+            })
+            .unwrap();
+
+        assert_eq!(result.status, SubmitStatus::Accepted);
+        assert_eq!(result.submission_id.0, "rpc-single-sig");
+    }
+
+    #[test]
+    fn routed_submitter_leader_aware_prefers_rpc_lane() {
+        let rpc = std::sync::Arc::new(StaticSubmitter {
+            attempts: AtomicUsize::new(0),
+            outcome: Ok(SubmitAttemptOutcome::Terminal(SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("rpc-accepted".into()),
+                endpoint: "mock://solana-rpc".into(),
+                rejection: None,
+            })),
+        });
+        let jito = std::sync::Arc::new(StaticSubmitter {
+            attempts: AtomicUsize::new(0),
+            outcome: Ok(SubmitAttemptOutcome::Terminal(SubmitResult {
+                status: SubmitStatus::Rejected,
+                submission_id: SubmissionId("jito-rejected".into()),
+                endpoint: "mock://jito/api/v1/transactions".into(),
+                rejection: Some(SubmitRejectionReason::RemoteRejected),
+            })),
+        });
+        let submitter = RoutedSubmitter::new(
+            Some(jito.clone()),
+            Some(rpc.clone()),
+            SingleTransactionRoutingPolicy::LeaderAware,
+        );
+
+        let result = submitter
+            .submit(SubmitRequest {
+                envelope: SignedTransactionEnvelope {
+                    route_id: RouteId("route-a".into()),
+                    recent_blockhash: "blockhash-1".into(),
+                    signature: "sig".into(),
+                    signer_id: "wallet".into(),
+                    signed_message: vec![1, 2, 3],
+                    quoted_slot: 10,
+                    blockhash_slot: Some(11),
+                    signed_at: SystemTime::now(),
+                },
+                mode: SubmitMode::SingleTransaction,
+                leader: Some("leader-a".into()),
+            })
+            .unwrap();
+
+        assert_eq!(result.submission_id.0, "rpc-accepted");
+        assert_eq!(rpc.attempts.load(Ordering::Relaxed), 1);
+        assert_eq!(jito.attempts.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -134,10 +233,12 @@ mod tests {
                     signature: "sig".into(),
                     signer_id: "wallet".into(),
                     signed_message: vec![1, 2, 3],
-                    build_slot: 10,
+                    quoted_slot: 10,
+                    blockhash_slot: Some(11),
                     signed_at: SystemTime::now(),
                 },
                 mode: SubmitMode::SingleTransaction,
+                leader: None,
             })
             .unwrap();
 
@@ -171,10 +272,12 @@ mod tests {
                     signature: "sig".into(),
                     signer_id: "wallet".into(),
                     signed_message: vec![1, 2, 3],
-                    build_slot: 10,
+                    quoted_slot: 10,
+                    blockhash_slot: Some(11),
                     signed_at: SystemTime::now(),
                 },
                 mode: SubmitMode::SingleTransaction,
+                leader: None,
             })
             .unwrap();
 

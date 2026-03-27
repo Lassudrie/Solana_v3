@@ -1,22 +1,29 @@
 use std::{
     collections::BTreeSet,
     path::PathBuf,
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
+    thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use detection::{EventSourceKind, IngestError, MarketEventSource, NormalizedEvent};
+use reconciliation::{
+    ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, OnChainReconciler,
+    OnChainReconciliationConfig,
+};
 use submit::SubmitRejectionReason;
 use thiserror::Error;
 
 use crate::{
     account_batcher::GetMultipleAccountsBatcher,
     bootstrap::{BootstrapError, bootstrap_with_health},
+    build_sign_dispatch::{BuildSignDispatcher, EnqueueError as BuildSignEnqueueError},
     config::{BotConfig, RuntimeControlConfig},
     control::{RuntimeIssue, RuntimeMode, RuntimeStatus, SharedRuntimeStatus},
     observer::ObserverHandle,
     refresh::{AsyncStateRefresher, RefreshFailure},
     route_health::RouteHealthRegistry,
-    runtime::BotRuntime,
+    runtime::{BotRuntime, PreparedHotPath},
     sources::{EventSourceConfigError, build_event_source},
     submit_dispatch::{EnqueueError, SubmitDispatcher},
 };
@@ -43,11 +50,195 @@ pub enum DaemonError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to start build/sign dispatcher: {source}")]
+    BuildSignDispatcher {
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+enum ReconciliationRequest {
+    TrackSubmission(ExecutionRecord),
+    Tick { observed_slot: u64 },
+    Shutdown,
+}
+
+enum ReconciliationResponse {
+    Transition {
+        observed_slot: u64,
+        transition: ExecutionTransition,
+        record: ExecutionRecord,
+    },
+    TickFinished {
+        duration: Duration,
+    },
+}
+
+struct ReconciliationWorker {
+    request_tx: Sender<ReconciliationRequest>,
+    response_rx: Receiver<ReconciliationResponse>,
+    join_handle: Option<JoinHandle<()>>,
+    poll_interval: Duration,
+    last_tick_completed_at: Option<Instant>,
+    tick_in_flight: bool,
+    stopped: bool,
+}
+
+impl ReconciliationWorker {
+    fn spawn(config: OnChainReconciliationConfig, poll_interval: Duration) -> Self {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let join_handle = thread::spawn(move || {
+            run_reconciliation_worker(config, request_rx, response_tx);
+        });
+        Self {
+            request_tx,
+            response_rx,
+            join_handle: Some(join_handle),
+            poll_interval,
+            last_tick_completed_at: None,
+            tick_in_flight: false,
+            stopped: false,
+        }
+    }
+
+    fn track_submission(&self, record: &ExecutionRecord) -> Result<(), ()> {
+        if record.outcome != ExecutionOutcome::Pending {
+            return Ok(());
+        }
+
+        self.request_tx
+            .send(ReconciliationRequest::TrackSubmission(record.clone()))
+            .map_err(|_| ())
+    }
+
+    fn request_tick_if_due(&mut self, observed_slot: u64) -> Result<bool, ()> {
+        if !self.reconciliation_due() {
+            return Ok(false);
+        }
+        self.request_tick(observed_slot)
+    }
+
+    fn request_tick(&mut self, observed_slot: u64) -> Result<bool, ()> {
+        if self.tick_in_flight {
+            return Ok(false);
+        }
+        self.request_tx
+            .send(ReconciliationRequest::Tick { observed_slot })
+            .map_err(|_| ())?;
+        self.tick_in_flight = true;
+        Ok(true)
+    }
+
+    fn try_next_response(&mut self) -> Result<Option<ReconciliationResponse>, ()> {
+        match self.response_rx.try_recv() {
+            Ok(response) => Ok(Some(response)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(()),
+        }
+    }
+
+    fn wait_for_response(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<ReconciliationResponse>, ()> {
+        match self.response_rx.recv_timeout(timeout) {
+            Ok(response) => Ok(Some(response)),
+            Err(RecvTimeoutError::Timeout) => Ok(None),
+            Err(RecvTimeoutError::Disconnected) => Err(()),
+        }
+    }
+
+    fn note_tick_finished(&mut self) {
+        self.tick_in_flight = false;
+        self.last_tick_completed_at = Some(Instant::now());
+    }
+
+    fn reconciliation_due(&self) -> bool {
+        if self.tick_in_flight {
+            return false;
+        }
+        if self.poll_interval == Duration::ZERO {
+            return true;
+        }
+
+        match self.last_tick_completed_at {
+            None => true,
+            Some(last) => last.elapsed() >= self.poll_interval,
+        }
+    }
+
+    fn is_tick_in_flight(&self) -> bool {
+        self.tick_in_flight
+    }
+
+    fn shutdown(&mut self) {
+        if self.stopped {
+            return;
+        }
+        let _ = self.request_tx.send(ReconciliationRequest::Shutdown);
+        self.stopped = true;
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
+impl Drop for ReconciliationWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_reconciliation_worker(
+    config: OnChainReconciliationConfig,
+    request_rx: Receiver<ReconciliationRequest>,
+    response_tx: Sender<ReconciliationResponse>,
+) {
+    let mut tracker = ExecutionTracker::default();
+    let mut reconciler = OnChainReconciler::new(config);
+    while let Ok(request) = request_rx.recv() {
+        match request {
+            ReconciliationRequest::TrackSubmission(record) => {
+                tracker.upsert_record(record);
+            }
+            ReconciliationRequest::Tick { observed_slot } => {
+                let reconcile_started = Instant::now();
+                let transitions = reconciler.tick(&mut tracker, observed_slot);
+                for transition in transitions {
+                    let Some(record) = tracker.get(&transition.submission_id).cloned() else {
+                        continue;
+                    };
+                    if response_tx
+                        .send(ReconciliationResponse::Transition {
+                            observed_slot,
+                            transition,
+                            record,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if response_tx
+                    .send(ReconciliationResponse::TickFinished {
+                        duration: reconcile_started.elapsed(),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            ReconciliationRequest::Shutdown => break,
+        }
+    }
 }
 
 pub struct BotDaemon {
     runtime: BotRuntime,
+    build_sign_dispatcher: BuildSignDispatcher,
     submit_dispatcher: SubmitDispatcher,
+    reconciliation_worker: ReconciliationWorker,
     refresher: AsyncStateRefresher,
     source: Box<dyn MarketEventSource>,
     status: SharedRuntimeStatus,
@@ -56,8 +247,6 @@ pub struct BotDaemon {
     kill_switch_sentinel_path: Option<PathBuf>,
     min_wallet_balance_lamports: u64,
     max_blockhash_slot_lag: u64,
-    reconciliation_poll_interval: Duration,
-    last_reconcile_at: Option<Instant>,
     last_shredstream_sequence: Option<u64>,
     last_shredstream_source_event_at: Option<SystemTime>,
 }
@@ -88,6 +277,13 @@ impl BotDaemon {
         })?;
         let submit_dispatcher = SubmitDispatcher::from_config(&config)
             .map_err(|source| DaemonError::SubmitDispatcher { source })?;
+        let build_sign_dispatcher = BuildSignDispatcher::new(
+            runtime.build_sign_pipeline(),
+            config.submit.worker_count,
+            config.submit.queue_capacity,
+            config.submit.congestion_threshold_pct,
+        )
+        .map_err(|source| DaemonError::BuildSignDispatcher { source })?;
         let account_batcher =
             GetMultipleAccountsBatcher::new(&config.reconciliation.rpc_http_endpoint);
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
@@ -120,10 +316,24 @@ impl BotDaemon {
             account_batcher,
             lookup_table_cache,
         )?;
+        let reconciliation_worker = ReconciliationWorker::spawn(
+            OnChainReconciliationConfig {
+                enabled: config.reconciliation.enabled,
+                rpc_http_endpoint: config.reconciliation.rpc_http_endpoint.clone(),
+                rpc_ws_endpoint: config.reconciliation.rpc_ws_endpoint.clone(),
+                websocket_enabled: config.reconciliation.websocket_enabled,
+                websocket_timeout_ms: config.reconciliation.websocket_timeout_ms,
+                search_transaction_history: config.reconciliation.search_transaction_history,
+                max_pending_slots: config.reconciliation.max_pending_slots,
+            },
+            Duration::from_millis(config.reconciliation.poll_interval_millis),
+        );
 
         let daemon = Self {
             runtime,
+            build_sign_dispatcher,
             submit_dispatcher,
+            reconciliation_worker,
             refresher,
             source,
             status,
@@ -137,10 +347,6 @@ impl BotDaemon {
                 .map(PathBuf::from),
             min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
             max_blockhash_slot_lag: config.strategy.max_blockhash_slot_lag,
-            reconciliation_poll_interval: Duration::from_millis(
-                config.reconciliation.poll_interval_millis,
-            ),
-            last_reconcile_at: None,
             last_shredstream_sequence: None,
             last_shredstream_source_event_at: None,
         };
@@ -160,7 +366,9 @@ impl BotDaemon {
             let refresh_snapshot = self.refresher.drain_snapshot();
             let refresh_failure_status = self.refresh_failure_status(&refresh_snapshot.failures);
             self.runtime.apply_async_refresh(refresh_snapshot);
+            self.drain_build_sign_completions();
             self.drain_submit_completions();
+            self.drain_reconciliation_updates();
             self.reconcile_if_due();
             let kill_switch_active = self.refresh_kill_switch();
             if let Some((issue, detail)) = refresh_failure_status {
@@ -175,8 +383,9 @@ impl BotDaemon {
                 Ok(Some(event)) => self.process_source_event(event),
                 Ok(None) => continue,
                 Err(IngestError::Exhausted { .. }) => {
+                    self.flush_build_sign_dispatcher();
                     self.flush_submit_dispatcher();
-                    self.reconcile_now();
+                    self.flush_reconciliation_worker();
                     self.refresh_status(
                         Some(RuntimeMode::Stopped),
                         Some(RuntimeIssue::EventSourceExhausted),
@@ -195,8 +404,9 @@ impl BotDaemon {
                     Ok(Some(event)) => self.process_source_event(event),
                     Ok(None) => break,
                     Err(IngestError::Exhausted { .. }) => {
+                        self.flush_build_sign_dispatcher();
                         self.flush_submit_dispatcher();
-                        self.reconcile_now();
+                        self.flush_reconciliation_worker();
                         self.refresh_status(
                             Some(RuntimeMode::Stopped),
                             Some(RuntimeIssue::EventSourceExhausted),
@@ -211,7 +421,9 @@ impl BotDaemon {
                 }
             }
 
+            self.drain_build_sign_completions();
             self.drain_submit_completions();
+            self.drain_reconciliation_updates();
         }
     }
 
@@ -220,20 +432,63 @@ impl BotDaemon {
             self.record_shredstream_metrics(&event);
         }
 
+        let additional_pending = self
+            .submit_dispatcher
+            .pending_count()
+            .saturating_add(self.build_sign_dispatcher.pending_count());
         match self
             .runtime
-            .prepare_event(event, self.submit_dispatcher.pending_count())
+            .prepare_event_for_dispatch(event, additional_pending)
         {
-            Ok(report) => {
-                if report.signed_envelope.is_some() {
-                    self.dispatch_submission(report);
-                } else {
-                    self.observer.publish_hot_path(report);
-                    self.refresh_status(None, None, None);
-                }
+            Ok(PreparedHotPath::Report(report)) => {
+                self.publish_hot_path_report(report);
+                self.refresh_status(None, None, None);
             }
+            Ok(PreparedHotPath::BuildSign(task)) => self.dispatch_build_sign(task),
             Err(error) => {
                 let detail = error.to_string();
+                self.refresh_status(
+                    Some(RuntimeMode::Degraded),
+                    Some(RuntimeIssue::RuntimeFailure {
+                        detail: detail.clone(),
+                    }),
+                    Some(detail),
+                );
+            }
+        }
+    }
+
+    fn dispatch_build_sign(&mut self, task: crate::runtime::PreparedExecution) {
+        match self.build_sign_dispatcher.try_enqueue(task) {
+            Ok(()) => self.refresh_status(None, None, None),
+            Err(BuildSignEnqueueError::Full(task)) => {
+                let congestion_issue = {
+                    let load = self.build_sign_dispatcher.load();
+                    RuntimeIssue::ExecutionPathCongested {
+                        pending: load.pending,
+                        capacity: load.capacity,
+                        workers: load.workers,
+                    }
+                };
+                let report = self
+                    .build_sign_dispatcher
+                    .queue_rejection(task, builder::BuildRejectionReason::ExecutionPathCongested);
+                self.runtime.observe_build_sign_report(&report);
+                self.publish_hot_path_report(report);
+                self.refresh_status(
+                    Some(RuntimeMode::Degraded),
+                    Some(congestion_issue),
+                    Some("build/sign path congested".into()),
+                );
+            }
+            Err(BuildSignEnqueueError::Disconnected(task)) => {
+                let detail = "build/sign dispatcher unavailable".to_string();
+                let report = self.build_sign_dispatcher.queue_rejection(
+                    task,
+                    builder::BuildRejectionReason::ExecutionPathUnavailable,
+                );
+                self.runtime.observe_build_sign_report(&report);
+                self.publish_hot_path_report(report);
                 self.refresh_status(
                     Some(RuntimeMode::Degraded),
                     Some(RuntimeIssue::RuntimeFailure {
@@ -266,7 +521,7 @@ impl BotDaemon {
                     Duration::ZERO,
                     SystemTime::now(),
                 );
-                self.observer.publish_hot_path(report);
+                self.publish_hot_path_report(report);
                 self.refresh_status(
                     Some(RuntimeMode::Degraded),
                     Some(congestion_issue),
@@ -283,7 +538,7 @@ impl BotDaemon {
                     Duration::ZERO,
                     SystemTime::now(),
                 );
-                self.observer.publish_hot_path(report);
+                self.publish_hot_path_report(report);
                 self.refresh_status(None, None, None);
             }
         }
@@ -306,9 +561,78 @@ impl BotDaemon {
                 completion.submit_duration,
                 completion.finished_at,
             );
-            self.observer.publish_hot_path(report);
+            self.publish_hot_path_report(report);
         }
         if drained {
+            self.refresh_status(None, None, None);
+        }
+    }
+
+    fn drain_build_sign_completions(&mut self) {
+        let mut drained = false;
+        let mut had_failure = false;
+        while let Some(completion) = self.build_sign_dispatcher.try_next_completion() {
+            drained = true;
+            self.runtime.observe_build_sign_report(&completion.report);
+            if let Some(error) = completion.signing_error {
+                had_failure = true;
+                let detail = error.to_string();
+                self.publish_hot_path_report(completion.report);
+                self.refresh_status(
+                    Some(RuntimeMode::Degraded),
+                    Some(RuntimeIssue::RuntimeFailure {
+                        detail: detail.clone(),
+                    }),
+                    Some(detail),
+                );
+                continue;
+            }
+            if completion.report.signed_envelope.is_some() {
+                self.dispatch_submission(completion.report);
+            } else {
+                self.publish_hot_path_report(completion.report);
+            }
+        }
+        if drained && !had_failure {
+            self.refresh_status(None, None, None);
+        }
+    }
+
+    fn flush_build_sign_dispatcher(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut had_failure = false;
+        while self.build_sign_dispatcher.pending_count() > 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let timeout = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let Some(completion) = self.build_sign_dispatcher.wait_for_completion(timeout) else {
+                continue;
+            };
+            self.runtime.observe_build_sign_report(&completion.report);
+            if let Some(error) = completion.signing_error {
+                had_failure = true;
+                let detail = error.to_string();
+                self.publish_hot_path_report(completion.report);
+                self.refresh_status(
+                    Some(RuntimeMode::Degraded),
+                    Some(RuntimeIssue::RuntimeFailure {
+                        detail: detail.clone(),
+                    }),
+                    Some(detail),
+                );
+                continue;
+            }
+            if completion.report.signed_envelope.is_some() {
+                self.dispatch_submission(completion.report);
+            } else {
+                self.publish_hot_path_report(completion.report);
+            }
+        }
+        if !had_failure {
             self.refresh_status(None, None, None);
         }
     }
@@ -339,7 +663,7 @@ impl BotDaemon {
                 completion.submit_duration,
                 completion.finished_at,
             );
-            self.observer.publish_hot_path(report);
+            self.publish_hot_path_report(report);
         }
         self.refresh_status(None, None, None);
     }
@@ -356,32 +680,82 @@ impl BotDaemon {
     }
 
     fn reconcile_if_due(&mut self) {
-        if !self.reconciliation_due() {
-            return;
-        }
-
-        self.reconcile_now();
+        let _ = self
+            .reconciliation_worker
+            .request_tick_if_due(self.runtime.latest_slot());
     }
 
-    fn reconcile_now(&mut self) {
-        let observed_slot = self.runtime.latest_slot();
-        let transitions = self.runtime.reconcile(observed_slot);
-        for transition in transitions {
-            if let Some(record) = self.runtime.execution_record(&transition.submission_id) {
+    fn drain_reconciliation_updates(&mut self) {
+        let mut drained = false;
+        loop {
+            let response = match self.reconciliation_worker.try_next_response() {
+                Ok(Some(response)) => response,
+                Ok(None) => break,
+                Err(()) => break,
+            };
+            drained = true;
+            self.handle_reconciliation_response(response);
+        }
+        if drained {
+            self.refresh_status(None, None, None);
+        }
+    }
+
+    fn handle_reconciliation_response(&mut self, response: ReconciliationResponse) {
+        match response {
+            ReconciliationResponse::Transition {
+                observed_slot,
+                transition,
+                record,
+            } => {
+                let record = self.runtime.apply_reconciliation_transition(
+                    observed_slot,
+                    &transition,
+                    record,
+                );
                 self.observer.publish_trade_update(record);
             }
+            ReconciliationResponse::TickFinished { duration } => {
+                self.runtime.record_reconcile_duration(duration);
+                self.reconciliation_worker.note_tick_finished();
+            }
         }
-        self.last_reconcile_at = Some(Instant::now());
     }
 
-    fn reconciliation_due(&self) -> bool {
-        if self.reconciliation_poll_interval == Duration::ZERO {
-            return true;
-        }
+    fn flush_reconciliation_worker(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        self.wait_for_reconciliation_idle(deadline);
+        let _ = self
+            .reconciliation_worker
+            .request_tick(self.runtime.latest_slot());
+        self.wait_for_reconciliation_idle(deadline);
+        self.drain_reconciliation_updates();
+        self.reconciliation_worker.shutdown();
+    }
 
-        match self.last_reconcile_at {
-            None => true,
-            Some(last) => last.elapsed() >= self.reconciliation_poll_interval,
+    fn wait_for_reconciliation_idle(&mut self, deadline: Instant) {
+        while self.reconciliation_worker.is_tick_in_flight() {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let timeout = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            let response = match self.reconciliation_worker.wait_for_response(timeout) {
+                Ok(Some(response)) => response,
+                Ok(None) => continue,
+                Err(()) => break,
+            };
+            self.handle_reconciliation_response(response);
+        }
+    }
+
+    fn publish_hot_path_report(&mut self, report: crate::runtime::HotPathReport) {
+        let execution_record = report.execution_record.clone();
+        self.observer.publish_hot_path(report);
+        if let Some(record) = execution_record.as_ref() {
+            let _ = self.reconciliation_worker.track_submission(record);
         }
     }
 
@@ -452,6 +826,7 @@ impl BotDaemon {
         let inflight_submissions = self
             .runtime
             .pending_submissions()
+            .saturating_add(self.build_sign_dispatcher.pending_count())
             .saturating_add(self.submit_dispatcher.pending_count());
         let blockhash_slot_lag = execution_state.blockhash_slot_lag();
         let derived_issue = issue_override.or_else(|| {
@@ -491,7 +866,9 @@ impl BotDaemon {
                         maximum: self.max_blockhash_slot_lag,
                     })
                 }
-                _ => self.submit_path_congestion_issue(),
+                _ => self
+                    .execution_path_congestion_issue()
+                    .or_else(|| self.submit_path_congestion_issue()),
             }
         });
         let ready = derived_issue.is_none();
@@ -502,6 +879,7 @@ impl BotDaemon {
                 derived_issue,
                 Some(
                     RuntimeIssue::KillSwitchActive
+                        | RuntimeIssue::ExecutionPathCongested { .. }
                         | RuntimeIssue::SubmitPathCongested { .. }
                         | RuntimeIssue::AsyncRefreshFailed { .. }
                         | RuntimeIssue::EventSourceFailure { .. }
@@ -555,6 +933,16 @@ impl BotDaemon {
                 capacity: load.capacity,
                 workers: load.workers,
             })
+    }
+
+    fn execution_path_congestion_issue(&self) -> Option<RuntimeIssue> {
+        self.build_sign_dispatcher.congestion_load().map(|load| {
+            RuntimeIssue::ExecutionPathCongested {
+                pending: load.pending,
+                capacity: load.capacity,
+                workers: load.workers,
+            }
+        })
     }
 
     fn refresh_failure_status(
@@ -706,10 +1094,10 @@ mod tests {
         let mut config = BotConfig::default();
         let keypair = Keypair::new_from_array([7; 32]);
         config.jito.endpoint = "mock://jito".into();
-        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.builder.compute_unit_limit = 1;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.signing.validate_execution_accounts = false;
         config.runtime.live_set_health.enabled = false;
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();

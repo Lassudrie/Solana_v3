@@ -1,5 +1,7 @@
 # Audit Bot - 2026-03-25
 
+Note 2026-03-27: ce document est un audit date, pas une spec vivante. Plusieurs constats ont deja evolue depuis, notamment la soumission live qui passe maintenant par un dispatcher async, et `source_latency` qui depend des sources au lieu d'etre uniformement nulle.
+
 Objectif: vérifier ce qui manque avant utilisation production.
 
 ## État réel du pipeline
@@ -58,8 +60,9 @@ Validation locale sur l'arbre courant:
 ## Manques importants
 
 4. Mesure de latence source incomplète
-- `source_latency` reste à zéro dans [shredstream.rs](../../crates/detection/src/shredstream.rs).
-- Le bot ne mesure pas encore proprement son avance informationnelle réelle.
+- `source_latency` reste absente dans [shredstream.rs](../../crates/detection/src/shredstream.rs).
+- la source gRPC live peut en revanche renseigner une vraie latence amont quand `created_at` est disponible.
+- Le bot ne mesure donc pas encore proprement son avance informationnelle réelle sur toutes les sources.
 
 5. Observabilité SLO incomplète
 - Le control plane expose des compteurs et des latences cumulées.

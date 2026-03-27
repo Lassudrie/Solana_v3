@@ -120,7 +120,10 @@ impl OnChainReconciler {
     ) -> Vec<ExecutionTransition> {
         let mut transitions = Vec::new();
         for record in tracker.pending_records() {
-            if observed_slot.saturating_sub(record.build_slot) > self.config.max_pending_slots {
+            let Some(reference_slot) = record.expiry_reference_slot() else {
+                continue;
+            };
+            if observed_slot.saturating_sub(reference_slot) > self.config.max_pending_slots {
                 if let Some(transition) = tracker.transition(
                     &record.submission_id,
                     InclusionStatus::Expired { observed_slot },
@@ -223,7 +226,7 @@ impl OnChainReconciler {
                             if let Some(transition) = tracker.transition(
                                 &record.submission_id,
                                 InclusionStatus::Landed {
-                                    slot: status.landed_slot.unwrap_or(record.build_slot),
+                                    slot: status.landed_slot.unwrap_or(record.slot_fallback()),
                                 },
                             ) {
                                 transitions.push(transition);
@@ -809,7 +812,7 @@ mod tests {
     };
     use domain::RouteId;
     use serde_json::json;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
     use submit::{SubmissionId, SubmitMode, SubmitResult, SubmitStatus};
     use tungstenite::Message;
 
@@ -820,6 +823,9 @@ mod tests {
             RouteId("route-a".into()),
             "chain-sig".into(),
             10,
+            Some(11),
+            Some(12),
+            UNIX_EPOCH,
             SubmitMode::SingleTransaction,
             SubmitResult {
                 status: SubmitStatus::Accepted,

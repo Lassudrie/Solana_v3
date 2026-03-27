@@ -1,19 +1,21 @@
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use builder::{BuildRequest, BuildResult, BuildStatus, DynamicBuildParameters, TransactionBuilder};
 use domain::{
-    AccountUpdateStatus, EventSourceKind, ExecutionSnapshot, LookupTableSnapshot, NormalizedEvent,
-    PoolSnapshot, StateApplyOutcome,
+    AccountUpdateStatus, EventSourceKind, ExecutionSnapshot, LookupTableSnapshot, MarketEvent,
+    NormalizedEvent, PoolSnapshot, StateApplyOutcome,
 };
 use reconciliation::{
     ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, FailureClass,
-    OnChainReconciler,
 };
 use signing::{HotWallet, SignedTransactionEnvelope, Signer, SigningError, SigningRequest};
 use state::{StateError, StatePlane};
 use strategy::{StrategyPlane, opportunity::SelectionOutcome};
 use submit::{SubmitError, SubmitMode, SubmitRequest, SubmitResult, Submitter};
-use telemetry::{LogLevel, PipelineStage, TelemetryStack};
+use telemetry::{PipelineStage, TelemetryStack};
 use thiserror::Error;
 
 use crate::execution_context::ExecutionContext;
@@ -29,11 +31,16 @@ pub struct HotPathReport {
     pub signed_envelope: Option<SignedTransactionEnvelope>,
     pub submit_result: Option<SubmitResult>,
     pub execution_record: Option<ExecutionRecord>,
+    pub submit_leader: Option<String>,
     pub pipeline_trace: PipelineTrace,
 }
 
 impl HotPathReport {
-    fn empty(state_outcome: Option<StateApplyOutcome>, pipeline_trace: PipelineTrace) -> Self {
+    fn empty(
+        state_outcome: Option<StateApplyOutcome>,
+        submit_leader: Option<String>,
+        pipeline_trace: PipelineTrace,
+    ) -> Self {
         Self {
             state_outcome,
             pool_snapshots: Vec::new(),
@@ -45,6 +52,7 @@ impl HotPathReport {
             signed_envelope: None,
             submit_result: None,
             execution_record: None,
+            submit_leader,
             pipeline_trace,
         }
     }
@@ -104,14 +112,33 @@ pub enum RuntimeError {
     Submit(#[from] SubmitError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedExecution {
+    pub report: HotPathReport,
+    pub build_request: BuildRequest,
+    pub wallet: HotWallet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PreparedHotPath {
+    Report(HotPathReport),
+    BuildSign(PreparedExecution),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BuildSignCompletion {
+    pub report: HotPathReport,
+    pub signing_error: Option<SigningError>,
+}
+
 pub struct HotPathPipeline {
     state: StatePlane,
     execution: ExecutionContext,
     strategy: StrategyPlane,
     builder: builder::AtomicArbTransactionBuilder,
     wallet: HotWallet,
-    signer: Box<dyn Signer>,
-    submitter: Box<dyn Submitter>,
+    signer: Arc<dyn Signer>,
+    submitter: Arc<dyn Submitter>,
 }
 
 impl HotPathPipeline {
@@ -120,8 +147,8 @@ impl HotPathPipeline {
         strategy: StrategyPlane,
         builder: builder::AtomicArbTransactionBuilder,
         wallet: HotWallet,
-        signer: Box<dyn Signer>,
-        submitter: Box<dyn Submitter>,
+        signer: Arc<dyn Signer>,
+        submitter: Arc<dyn Submitter>,
     ) -> Self {
         Self {
             state,
@@ -131,6 +158,59 @@ impl HotPathPipeline {
             wallet,
             signer,
             submitter,
+        }
+    }
+
+    fn build_sign_pipeline(&self) -> BuildSignPipeline {
+        BuildSignPipeline {
+            builder: self.builder.clone(),
+            signer: Arc::clone(&self.signer),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct BuildSignPipeline {
+    builder: builder::AtomicArbTransactionBuilder,
+    signer: Arc<dyn Signer>,
+}
+
+impl BuildSignPipeline {
+    pub(crate) fn execute(&self, mut prepared: PreparedExecution) -> BuildSignCompletion {
+        let build_started = Instant::now();
+        let build_result = self.builder.build(prepared.build_request);
+        prepared.report.pipeline_trace.build_duration = Some(build_started.elapsed());
+        prepared.report.build_result = Some(build_result.clone());
+        if build_result.status != BuildStatus::Built {
+            return BuildSignCompletion {
+                report: prepared.report,
+                signing_error: None,
+            };
+        }
+
+        let unsigned_envelope = build_result.envelope.expect("built envelope");
+        let sign_started = Instant::now();
+        match self.signer.sign(
+            &prepared.wallet,
+            SigningRequest {
+                envelope: unsigned_envelope,
+            },
+        ) {
+            Ok(signed_envelope) => {
+                prepared.report.pipeline_trace.sign_duration = Some(sign_started.elapsed());
+                prepared.report.signed_envelope = Some(signed_envelope);
+                BuildSignCompletion {
+                    report: prepared.report,
+                    signing_error: None,
+                }
+            }
+            Err(error) => {
+                prepared.report.pipeline_trace.sign_duration = Some(sign_started.elapsed());
+                BuildSignCompletion {
+                    report: prepared.report,
+                    signing_error: Some(error),
+                }
+            }
         }
     }
 }
@@ -204,7 +284,6 @@ pub struct BotRuntime {
     hot_path: HotPathPipeline,
     cold_path: ColdPathServices,
     tracker: ExecutionTracker,
-    reconciler: OnChainReconciler,
     telemetry: TelemetryStack,
     submit_mode: SubmitMode,
     compute_unit_limit: u32,
@@ -227,7 +306,6 @@ impl BotRuntime {
             hot_path,
             cold_path,
             tracker: ExecutionTracker::default(),
-            reconciler: OnChainReconciler::default(),
             telemetry: TelemetryStack::default(),
             submit_mode,
             compute_unit_limit,
@@ -235,10 +313,6 @@ impl BotRuntime {
             jito_tip_lamports,
             route_health,
         }
-    }
-
-    pub fn set_reconciler(&mut self, reconciler: OnChainReconciler) {
-        self.reconciler = reconciler;
     }
 
     pub fn apply_cold_path_seed(&mut self) {
@@ -285,6 +359,10 @@ impl BotRuntime {
         &self.telemetry
     }
 
+    pub(crate) fn build_sign_pipeline(&self) -> BuildSignPipeline {
+        self.hot_path.build_sign_pipeline()
+    }
+
     pub fn execution_state(&self) -> ExecutionSnapshot {
         self.hot_path
             .execution
@@ -328,70 +406,82 @@ impl BotRuntime {
             })
     }
 
-    pub fn execution_record(
-        &self,
-        submission_id: &submit::SubmissionId,
-    ) -> Option<ExecutionRecord> {
-        self.tracker.get(submission_id).cloned()
+    pub fn record_reconcile_duration(&self, duration: Duration) {
+        self.telemetry
+            .record_stage(PipelineStage::Reconcile, duration);
     }
 
-    pub fn reconcile(&mut self, observed_slot: u64) -> Vec<ExecutionTransition> {
-        let reconcile_started = Instant::now();
-        let transitions = self.reconciler.tick(&mut self.tracker, observed_slot);
-        self.telemetry
-            .record_stage(PipelineStage::Reconcile, reconcile_started.elapsed());
-        let mut route_health = self.route_health.lock().ok();
-        for transition in &transitions {
-            if let Some(record) = self.tracker.get(&transition.submission_id) {
-                match &transition.current_outcome {
-                    ExecutionOutcome::Included { .. } => self
-                        .hot_path
-                        .strategy
-                        .record_execution_success(&record.route_id),
-                    ExecutionOutcome::Failed(FailureClass::ChainExecutionTooLittleOutput) => self
-                        .hot_path
-                        .strategy
-                        .record_execution_too_little_output(&record.route_id),
-                    _ => {}
-                }
-                if let Some(route_health) = route_health.as_mut() {
-                    match &transition.current_outcome {
-                        ExecutionOutcome::Included { .. } => {
-                            route_health.on_execution_success(&record.route_id, observed_slot);
-                        }
-                        ExecutionOutcome::Failed(class) => {
-                            route_health.on_execution_failure(
-                                &record.route_id,
-                                class,
-                                observed_slot,
-                            );
-                        }
-                        ExecutionOutcome::Pending => {}
-                    }
-                }
-            }
-            self.record_transition_metrics(transition);
+    pub(crate) fn observe_build_sign_report(&self, report: &HotPathReport) {
+        if let Some(build_duration) = report.pipeline_trace.build_duration {
+            self.telemetry
+                .record_stage(PipelineStage::Build, build_duration);
         }
-        transitions
+        if let Some(sign_duration) = report.pipeline_trace.sign_duration {
+            self.telemetry
+                .record_stage(PipelineStage::Sign, sign_duration);
+        }
+        match report.build_result.as_ref().map(|result| result.status) {
+            Some(BuildStatus::Built) => self.telemetry.metrics.increment_build(),
+            Some(BuildStatus::Rejected) => self.telemetry.metrics.increment_rejection(),
+            None => {}
+        }
+    }
+
+    pub fn apply_reconciliation_transition(
+        &mut self,
+        observed_slot: u64,
+        transition: &ExecutionTransition,
+        record: ExecutionRecord,
+    ) -> ExecutionRecord {
+        self.tracker.upsert_record(record.clone());
+        let mut route_health = self.route_health.lock().ok();
+        match &transition.current_outcome {
+            ExecutionOutcome::Included { .. } => self
+                .hot_path
+                .strategy
+                .record_execution_success(&record.route_id),
+            ExecutionOutcome::Failed(FailureClass::ChainExecutionTooLittleOutput) => self
+                .hot_path
+                .strategy
+                .record_execution_too_little_output(&record.route_id),
+            _ => {}
+        }
+        if let Some(route_health) = route_health.as_mut() {
+            match &transition.current_outcome {
+                ExecutionOutcome::Included { .. } => {
+                    route_health.on_execution_success(&record.route_id, observed_slot);
+                }
+                ExecutionOutcome::Failed(class) => {
+                    route_health.on_execution_failure(&record.route_id, class, observed_slot);
+                }
+                ExecutionOutcome::Pending => {}
+            }
+        }
+        self.record_transition_metrics(transition);
+        record
     }
 
     pub fn apply_kill_switch(&mut self, enabled: bool) {
         self.hot_path.execution.set_kill_switch(enabled);
     }
 
-    pub fn prepare_event(
+    pub(crate) fn prepare_event_for_dispatch(
         &mut self,
         event: NormalizedEvent,
         additional_pending_submissions: usize,
-    ) -> Result<HotPathReport, RuntimeError> {
+    ) -> Result<PreparedHotPath, RuntimeError> {
         let mut pipeline_trace = PipelineTrace::from_event(&event);
         let process_started_at = SystemTime::now();
         pipeline_trace.queue_wait_duration = process_started_at
             .duration_since(event.latency.normalized_at)
             .unwrap_or(Duration::ZERO);
         self.telemetry.metrics.increment_detect();
-        self.telemetry
-            .log(LogLevel::Debug, "runtime", "event received");
+        if let MarketEvent::SlotBoundary(slot_boundary) = &event.payload {
+            self.hot_path
+                .execution
+                .set_current_leader(slot_boundary.leader.clone());
+        }
+        let submit_leader = self.hot_path.execution.current_leader();
 
         let state_started = Instant::now();
         let state_outcome = self.hot_path.state.apply_event(&event)?;
@@ -403,10 +493,18 @@ impl BotRuntime {
         if let Some(outcome) = &state_outcome {
             if outcome.update_status == AccountUpdateStatus::StaleRejected {
                 self.telemetry.metrics.increment_stale();
-                return Ok(HotPathReport::empty(state_outcome, pipeline_trace));
+                return Ok(PreparedHotPath::Report(HotPathReport::empty(
+                    state_outcome,
+                    submit_leader,
+                    pipeline_trace,
+                )));
             }
         } else {
-            return Ok(HotPathReport::empty(None, pipeline_trace));
+            return Ok(PreparedHotPath::Report(HotPathReport::empty(
+                None,
+                submit_leader,
+                pipeline_trace,
+            )));
         }
 
         let state_outcome = state_outcome.expect("checked above");
@@ -426,7 +524,7 @@ impl BotRuntime {
             }
         }
         if state_outcome.impacted_routes.is_empty() {
-            return Ok(HotPathReport {
+            return Ok(PreparedHotPath::Report(HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
                 selection: SelectionOutcome {
@@ -437,8 +535,9 @@ impl BotRuntime {
                 signed_envelope: None,
                 submit_result: None,
                 execution_record: None,
+                submit_leader,
                 pipeline_trace,
-            });
+            }));
         }
 
         let impacted_routes = self
@@ -454,7 +553,7 @@ impl BotRuntime {
             .unwrap_or_else(|| state_outcome.impacted_routes.clone());
         if impacted_routes.is_empty() {
             self.telemetry.metrics.increment_rejection();
-            return Ok(HotPathReport {
+            return Ok(PreparedHotPath::Report(HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
                 selection: SelectionOutcome {
@@ -465,8 +564,9 @@ impl BotRuntime {
                 signed_envelope: None,
                 submit_result: None,
                 execution_record: None,
+                submit_leader,
                 pipeline_trace,
-            });
+            }));
         }
 
         let strategy_started = Instant::now();
@@ -488,7 +588,7 @@ impl BotRuntime {
             .record_stage(PipelineStage::Select, select_duration);
         if selection.best_candidate.is_none() {
             self.telemetry.metrics.increment_rejection();
-            return Ok(HotPathReport {
+            return Ok(PreparedHotPath::Report(HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
                 selection,
@@ -496,16 +596,16 @@ impl BotRuntime {
                 signed_envelope: None,
                 submit_result: None,
                 execution_record: None,
+                submit_leader,
                 pipeline_trace,
-            });
+            }));
         }
 
         let candidate = selection
             .best_candidate
             .clone()
             .expect("candidate available");
-        let build_started = Instant::now();
-        let build_result = self.hot_path.builder.build(BuildRequest {
+        let build_request = BuildRequest {
             candidate,
             dynamic: DynamicBuildParameters {
                 recent_blockhash: execution_state.latest_blockhash.unwrap_or_default(),
@@ -517,49 +617,40 @@ impl BotRuntime {
                 jito_tip_lamports: self.jito_tip_lamports,
                 resolved_lookup_tables: execution_state.lookup_tables.clone(),
             },
-        });
-        let build_duration = build_started.elapsed();
-        pipeline_trace.build_duration = Some(build_duration);
-        self.telemetry
-            .record_stage(PipelineStage::Build, build_duration);
-        if build_result.status != BuildStatus::Built {
-            self.telemetry.metrics.increment_rejection();
-            return Ok(HotPathReport {
+        };
+        Ok(PreparedHotPath::BuildSign(PreparedExecution {
+            report: HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
                 selection,
-                build_result: Some(build_result),
+                build_result: None,
                 signed_envelope: None,
                 submit_result: None,
                 execution_record: None,
+                submit_leader,
                 pipeline_trace,
-            });
-        }
-
-        self.telemetry.metrics.increment_build();
-        let unsigned_envelope = build_result.envelope.clone().expect("built envelope");
-        let sign_started = Instant::now();
-        let signed_envelope = self.hot_path.signer.sign(
-            &self.hot_path.wallet,
-            SigningRequest {
-                envelope: unsigned_envelope,
             },
-        )?;
-        let sign_duration = sign_started.elapsed();
-        pipeline_trace.sign_duration = Some(sign_duration);
-        self.telemetry
-            .record_stage(PipelineStage::Sign, sign_duration);
+            build_request,
+            wallet: self.hot_path.wallet.clone(),
+        }))
+    }
 
-        Ok(HotPathReport {
-            state_outcome: Some(state_outcome),
-            pool_snapshots,
-            selection,
-            build_result: Some(build_result),
-            signed_envelope: Some(signed_envelope),
-            submit_result: None,
-            execution_record: None,
-            pipeline_trace,
-        })
+    pub fn prepare_event(
+        &mut self,
+        event: NormalizedEvent,
+        additional_pending_submissions: usize,
+    ) -> Result<HotPathReport, RuntimeError> {
+        match self.prepare_event_for_dispatch(event, additional_pending_submissions)? {
+            PreparedHotPath::Report(report) => Ok(report),
+            PreparedHotPath::BuildSign(prepared) => {
+                let completion = self.hot_path.build_sign_pipeline().execute(prepared);
+                self.observe_build_sign_report(&completion.report);
+                if let Some(error) = completion.signing_error {
+                    return Err(RuntimeError::Signing(error));
+                }
+                Ok(completion.report)
+            }
+        }
     }
 
     pub fn finalize_submission(
@@ -581,10 +672,18 @@ impl BotRuntime {
             .signed_envelope
             .clone()
             .expect("submission finalization requires a signed envelope");
+        let submitted_slot = Some(
+            self.latest_slot()
+                .max(signed_envelope.blockhash_slot.unwrap_or(0)),
+        )
+        .filter(|slot| *slot > 0);
         let execution_record = self.tracker.register_submission(
             signed_envelope.route_id.clone(),
             signed_envelope.signature.clone(),
-            signed_envelope.build_slot,
+            signed_envelope.quoted_slot,
+            signed_envelope.blockhash_slot,
+            submitted_slot,
+            submitted_at,
             self.submit_mode,
             submit_result.clone(),
         );
@@ -593,7 +692,7 @@ impl BotRuntime {
                 route_health.on_execution_failure(
                     &execution_record.route_id,
                     class,
-                    execution_record.build_slot,
+                    execution_record.slot_fallback(),
                 );
             }
         }
@@ -613,6 +712,7 @@ impl BotRuntime {
         let submit_result = self.hot_path.submitter.submit(SubmitRequest {
             envelope: signed_envelope,
             mode: self.submit_mode,
+            leader: report.submit_leader.clone(),
         })?;
         Ok(self.finalize_submission(
             report,
@@ -655,6 +755,9 @@ mod tests {
     use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate, SnapshotConfidence};
     use domain::PoolVenue;
     use signerd::{SecureSignerService, SecureSignerServiceConfig};
+    use signing::{
+        HotWallet, SignedTransactionEnvelope, Signer as WalletSigner, SigningError, SigningRequest,
+    };
     use solana_sdk::{
         hash::hashv,
         pubkey::Pubkey,
@@ -666,11 +769,14 @@ mod tests {
     use std::{
         env, fs,
         path::PathBuf,
-        process, thread,
+        process,
+        sync::Arc,
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
     use submit::SubmitStatus;
 
+    use super::PreparedHotPath;
     use crate::{
         bootstrap::bootstrap,
         config::{
@@ -726,6 +832,29 @@ mod tests {
             default_jito_tip_lamports: 5_000,
             max_quote_slot_lag: 4,
             max_alt_slot_lag: 4,
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicSigner {
+        pubkey: String,
+    }
+
+    impl WalletSigner for PanicSigner {
+        fn pubkey_string(&self) -> Result<String, SigningError> {
+            Ok(self.pubkey.clone())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn sign(
+            &self,
+            _wallet: &HotWallet,
+            _request: SigningRequest,
+        ) -> Result<SignedTransactionEnvelope, SigningError> {
+            panic!("prepare_event_for_dispatch must not call sign()");
         }
     }
 
@@ -821,7 +950,6 @@ mod tests {
         config.builder.jito_tip_lamports = 1;
         config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
-        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
         let (owner_pubkey, keypair_base58) = test_signing_material();
@@ -842,6 +970,44 @@ mod tests {
     }
 
     #[test]
+    fn prepare_event_for_dispatch_does_not_invoke_signer_inline() {
+        let mut config = BotConfig::default();
+        config.routes = RoutesConfig {
+            definitions: vec![route_config()],
+        };
+        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
+        config.runtime.live_set_health.enabled = false;
+        config.jito.endpoint = "mock://jito".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        let (owner_pubkey, keypair_base58) = test_signing_material();
+        config.signing.owner_pubkey = owner_pubkey.clone();
+        config.signing.keypair_base58 = Some(keypair_base58);
+        let mut runtime = bootstrap(config).unwrap();
+        runtime.hot_path.signer = Arc::new(PanicSigner {
+            pubkey: owner_pubkey,
+        });
+
+        let first = snapshot_event(1, "pool-a");
+        let second = snapshot_event(2, "pool-b");
+
+        let first_report = runtime.prepare_event_for_dispatch(first, 0).unwrap();
+        assert!(matches!(first_report, PreparedHotPath::Report(_)));
+
+        let prepared = runtime.prepare_event_for_dispatch(second, 0).unwrap();
+        match prepared {
+            PreparedHotPath::BuildSign(task) => {
+                assert!(task.report.signed_envelope.is_none());
+                assert!(task.report.build_result.is_none());
+                assert!(task.report.selection.best_candidate.is_some());
+            }
+            other => panic!("expected build/sign handoff, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn secure_unix_pipeline_wiring_reaches_submit() {
         let mut config = BotConfig::default();
         config.routes = RoutesConfig {
@@ -852,7 +1018,6 @@ mod tests {
         config.builder.jito_tip_lamports = 1;
         config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
-        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
         config.signing.provider = SigningProviderKind::SecureUnix;

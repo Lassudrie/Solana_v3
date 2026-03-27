@@ -22,6 +22,7 @@ pub struct SignedTransactionEnvelope {
     pub signature: String,
     pub signer_id: String,
     pub signed_message: Vec<u8>,
-    pub build_slot: u64,
+    pub quoted_slot: u64,
+    pub blockhash_slot: Option<u64>,
     pub signed_at: SystemTime,
 }

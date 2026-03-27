@@ -34,6 +34,31 @@ impl RpcError {
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Self::RateLimited { .. })
     }
+
+    pub fn is_min_context_slot_not_reached(&self) -> bool {
+        matches!(
+            self,
+            Self::JsonRpc {
+                code: -32603 | -32016,
+                message,
+                ..
+            } if message.contains("Min context slot not reached")
+                || message.contains("Minimum context slot has not been reached")
+        )
+    }
+
+    pub fn is_transient(&self) -> bool {
+        self.is_rate_limited()
+            || self.is_min_context_slot_not_reached()
+            || matches!(
+                self,
+                Self::RequestFailed { .. }
+                    | Self::HttpStatus {
+                        status: 500..=599,
+                        ..
+                    }
+            )
+    }
 }
 
 pub fn rpc_call<T: DeserializeOwned>(
@@ -110,22 +135,27 @@ impl RpcRateLimitBackoff {
         self.consecutive_rate_limits = 0;
     }
 
+    pub fn on_rate_limited(&mut self) -> Duration {
+        self.consecutive_rate_limits = self.consecutive_rate_limits.saturating_add(1);
+        jittered_delay(base_rate_limit_delay(self.consecutive_rate_limits))
+    }
+
     pub fn on_error(&mut self, error: &RpcError) -> Duration {
         if !error.is_rate_limited() {
             return Duration::ZERO;
         }
-        self.consecutive_rate_limits = self.consecutive_rate_limits.saturating_add(1);
-        jittered_delay(base_rate_limit_delay(self.consecutive_rate_limits))
+        self.on_rate_limited()
     }
 }
 
 fn base_rate_limit_delay(attempt: u32) -> Duration {
     match attempt {
-        0 | 1 => Duration::from_millis(250),
-        2 => Duration::from_millis(500),
-        3 => Duration::from_secs(1),
-        4 => Duration::from_secs(2),
-        _ => Duration::from_secs(5),
+        0 | 1 => Duration::from_secs(1),
+        2 => Duration::from_secs(2),
+        3 => Duration::from_secs(5),
+        4 => Duration::from_secs(10),
+        5 => Duration::from_secs(20),
+        _ => Duration::from_secs(30),
     }
 }
 
@@ -194,5 +224,24 @@ mod tests {
         .expect("json-rpc error envelope");
         assert!(parsed.result.is_none());
         assert_eq!(parsed.error.expect("error").code, -32429);
+    }
+
+    #[test]
+    fn minimum_context_slot_errors_are_transient() {
+        let legacy = RpcError::JsonRpc {
+            method: "getMultipleAccounts".into(),
+            code: -32603,
+            message: "Min context slot not reached".into(),
+        };
+        assert!(legacy.is_min_context_slot_not_reached());
+        assert!(legacy.is_transient());
+
+        let modern = RpcError::JsonRpc {
+            method: "getMultipleAccounts".into(),
+            code: -32016,
+            message: "Minimum context slot has not been reached".into(),
+        };
+        assert!(modern.is_min_context_slot_not_reached());
+        assert!(modern.is_transient());
     }
 }

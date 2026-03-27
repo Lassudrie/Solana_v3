@@ -206,6 +206,7 @@ enum WireEvent {
         observed_slot: Option<u64>,
         pool_id: String,
         slot: u64,
+        write_version: u64,
     },
     SlotBoundary {
         source: Option<WireSourceKind>,
@@ -339,12 +340,17 @@ fn parse_wire_event(
             observed_slot,
             pool_id,
             slot,
+            write_version,
         } => Ok(normalized_event(
             source,
             sequence,
             observed_slot.unwrap_or(slot),
             default_kind,
-            MarketEvent::PoolInvalidation(PoolInvalidation { pool_id }),
+            MarketEvent::PoolInvalidation(PoolInvalidation {
+                pool_id,
+                slot,
+                write_version,
+            }),
             next_sequence,
         )),
         WireEvent::SlotBoundary {
@@ -474,6 +480,31 @@ mod tests {
                 assert_eq!(update.venue, PoolVenue::OrcaWhirlpool);
             }
             other => panic!("expected pool snapshot update, got {other:?}"),
+        }
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn jsonl_source_reads_versioned_pool_invalidations() {
+        let path = temp_file_path("detection-jsonl-invalidation-source");
+        fs::write(
+            &path,
+            "{\"type\":\"pool_invalidation\",\"source\":\"shredstream\",\"sequence\":10,\"observed_slot\":44,\"pool_id\":\"pool-a\",\"slot\":44,\"write_version\":7}\n",
+        )
+        .unwrap();
+
+        let mut source = JsonlFileEventSource::open(&path).unwrap();
+        let event = source.poll_next().unwrap().expect("event");
+
+        assert_eq!(event.source.sequence, 10);
+        match event.payload {
+            MarketEvent::PoolInvalidation(invalidation) => {
+                assert_eq!(invalidation.pool_id, "pool-a");
+                assert_eq!(invalidation.slot, 44);
+                assert_eq!(invalidation.write_version, 7);
+            }
+            other => panic!("expected pool invalidation, got {other:?}"),
         }
 
         let _ = fs::remove_file(path);

@@ -30,9 +30,7 @@ pub struct DirectionalConcentratedQuoteModel {
 
 impl DirectionalConcentratedQuoteModel {
     pub fn is_executable(&self) -> bool {
-        self.complete
-            && self.loaded_tick_arrays >= self.expected_tick_arrays
-            && !self.windows.is_empty()
+        self.loaded_tick_arrays > 0 && !self.windows.is_empty()
     }
 }
 

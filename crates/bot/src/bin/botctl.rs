@@ -773,7 +773,7 @@ fn print_trade_table(items: Vec<MonitorTradeEvent>) {
             "src_submit_ns",
             "src_term_ns",
             "tip",
-            "slot",
+            "submit_slot",
             "submission_id",
         ],
         items.into_iter().map(|item| {
@@ -799,7 +799,7 @@ fn print_trade_table(items: Vec<MonitorTradeEvent>) {
                 item.jito_tip_lamports
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".into()),
-                item.build_slot.to_string(),
+                display_optional_u64(item.submitted_slot),
                 item.submission_id,
             ]
         }),
@@ -1298,7 +1298,7 @@ fn render_trades_body(frame: &mut Frame, area: Rect, app: &App) {
             item.jito_tip_lamports
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
-            item.build_slot.to_string(),
+            display_optional_u64(item.submitted_slot),
             item.submission_id.clone(),
         ])
     });
@@ -1727,8 +1727,10 @@ mod tests {
                     failure_custom_code: None,
                     failure_error_name: None,
                     endpoint: "jito".into(),
-                    build_slot: 10,
-                    created_at_unix_millis: 0,
+                    quoted_slot: 10,
+                    blockhash_slot: Some(11),
+                    submitted_slot: Some(12),
+                    submitted_at_unix_millis: 0,
                     updated_at_unix_millis: 0,
                     source_to_submit_nanos: Some(1),
                     submit_to_terminal_nanos: None,

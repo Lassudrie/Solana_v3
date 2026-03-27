@@ -1,39 +1,53 @@
+use base64::Engine;
 use builder::{
     AtomicArbTransactionBuilder, ExecutionRegistry, LookupTableUsageConfig, MessageMode,
     OrcaSimplePoolConfig, OrcaWhirlpoolConfig, RaydiumClmmConfig, RaydiumSimplePoolConfig,
     RouteExecutionConfig as BuilderRouteExecutionConfig, VenueExecutionConfig,
 };
-use reconciliation::{OnChainReconciler, OnChainReconciliationConfig};
+use reqwest::blocking::Client;
+use serde::Deserialize;
+use serde_json::json;
 use signing::{Signer, SigningError};
+use solana_sdk::pubkey::Pubkey;
 use state::{
     StatePlane,
     decoder::{OrcaWhirlpoolAccountDecoder, PoolPriceAccountDecoder, RaydiumClmmPoolDecoder},
     types::{AccountKey, PoolId, RouteId},
 };
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    str::FromStr,
+    sync::Arc,
+    time::Duration,
+};
 use strategy::{
     StrategyPlane,
     guards::GuardrailConfig,
     route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
 };
-use submit::{JitoConfig, JitoSubmitter, SubmitMode};
 use thiserror::Error;
 
 use crate::{
     config::{
         BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteLegExecutionConfig,
-        RuntimeProfileConfig, SigningConfig, SigningProviderKind, SubmitModeConfig, SwapSideConfig,
+        RuntimeProfileConfig, SigningConfig, SigningProviderKind, SwapSideConfig,
     },
     route_health::SharedRouteHealth,
+    rpc::rpc_call,
     runtime::{
         AltCacheService, BlockhashService, BotRuntime, ColdPathServices, HotPathPipeline,
         WalletRefreshService, WarmupCoordinator,
     },
+    submit_factory::{build_submitter, submit_mode_from_config},
 };
 
 const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const MOCK_SCHEME: &str = "mock://";
+const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
+const SPL_TOKEN_ACCOUNT_STATE_OFFSET: usize = 108;
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
@@ -43,12 +57,40 @@ pub enum BootstrapError {
     InvalidConfig { detail: String },
     #[error("invalid route config for {route_id}: {detail}")]
     InvalidRouteConfig { route_id: String, detail: String },
+    #[error("execution environment is not ready: {detail}")]
+    ExecutionEnvironment { detail: String },
 }
 
 struct ResolvedSigner {
     owner_pubkey: String,
     signer_available: bool,
-    signer: Box<dyn Signer>,
+    signer: Arc<dyn Signer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredTokenAccount {
+    address: String,
+    token_program_id: String,
+    wallet_owner: String,
+    expected_mint: Option<String>,
+    sources: BTreeSet<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcMultipleAccountsResponse {
+    value: Vec<Option<RpcAccountInfo>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcAccountInfo {
+    owner: String,
+    data: (String, String),
+}
+
+#[derive(Debug)]
+struct ParsedTokenAccount {
+    mint: String,
+    owner: String,
 }
 
 pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
@@ -99,6 +141,8 @@ pub fn bootstrap_with_health(
     for route in &active_routes {
         validate_runtime_route_config(route)?;
     }
+    let resolved_signer = resolve_signer(&config.signing)?;
+    validate_execution_environment(&config, &active_routes, &resolved_signer.owner_pubkey)?;
     let tracked_pool_pairs = build_tracked_pool_pairs(&active_routes);
 
     let mut execution_registry = ExecutionRegistry::default();
@@ -120,7 +164,8 @@ pub fn bootstrap_with_health(
         if let Ok(mut health) = route_health.lock() {
             health.register_route(route_id.clone(), &pool_ids);
         }
-        state.register_route(route_id.clone(), pool_ids);
+        let max_quote_slot_lag = effective_max_quote_slot_lag(route);
+        state.register_route_with_execution_lag(route_id.clone(), pool_ids, max_quote_slot_lag);
         for dependency in &route.account_dependencies {
             state.register_account_dependency(
                 AccountKey(dependency.account_key.clone()),
@@ -149,7 +194,7 @@ pub fn bootstrap_with_health(
                     fee_bps: route.legs[1].fee_bps,
                 },
             ],
-            max_quote_slot_lag: effective_max_quote_slot_lag(route),
+            max_quote_slot_lag,
             min_trade_size,
             default_trade_size: route.default_trade_size,
             max_trade_size: route.max_trade_size,
@@ -179,7 +224,7 @@ pub fn bootstrap_with_health(
                 .execution
                 .default_compute_unit_price_micro_lamports,
             default_jito_tip_lamports: route.execution.default_jito_tip_lamports,
-            max_quote_slot_lag: effective_max_quote_slot_lag(route),
+            max_quote_slot_lag,
             max_alt_slot_lag: route.execution.max_alt_slot_lag,
             legs: [
                 map_leg_execution(&route.legs[0].execution),
@@ -188,11 +233,7 @@ pub fn bootstrap_with_health(
         });
     }
 
-    let submit_mode = match config.submit.mode {
-        SubmitModeConfig::SingleTransaction => SubmitMode::SingleTransaction,
-        SubmitModeConfig::Bundle => SubmitMode::Bundle,
-    };
-    let resolved_signer = resolve_signer(&config.signing)?;
+    let submit_mode = submit_mode_from_config(&config);
     let cold_path = ColdPathServices {
         warmup: WarmupCoordinator::default(),
         blockhash: BlockhashService {
@@ -228,17 +269,7 @@ pub fn bootstrap_with_health(
                 status: wallet_status,
             },
             resolved_signer.signer,
-            Box::new(JitoSubmitter::new(JitoConfig {
-                endpoint: config.jito.endpoint.clone(),
-                ws_endpoint: config.jito.ws_endpoint.clone(),
-                auth_token: config.jito.auth_token.clone(),
-                bundle_enabled: config.jito.bundle_enabled,
-                connect_timeout_ms: config.jito.connect_timeout_ms,
-                request_timeout_ms: config.jito.request_timeout_ms,
-                retry_attempts: config.jito.retry_attempts,
-                retry_backoff_ms: config.jito.retry_backoff_ms,
-                idempotency_cache_size: config.jito.idempotency_cache_size,
-            })),
+            build_submitter(&config),
         ),
         cold_path,
         submit_mode,
@@ -247,15 +278,6 @@ pub fn bootstrap_with_health(
         config.builder.jito_tip_lamports,
         route_health,
     );
-    runtime.set_reconciler(OnChainReconciler::new(OnChainReconciliationConfig {
-        enabled: config.reconciliation.enabled,
-        rpc_http_endpoint: config.reconciliation.rpc_http_endpoint.clone(),
-        rpc_ws_endpoint: config.reconciliation.rpc_ws_endpoint.clone(),
-        websocket_enabled: config.reconciliation.websocket_enabled,
-        websocket_timeout_ms: config.reconciliation.websocket_timeout_ms,
-        search_transaction_history: config.reconciliation.search_transaction_history,
-        max_pending_slots: config.reconciliation.max_pending_slots,
-    }));
     runtime.apply_cold_path_seed();
     Ok(runtime)
 }
@@ -389,6 +411,417 @@ fn route_requires_explicit_sol_quote_conversion(route: &crate::config::RouteConf
         && route.input_mint == route.output_mint
         && route.input_mint == quote_mint
         && quote_mint != SOL_MINT
+}
+
+fn validate_execution_environment(
+    config: &BotConfig,
+    routes: &[&crate::config::RouteConfig],
+    wallet_owner: &str,
+) -> Result<(), BootstrapError> {
+    if !config.signing.validate_execution_accounts || routes.is_empty() {
+        return Ok(());
+    }
+
+    let endpoint = config.reconciliation.rpc_http_endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(BootstrapError::InvalidConfig {
+            detail: "signing.validate_execution_accounts requires reconciliation.rpc_http_endpoint"
+                .into(),
+        });
+    }
+    if endpoint.starts_with(MOCK_SCHEME) {
+        return Ok(());
+    }
+
+    let requirements = collect_required_token_accounts(routes, wallet_owner)?;
+    if requirements.is_empty() {
+        return Ok(());
+    }
+
+    let account_keys = requirements
+        .iter()
+        .map(|requirement| requirement.address.clone())
+        .collect::<Vec<_>>();
+    let accounts = fetch_accounts(endpoint, &account_keys).map_err(|detail| {
+        BootstrapError::ExecutionEnvironment {
+            detail: format!("failed to fetch execution accounts: {detail}"),
+        }
+    })?;
+
+    let mut failures = Vec::new();
+    for requirement in requirements {
+        match accounts.get(&requirement.address) {
+            None => failures.push(format!(
+                "{} missing for {}",
+                requirement.address,
+                requirement
+                    .sources
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Some(None) => failures.push(format!(
+                "{} missing for {}",
+                requirement.address,
+                requirement
+                    .sources
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            Some(Some(account)) => {
+                validate_required_token_account(&requirement, account, &mut failures);
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(BootstrapError::ExecutionEnvironment {
+            detail: failures.join(" | "),
+        })
+    }
+}
+
+fn collect_required_token_accounts(
+    routes: &[&crate::config::RouteConfig],
+    wallet_owner: &str,
+) -> Result<Vec<RequiredTokenAccount>, BootstrapError> {
+    let mut requirements = HashMap::<String, RequiredTokenAccount>::new();
+
+    for route in routes {
+        let route_token_program = route_primary_token_program(route)?;
+        for mint in route_runtime_mints(route) {
+            let address = associated_token_address(wallet_owner, &mint, &route_token_program)?;
+            insert_required_token_account(
+                &mut requirements,
+                route,
+                RequiredTokenAccount {
+                    address,
+                    token_program_id: route_token_program.clone(),
+                    wallet_owner: wallet_owner.into(),
+                    expected_mint: Some(mint),
+                    sources: BTreeSet::new(),
+                },
+                "route_mint_ata",
+            )?;
+        }
+
+        for leg in &route.legs {
+            match &leg.execution {
+                RouteLegExecutionConfig::OrcaSimplePool(config) => {
+                    insert_required_token_account(
+                        &mut requirements,
+                        route,
+                        RequiredTokenAccount {
+                            address: config.user_source_token_account.clone(),
+                            token_program_id: config.token_program_id.clone(),
+                            wallet_owner: wallet_owner.into(),
+                            expected_mint: None,
+                            sources: BTreeSet::new(),
+                        },
+                        "configured_user_source_account",
+                    )?;
+                    insert_required_token_account(
+                        &mut requirements,
+                        route,
+                        RequiredTokenAccount {
+                            address: config.user_destination_token_account.clone(),
+                            token_program_id: config.token_program_id.clone(),
+                            wallet_owner: wallet_owner.into(),
+                            expected_mint: None,
+                            sources: BTreeSet::new(),
+                        },
+                        "configured_user_destination_account",
+                    )?;
+                }
+                RouteLegExecutionConfig::RaydiumSimplePool(config) => {
+                    insert_required_token_account(
+                        &mut requirements,
+                        route,
+                        RequiredTokenAccount {
+                            address: config.user_source_token_account.clone(),
+                            token_program_id: config.token_program_id.clone(),
+                            wallet_owner: wallet_owner.into(),
+                            expected_mint: None,
+                            sources: BTreeSet::new(),
+                        },
+                        "configured_user_source_account",
+                    )?;
+                    insert_required_token_account(
+                        &mut requirements,
+                        route,
+                        RequiredTokenAccount {
+                            address: config.user_destination_token_account.clone(),
+                            token_program_id: config.token_program_id.clone(),
+                            wallet_owner: wallet_owner.into(),
+                            expected_mint: None,
+                            sources: BTreeSet::new(),
+                        },
+                        "configured_user_destination_account",
+                    )?;
+                }
+                RouteLegExecutionConfig::OrcaWhirlpool(config) => {
+                    for mint in [&config.token_mint_a, &config.token_mint_b] {
+                        let address =
+                            associated_token_address(wallet_owner, mint, &config.token_program_id)?;
+                        insert_required_token_account(
+                            &mut requirements,
+                            route,
+                            RequiredTokenAccount {
+                                address,
+                                token_program_id: config.token_program_id.clone(),
+                                wallet_owner: wallet_owner.into(),
+                                expected_mint: Some(mint.clone()),
+                                sources: BTreeSet::new(),
+                            },
+                            "derived_whirlpool_ata",
+                        )?;
+                    }
+                }
+                RouteLegExecutionConfig::RaydiumClmm(config) => {
+                    for mint in [&config.token_mint_0, &config.token_mint_1] {
+                        let address =
+                            associated_token_address(wallet_owner, mint, &config.token_program_id)?;
+                        insert_required_token_account(
+                            &mut requirements,
+                            route,
+                            RequiredTokenAccount {
+                                address,
+                                token_program_id: config.token_program_id.clone(),
+                                wallet_owner: wallet_owner.into(),
+                                expected_mint: Some(mint.clone()),
+                                sources: BTreeSet::new(),
+                            },
+                            "derived_clmm_ata",
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(requirements.into_values().collect())
+}
+
+fn insert_required_token_account(
+    requirements: &mut HashMap<String, RequiredTokenAccount>,
+    route: &crate::config::RouteConfig,
+    mut requirement: RequiredTokenAccount,
+    source: &str,
+) -> Result<(), BootstrapError> {
+    requirement
+        .sources
+        .insert(format!("{source}:{}", route.route_id));
+    match requirements.get_mut(&requirement.address) {
+        Some(existing) => {
+            if existing.token_program_id != requirement.token_program_id {
+                return Err(BootstrapError::InvalidConfig {
+                    detail: format!(
+                        "execution account {} has conflicting token programs: {} vs {}",
+                        requirement.address,
+                        existing.token_program_id,
+                        requirement.token_program_id
+                    ),
+                });
+            }
+            if existing.wallet_owner != requirement.wallet_owner {
+                return Err(BootstrapError::InvalidConfig {
+                    detail: format!(
+                        "execution account {} has conflicting wallet owners: {} vs {}",
+                        requirement.address, existing.wallet_owner, requirement.wallet_owner
+                    ),
+                });
+            }
+            match (&existing.expected_mint, &requirement.expected_mint) {
+                (Some(left), Some(right)) if left != right => {
+                    return Err(BootstrapError::InvalidConfig {
+                        detail: format!(
+                            "execution account {} has conflicting expected mints: {} vs {}",
+                            requirement.address, left, right
+                        ),
+                    });
+                }
+                (None, Some(mint)) => existing.expected_mint = Some(mint.clone()),
+                _ => {}
+            }
+            existing.sources.extend(requirement.sources);
+        }
+        None => {
+            requirements.insert(requirement.address.clone(), requirement);
+        }
+    }
+    Ok(())
+}
+
+fn route_runtime_mints(route: &crate::config::RouteConfig) -> Vec<String> {
+    let mut mints = BTreeSet::new();
+    mints.insert(route.input_mint.clone());
+    mints.insert(route.output_mint.clone());
+    if let Some(mint) = &route.base_mint {
+        mints.insert(mint.clone());
+    }
+    if let Some(mint) = &route.quote_mint {
+        mints.insert(mint.clone());
+    }
+    mints
+        .into_iter()
+        .filter(|mint| parse_pubkey(mint).is_ok())
+        .collect()
+}
+
+fn route_primary_token_program(
+    route: &crate::config::RouteConfig,
+) -> Result<String, BootstrapError> {
+    let token_programs = route
+        .legs
+        .iter()
+        .map(|leg| match &leg.execution {
+            RouteLegExecutionConfig::OrcaSimplePool(config) => config.token_program_id.clone(),
+            RouteLegExecutionConfig::OrcaWhirlpool(config) => config.token_program_id.clone(),
+            RouteLegExecutionConfig::RaydiumSimplePool(config) => config.token_program_id.clone(),
+            RouteLegExecutionConfig::RaydiumClmm(config) => config.token_program_id.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+
+    if token_programs.len() != 1 {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: "route uses conflicting token_program_id values across legs; wallet ATA validation is ambiguous".into(),
+        });
+    }
+
+    token_programs
+        .into_iter()
+        .next()
+        .ok_or_else(|| BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: "route does not expose a token_program_id".into(),
+        })
+}
+
+fn associated_token_address(
+    owner: &str,
+    mint: &str,
+    token_program: &str,
+) -> Result<String, BootstrapError> {
+    let owner = parse_pubkey(owner).map_err(|detail| BootstrapError::InvalidConfig {
+        detail: format!("invalid wallet owner pubkey {owner}: {detail}"),
+    })?;
+    let mint = parse_pubkey(mint).map_err(|detail| BootstrapError::InvalidConfig {
+        detail: format!("invalid mint pubkey {mint}: {detail}"),
+    })?;
+    let token_program =
+        parse_pubkey(token_program).map_err(|detail| BootstrapError::InvalidConfig {
+            detail: format!("invalid token program pubkey {token_program}: {detail}"),
+        })?;
+    Ok(Pubkey::find_program_address(
+        &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
+        &Pubkey::from_str(ASSOCIATED_TOKEN_PROGRAM_ID).expect("associated token program id"),
+    )
+    .0
+    .to_string())
+}
+
+fn parse_pubkey(value: &str) -> Result<Pubkey, String> {
+    Pubkey::from_str(value).map_err(|error| error.to_string())
+}
+
+fn fetch_accounts(
+    endpoint: &str,
+    account_keys: &[String],
+) -> Result<HashMap<String, Option<RpcAccountInfo>>, String> {
+    let http = Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_millis(1_000))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut accounts = HashMap::with_capacity(account_keys.len());
+    for chunk in account_keys.chunks(100) {
+        let response = rpc_call::<RpcMultipleAccountsResponse>(
+            &http,
+            endpoint,
+            "getMultipleAccounts",
+            json!([
+                chunk,
+                { "encoding": "base64", "commitment": "processed" }
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
+        for (account_key, account) in chunk.iter().zip(response.value.into_iter()) {
+            accounts.insert(account_key.clone(), account);
+        }
+    }
+    Ok(accounts)
+}
+
+fn validate_required_token_account(
+    requirement: &RequiredTokenAccount,
+    account: &RpcAccountInfo,
+    failures: &mut Vec<String>,
+) {
+    if account.owner != requirement.token_program_id {
+        failures.push(format!(
+            "{} owner program mismatch: expected {}, got {}",
+            requirement.address, requirement.token_program_id, account.owner
+        ));
+        return;
+    }
+
+    match parse_token_account(account) {
+        Ok(parsed) => {
+            if parsed.owner != requirement.wallet_owner {
+                failures.push(format!(
+                    "{} token owner mismatch: expected {}, got {}",
+                    requirement.address, requirement.wallet_owner, parsed.owner
+                ));
+            }
+            if let Some(expected_mint) = &requirement.expected_mint
+                && &parsed.mint != expected_mint
+            {
+                failures.push(format!(
+                    "{} mint mismatch: expected {}, got {}",
+                    requirement.address, expected_mint, parsed.mint
+                ));
+            }
+        }
+        Err(detail) => failures.push(format!(
+            "{} invalid token account: {detail}",
+            requirement.address
+        )),
+    }
+}
+
+fn parse_token_account(account: &RpcAccountInfo) -> Result<ParsedTokenAccount, String> {
+    if account.data.1 != "base64" {
+        return Err(format!("unsupported account encoding {}", account.data.1));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(account.data.0.as_bytes())
+        .map_err(|error| error.to_string())?;
+    if bytes.len() < SPL_TOKEN_ACCOUNT_LEN {
+        return Err(format!(
+            "account data too short: expected at least {SPL_TOKEN_ACCOUNT_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    if bytes[SPL_TOKEN_ACCOUNT_STATE_OFFSET] != 1 {
+        return Err(format!(
+            "token account is not initialized (state={})",
+            bytes[SPL_TOKEN_ACCOUNT_STATE_OFFSET]
+        ));
+    }
+
+    let mint = Pubkey::try_from(&bytes[0..32])
+        .map_err(|error| error.to_string())?
+        .to_string();
+    let owner = Pubkey::try_from(&bytes[32..64])
+        .map_err(|error| error.to_string())?
+        .to_string();
+    Ok(ParsedTokenAccount { mint, owner })
 }
 
 fn build_tracked_pool_pairs(
@@ -652,7 +1085,7 @@ fn resolve_signer(config: &SigningConfig) -> Result<ResolvedSigner, SigningError
             Ok(ResolvedSigner {
                 owner_pubkey,
                 signer_available,
-                signer: Box::new(signer),
+                signer: Arc::new(signer),
             })
         }
         SigningProviderKind::SecureUnix => {
@@ -687,7 +1120,7 @@ fn resolve_signer(config: &SigningConfig) -> Result<ResolvedSigner, SigningError
             Ok(ResolvedSigner {
                 owner_pubkey,
                 signer_available: signer.is_available(),
-                signer: Box::new(signer),
+                signer: Arc::new(signer),
             })
         }
     }
@@ -695,13 +1128,23 @@ fn resolve_signer(config: &SigningConfig) -> Result<ResolvedSigner, SigningError
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        collections::HashMap,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        path::PathBuf,
+        str::FromStr,
+        sync::Arc,
+        thread,
+    };
 
+    use base64::Engine;
     use builder::{
         AtomicArbTransactionBuilder, BuildRequest, BuildStatus, DynamicBuildParameters,
         ExecutionRegistry, LookupTableUsageConfig, MessageFormat,
         RouteExecutionConfig as BuilderRouteExecutionConfig, TransactionBuilder,
     };
+    use serde_json::{Value, json};
     use solana_sdk::{
         hash::hashv,
         pubkey::Pubkey,
@@ -716,9 +1159,9 @@ mod tests {
     };
     use crate::config::{
         BotConfig, MessageModeConfig, OrcaSimplePoolLegExecutionConfig,
-        RaydiumClmmLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteClassConfig,
-        RouteConfig, RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
-        SwapSideConfig,
+        OrcaWhirlpoolLegExecutionConfig, RaydiumClmmLegExecutionConfig,
+        RaydiumSimplePoolLegExecutionConfig, RouteClassConfig, RouteConfig, RouteExecutionConfig,
+        RouteLegConfig, RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
     };
 
     fn test_pubkey(label: &str) -> String {
@@ -821,11 +1264,172 @@ mod tests {
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
         config.jito.endpoint = "mock://jito".into();
-        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.routes = RoutesConfig {
             definitions: vec![route],
         };
         config
+    }
+
+    fn concentrated_route_config() -> RouteConfig {
+        RouteConfig {
+            enabled: true,
+            route_class: RouteClassConfig::AmmFastPath,
+            route_id: "route-clmm".into(),
+            input_mint: test_pubkey("mint-quote"),
+            output_mint: test_pubkey("mint-quote"),
+            base_mint: Some(test_pubkey("mint-base")),
+            quote_mint: Some(test_pubkey("mint-quote")),
+            sol_quote_conversion_pool_id: Some("pool-whirlpool".into()),
+            default_trade_size: 10_000,
+            max_trade_size: 20_000,
+            min_trade_size: None,
+            size_ladder: Vec::new(),
+            execution_protection: Default::default(),
+            legs: [
+                RouteLegConfig {
+                    venue: "orca_whirlpool".into(),
+                    pool_id: "pool-whirlpool".into(),
+                    side: SwapSideConfig::BuyBase,
+                    fee_bps: Some(30),
+                    execution: RouteLegExecutionConfig::OrcaWhirlpool(
+                        OrcaWhirlpoolLegExecutionConfig {
+                            program_id: test_pubkey("orca-whirlpool-program"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            whirlpool: test_pubkey("whirlpool"),
+                            token_mint_a: test_pubkey("mint-base"),
+                            token_vault_a: test_pubkey("vault-a"),
+                            token_mint_b: test_pubkey("mint-quote"),
+                            token_vault_b: test_pubkey("vault-b"),
+                            tick_spacing: 64,
+                            a_to_b: true,
+                        },
+                    ),
+                },
+                RouteLegConfig {
+                    venue: "raydium_clmm".into(),
+                    pool_id: "pool-clmm".into(),
+                    side: SwapSideConfig::SellBase,
+                    fee_bps: Some(30),
+                    execution: RouteLegExecutionConfig::RaydiumClmm(
+                        RaydiumClmmLegExecutionConfig {
+                            program_id: test_pubkey("raydium-clmm-program"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            token_program_2022_id: test_pubkey("token-2022-program"),
+                            memo_program_id: test_pubkey("memo-program"),
+                            pool_state: test_pubkey("pool-state"),
+                            amm_config: test_pubkey("amm-config"),
+                            observation_state: test_pubkey("observation-state"),
+                            ex_bitmap_account: Some(test_pubkey("ex-bitmap")),
+                            token_mint_0: test_pubkey("mint-base"),
+                            token_vault_0: test_pubkey("vault-0"),
+                            token_mint_1: test_pubkey("mint-quote"),
+                            token_vault_1: test_pubkey("vault-1"),
+                            tick_spacing: 64,
+                            zero_for_one: true,
+                        },
+                    ),
+                },
+            ],
+            account_dependencies: Vec::new(),
+            execution: route_execution(),
+        }
+    }
+
+    fn associated_token_address_for_test(owner: &str, mint: &str, token_program: &str) -> String {
+        super::associated_token_address(owner, mint, token_program)
+            .expect("associated token address")
+    }
+
+    fn token_account_data(mint: &str, owner: &str) -> String {
+        let mut bytes = vec![0u8; super::SPL_TOKEN_ACCOUNT_LEN];
+        bytes[..32].copy_from_slice(&Pubkey::from_str(mint).expect("mint").to_bytes());
+        bytes[32..64].copy_from_slice(&Pubkey::from_str(owner).expect("owner").to_bytes());
+        bytes[super::SPL_TOKEN_ACCOUNT_STATE_OFFSET] = 1;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn rpc_token_account(owner_program: &str, mint: &str, owner: &str) -> Value {
+        json!({
+            "owner": owner_program,
+            "data": [token_account_data(mint, owner), "base64"]
+        })
+    }
+
+    fn spawn_mock_rpc_server<F>(handler: F) -> String
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock rpc server");
+        let address = listener.local_addr().expect("mock rpc address");
+        let handler = Arc::new(handler);
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let body = read_http_body(&mut stream);
+                let response_body = (handler.as_ref())(&body);
+                write_http_response(&mut stream, &response_body);
+            }
+        });
+
+        format!("http://{address}")
+    }
+
+    fn read_http_body(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 1024];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+
+        loop {
+            let bytes_read = stream.read(&mut buffer).expect("read mock request");
+            if bytes_read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..bytes_read]);
+
+            if header_end.is_none() {
+                header_end = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|position| position + 4);
+                if let Some(end) = header_end {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or(0);
+                }
+            }
+
+            if let Some(end) = header_end
+                && request.len() >= end + content_length
+            {
+                let body = &request[end..end + content_length];
+                return String::from_utf8_lossy(body).into_owned();
+            }
+        }
+
+        String::new()
+    }
+
+    fn write_http_response(stream: &mut TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write mock response");
     }
 
     fn repo_root_path(file: &str) -> PathBuf {
@@ -1089,6 +1693,128 @@ mod tests {
         };
         assert_eq!(route_id, "route-a");
         assert!(detail.contains("tracked SOL/"));
+    }
+
+    #[test]
+    fn bootstrap_validates_wallet_execution_accounts_before_start() {
+        let route = valid_route_config();
+        let mut config = test_config(route.clone());
+        let owner = config.signing.owner_pubkey.clone();
+        let token_program = match &route.legs[0].execution {
+            RouteLegExecutionConfig::OrcaSimplePool(config) => config.token_program_id.clone(),
+            _ => panic!("expected orca simple pool leg"),
+        };
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            associated_token_address_for_test(&owner, &route.input_mint, &token_program),
+            rpc_token_account(&token_program, &route.input_mint, &owner),
+        );
+        accounts.insert(
+            associated_token_address_for_test(
+                &owner,
+                route.base_mint.as_deref().expect("base mint"),
+                &token_program,
+            ),
+            rpc_token_account(
+                &token_program,
+                route.base_mint.as_deref().expect("base mint"),
+                &owner,
+            ),
+        );
+        accounts.insert(
+            test_pubkey("route-input-ata"),
+            rpc_token_account(&token_program, &route.input_mint, &owner),
+        );
+        accounts.insert(
+            test_pubkey("route-mid-ata"),
+            rpc_token_account(
+                &token_program,
+                route.base_mint.as_deref().expect("base mint"),
+                &owner,
+            ),
+        );
+        accounts.insert(
+            test_pubkey("route-output-ata"),
+            rpc_token_account(&token_program, &route.output_mint, &owner),
+        );
+
+        config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getMultipleAccounts" => {
+                    let keys = payload["params"][0].as_array().expect("account keys");
+                    let values = keys
+                        .iter()
+                        .map(|key| {
+                            accounts
+                                .get(key.as_str().expect("account key"))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect::<Vec<_>>();
+                    json!({ "result": { "value": values } }).to_string()
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+
+        bootstrap(config).expect("bootstrap should accept a prepared execution environment");
+    }
+
+    #[test]
+    fn bootstrap_rejects_missing_derived_ata_for_concentrated_routes() {
+        let route = concentrated_route_config();
+        let mut config = test_config(route.clone());
+        let owner = config.signing.owner_pubkey.clone();
+        let token_program = match &route.legs[0].execution {
+            RouteLegExecutionConfig::OrcaWhirlpool(config) => config.token_program_id.clone(),
+            _ => panic!("expected whirlpool leg"),
+        };
+        let quote_mint = route.quote_mint.as_deref().expect("quote mint").to_string();
+        let base_mint = route.base_mint.as_deref().expect("base mint").to_string();
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            associated_token_address_for_test(&owner, &quote_mint, &token_program),
+            rpc_token_account(&token_program, &quote_mint, &owner),
+        );
+        // Intentionally omit the base ATA required by the concentrated legs.
+        let missing_base_ata =
+            associated_token_address_for_test(&owner, &base_mint, &token_program);
+
+        config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getMultipleAccounts" => {
+                    let keys = payload["params"][0].as_array().expect("account keys");
+                    let values = keys
+                        .iter()
+                        .map(|key| {
+                            accounts
+                                .get(key.as_str().expect("account key"))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect::<Vec<_>>();
+                    json!({ "result": { "value": values } }).to_string()
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+
+        let error = match bootstrap(config) {
+            Ok(_) => panic!("missing base ATA should fail bootstrap"),
+            Err(error) => error,
+        };
+        let BootstrapError::ExecutionEnvironment { detail } = error else {
+            panic!("expected execution environment error");
+        };
+        assert!(detail.contains(&missing_base_ata));
+        assert!(
+            detail.contains("route_mint_ata:route-clmm")
+                || detail.contains("derived_whirlpool_ata:route-clmm")
+        );
     }
 
     #[test]

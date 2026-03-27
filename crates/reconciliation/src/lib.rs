@@ -18,6 +18,7 @@ mod tests {
         net::{TcpListener, TcpStream},
         sync::Arc,
         thread,
+        time::UNIX_EPOCH,
     };
 
     use crate::tracker::InclusionStatus;
@@ -29,12 +30,33 @@ mod tests {
         ExecutionOutcome, ExecutionTracker, OnChainReconciler, OnChainReconciliationConfig,
     };
 
+    fn register_submission(
+        tracker: &mut ExecutionTracker,
+        route_id: &str,
+        chain_signature: &str,
+        quoted_slot: u64,
+        submit_mode: SubmitMode,
+        result: SubmitResult,
+    ) -> super::ExecutionRecord {
+        tracker.register_submission(
+            RouteId(route_id.into()),
+            chain_signature.into(),
+            quoted_slot,
+            Some(quoted_slot.saturating_add(1)),
+            Some(quoted_slot.saturating_add(2)),
+            UNIX_EPOCH,
+            submit_mode,
+            result,
+        )
+    }
+
     #[test]
     fn tracker_records_state_transitions() {
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "sig-1".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "sig-1",
             10,
             SubmitMode::SingleTransaction,
             SubmitResult {
@@ -67,9 +89,10 @@ mod tests {
     #[test]
     fn onchain_reconciler_expires_old_pending_records() {
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "sig-1".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "sig-1",
             10,
             SubmitMode::SingleTransaction,
             SubmitResult {
@@ -105,9 +128,10 @@ mod tests {
     #[test]
     fn tracker_marks_submit_rejections_as_terminal() {
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "sig-1".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "sig-1",
             10,
             SubmitMode::SingleTransaction,
             SubmitResult {
@@ -132,9 +156,10 @@ mod tests {
     #[test]
     fn tracker_ignores_duplicate_and_regressive_transitions() {
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "sig-1".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "sig-1",
             10,
             SubmitMode::SingleTransaction,
             SubmitResult {
@@ -201,9 +226,10 @@ mod tests {
         });
 
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "chain-sig".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "chain-sig",
             10,
             SubmitMode::SingleTransaction,
             SubmitResult {
@@ -254,9 +280,10 @@ mod tests {
         });
 
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "chain-sig".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "chain-sig",
             10,
             SubmitMode::Bundle,
             SubmitResult {
@@ -308,9 +335,10 @@ mod tests {
         });
 
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "chain-sig".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "chain-sig",
             10,
             SubmitMode::Bundle,
             SubmitResult {
@@ -383,9 +411,10 @@ mod tests {
         });
 
         let mut tracker = ExecutionTracker::default();
-        let record = tracker.register_submission(
-            RouteId("route-a".into()),
-            "chain-sig".into(),
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "chain-sig",
             10,
             SubmitMode::SingleTransaction,
             SubmitResult {

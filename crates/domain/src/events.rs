@@ -112,6 +112,8 @@ pub struct PoolQuoteModelUpdate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolInvalidation {
     pub pool_id: String,
+    pub slot: u64,
+    pub write_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

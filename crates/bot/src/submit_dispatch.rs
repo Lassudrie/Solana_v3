@@ -10,16 +10,15 @@ use std::{
 };
 
 use submit::{
-    JitoConfig, JitoSubmitter, SubmissionId, SubmitAttemptOutcome, SubmitError, SubmitMode,
-    SubmitRejectionReason, SubmitRequest, SubmitResult, SubmitRetryPolicy, SubmitStatus, Submitter,
+    SubmissionId, SubmitAttemptOutcome, SubmitError, SubmitMode, SubmitRejectionReason,
+    SubmitRequest, SubmitResult, SubmitRetryPolicy, SubmitStatus, Submitter,
 };
 
-use crate::config::{BotConfig, SubmitModeConfig};
-use crate::runtime::HotPathReport;
-
-const API_V1_PATH: &str = "/api/v1";
-const TRANSACTION_PATH: &str = "/api/v1/transactions";
-const BUNDLE_PATH: &str = "/api/v1/bundles";
+use crate::{
+    config::BotConfig,
+    runtime::HotPathReport,
+    submit_factory::{build_submitter, submit_endpoint_label, submit_mode_from_config},
+};
 
 #[derive(Debug)]
 pub(crate) struct SubmitDispatcher {
@@ -85,22 +84,9 @@ struct DelayedSubmission {
 
 impl SubmitDispatcher {
     pub(crate) fn from_config(config: &BotConfig) -> Result<Self, std::io::Error> {
-        let submit_mode = match config.submit.mode {
-            SubmitModeConfig::SingleTransaction => SubmitMode::SingleTransaction,
-            SubmitModeConfig::Bundle => SubmitMode::Bundle,
-        };
-        let submitter: Arc<dyn Submitter> = Arc::new(JitoSubmitter::new(JitoConfig {
-            endpoint: config.jito.endpoint.clone(),
-            ws_endpoint: config.jito.ws_endpoint.clone(),
-            auth_token: config.jito.auth_token.clone(),
-            bundle_enabled: config.jito.bundle_enabled,
-            connect_timeout_ms: config.jito.connect_timeout_ms,
-            request_timeout_ms: config.jito.request_timeout_ms,
-            retry_attempts: config.jito.retry_attempts,
-            retry_backoff_ms: config.jito.retry_backoff_ms,
-            idempotency_cache_size: config.jito.idempotency_cache_size,
-        }));
-        let endpoint = request_url(&config.jito.endpoint, submit_mode);
+        let submit_mode = submit_mode_from_config(config);
+        let submitter = build_submitter(config);
+        let endpoint = submit_endpoint_label(config, submit_mode);
         Self::new(
             submitter,
             submit_mode,
@@ -136,10 +122,17 @@ impl SubmitDispatcher {
                 .spawn(move || submit_worker_loop(submitter, worker_receiver, sender))?;
         }
 
+        let coordinator_pending_count = Arc::clone(&pending_count);
         thread::Builder::new()
             .name("bot-submit-coordinator".into())
             .spawn(move || {
-                submit_coordinator_loop(receiver, worker_sender, completion_sender, retry_policy)
+                submit_coordinator_loop(
+                    receiver,
+                    worker_sender,
+                    completion_sender,
+                    retry_policy,
+                    coordinator_pending_count,
+                )
             })?;
 
         Ok(Self {
@@ -188,6 +181,7 @@ impl SubmitDispatcher {
             request: SubmitRequest {
                 envelope,
                 mode: self.submit_mode,
+                leader: report.submit_leader.clone(),
             },
             report,
             first_enqueued_at: Instant::now(),
@@ -197,7 +191,7 @@ impl SubmitDispatcher {
         match self.sender.send(CoordinatorMessage::Enqueue(pending)) {
             Ok(()) => Ok(()),
             Err(mpsc::SendError(CoordinatorMessage::Enqueue(pending))) => {
-                self.pending_count.fetch_sub(1, Ordering::Relaxed);
+                release_pending_slot(&self.pending_count);
                 Err(EnqueueError::Disconnected(pending.report))
             }
             Err(mpsc::SendError(CoordinatorMessage::AttemptFinished(_))) => unreachable!(),
@@ -206,20 +200,14 @@ impl SubmitDispatcher {
 
     pub(crate) fn try_next_completion(&self) -> Option<CompletedSubmission> {
         match self.completion_receiver.try_recv() {
-            Ok(completion) => {
-                self.pending_count.fetch_sub(1, Ordering::Relaxed);
-                Some(completion)
-            }
+            Ok(completion) => Some(completion),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
     }
 
     pub(crate) fn wait_for_completion(&self, timeout: Duration) -> Option<CompletedSubmission> {
         match self.completion_receiver.recv_timeout(timeout) {
-            Ok(completion) => {
-                self.pending_count.fetch_sub(1, Ordering::Relaxed);
-                Some(completion)
-            }
+            Ok(completion) => Some(completion),
             Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => None,
         }
     }
@@ -299,11 +287,17 @@ fn submit_coordinator_loop(
     worker_sender: Sender<PendingSubmission>,
     completion_sender: Sender<CompletedSubmission>,
     retry_policy: SubmitRetryPolicy,
+    pending_count: Arc<AtomicUsize>,
 ) {
     let mut delayed = VecDeque::new();
 
     loop {
-        dispatch_ready_retries(&mut delayed, &worker_sender, &completion_sender);
+        dispatch_ready_retries(
+            &mut delayed,
+            &worker_sender,
+            &completion_sender,
+            &pending_count,
+        );
 
         let timeout = delayed
             .front()
@@ -325,7 +319,12 @@ fn submit_coordinator_loop(
         };
         match message {
             CoordinatorMessage::Enqueue(pending) => {
-                dispatch_pending_submission(pending, &worker_sender, &completion_sender);
+                dispatch_pending_submission(
+                    pending,
+                    &worker_sender,
+                    &completion_sender,
+                    &pending_count,
+                );
             }
             CoordinatorMessage::AttemptFinished(completion) => {
                 handle_attempt_completion(
@@ -334,6 +333,7 @@ fn submit_coordinator_loop(
                     &completion_sender,
                     retry_policy,
                     &mut delayed,
+                    &pending_count,
                 );
             }
         }
@@ -344,6 +344,7 @@ fn dispatch_ready_retries(
     delayed: &mut VecDeque<DelayedSubmission>,
     worker_sender: &Sender<PendingSubmission>,
     completion_sender: &Sender<CompletedSubmission>,
+    pending_count: &Arc<AtomicUsize>,
 ) {
     let now = Instant::now();
     while delayed
@@ -352,7 +353,12 @@ fn dispatch_ready_retries(
         .unwrap_or(false)
     {
         let delayed = delayed.pop_front().expect("delayed retry");
-        dispatch_pending_submission(delayed.pending, worker_sender, completion_sender);
+        dispatch_pending_submission(
+            delayed.pending,
+            worker_sender,
+            completion_sender,
+            pending_count,
+        );
     }
 }
 
@@ -362,6 +368,7 @@ fn handle_attempt_completion(
     completion_sender: &Sender<CompletedSubmission>,
     retry_policy: SubmitRetryPolicy,
     delayed: &mut VecDeque<DelayedSubmission>,
+    pending_count: &Arc<AtomicUsize>,
 ) {
     let AttemptCompletion {
         mut pending,
@@ -370,7 +377,13 @@ fn handle_attempt_completion(
     } = completion;
     match result {
         Ok(SubmitAttemptOutcome::Terminal(result)) => {
-            send_terminal_completion(pending, finished_at, Ok(result), completion_sender);
+            send_terminal_completion(
+                pending,
+                finished_at,
+                Ok(result),
+                completion_sender,
+                pending_count,
+            );
         }
         Ok(SubmitAttemptOutcome::Retry {
             terminal_result,
@@ -383,6 +396,7 @@ fn handle_attempt_completion(
                     finished_at,
                     Ok(terminal_result),
                     completion_sender,
+                    pending_count,
                 );
                 return;
             }
@@ -397,10 +411,16 @@ fn handle_attempt_completion(
                     pending,
                 },
             );
-            dispatch_ready_retries(delayed, worker_sender, completion_sender);
+            dispatch_ready_retries(delayed, worker_sender, completion_sender, pending_count);
         }
         Err(error) => {
-            send_terminal_completion(pending, finished_at, Err(error), completion_sender);
+            send_terminal_completion(
+                pending,
+                finished_at,
+                Err(error),
+                completion_sender,
+                pending_count,
+            );
         }
     }
 }
@@ -409,6 +429,7 @@ fn dispatch_pending_submission(
     pending: PendingSubmission,
     worker_sender: &Sender<PendingSubmission>,
     completion_sender: &Sender<CompletedSubmission>,
+    pending_count: &Arc<AtomicUsize>,
 ) {
     if let Err(error) = worker_sender.send(pending) {
         send_terminal_completion(
@@ -416,6 +437,7 @@ fn dispatch_pending_submission(
             SystemTime::now(),
             Err(SubmitError::TransportUnavailable),
             completion_sender,
+            pending_count,
         );
     }
 }
@@ -425,7 +447,9 @@ fn send_terminal_completion(
     finished_at: SystemTime,
     result: Result<SubmitResult, SubmitError>,
     completion_sender: &Sender<CompletedSubmission>,
+    pending_count: &Arc<AtomicUsize>,
 ) {
+    release_pending_slot(pending_count);
     let completion = CompletedSubmission {
         report: pending.report,
         submit_duration: pending.first_enqueued_at.elapsed(),
@@ -433,6 +457,12 @@ fn send_terminal_completion(
         result,
     };
     let _ = completion_sender.send(completion);
+}
+
+fn release_pending_slot(pending_count: &AtomicUsize) {
+    let _ = pending_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        (current > 0).then_some(current - 1)
+    });
 }
 
 fn insert_delayed_submission(
@@ -448,30 +478,6 @@ fn insert_delayed_submission(
         delayed.insert(index, candidate);
     } else {
         delayed.push_back(candidate);
-    }
-}
-
-fn request_url(endpoint: &str, mode: SubmitMode) -> String {
-    let endpoint = endpoint.trim_end_matches('/');
-    match mode {
-        SubmitMode::SingleTransaction => {
-            if endpoint.ends_with(TRANSACTION_PATH) {
-                endpoint.to_owned()
-            } else if endpoint.ends_with(API_V1_PATH) {
-                format!("{endpoint}/transactions")
-            } else {
-                format!("{endpoint}{TRANSACTION_PATH}")
-            }
-        }
-        SubmitMode::Bundle => {
-            if endpoint.ends_with(BUNDLE_PATH) {
-                endpoint.to_owned()
-            } else if endpoint.ends_with(API_V1_PATH) {
-                format!("{endpoint}/bundles")
-            } else {
-                format!("{endpoint}{BUNDLE_PATH}")
-            }
-        }
     }
 }
 
@@ -654,11 +660,13 @@ mod tests {
                 signature: signature.into(),
                 signer_id: "wallet".into(),
                 signed_message: vec![1, 2, 3],
-                build_slot: 42,
+                quoted_slot: 42,
+                blockhash_slot: Some(43),
                 signed_at: SystemTime::now(),
             }),
             submit_result: None,
             execution_record: None,
+            submit_leader: None,
             pipeline_trace: PipelineTrace {
                 source: EventSourceKind::Synthetic,
                 source_sequence: 1,
@@ -703,7 +711,6 @@ mod tests {
     fn dispatcher_processes_completion_and_updates_pending_count() {
         let mut config = crate::config::BotConfig::default();
         config.jito.endpoint = "mock://jito".into();
-        config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         let dispatcher = SubmitDispatcher::from_config(&config).unwrap();
 
         dispatcher.try_enqueue(report("sig-2")).unwrap();
@@ -714,6 +721,68 @@ mod tests {
             .expect("completion");
         assert_eq!(dispatcher.pending_count(), 0);
         assert_eq!(result.unwrap().status, SubmitStatus::Accepted);
+    }
+
+    #[test]
+    fn terminal_completion_releases_pending_capacity_before_drain() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let (release_sender, release_receiver) = mpsc::channel();
+        let dispatcher = SubmitDispatcher::new(
+            Arc::new(BlockingSubmitter {
+                started: Arc::clone(&started),
+                release: Arc::new(Mutex::new(release_receiver)),
+            }),
+            SubmitMode::SingleTransaction,
+            "mock://jito/api/v1/transactions".into(),
+            1,
+            0,
+            100,
+        )
+        .expect("dispatcher");
+
+        dispatcher
+            .try_enqueue(report("sig-early-release-1"))
+            .expect("first enqueue");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while started.load(Ordering::Relaxed) < 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        release_sender.send(()).expect("release first");
+
+        let released_deadline = Instant::now() + Duration::from_secs(1);
+        while dispatcher.pending_count() != 0 && Instant::now() < released_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(dispatcher.pending_count(), 0);
+
+        dispatcher
+            .try_enqueue(report("sig-early-release-2"))
+            .expect("second enqueue should use capacity freed by terminal completion");
+        let second_deadline = Instant::now() + Duration::from_secs(1);
+        while started.load(Ordering::Relaxed) < 2 && Instant::now() < second_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(started.load(Ordering::Relaxed), 2);
+
+        release_sender.send(()).expect("release second");
+
+        let first_completion = dispatcher
+            .wait_for_completion(Duration::from_secs(1))
+            .expect("first completion");
+        let second_completion = dispatcher
+            .wait_for_completion(Duration::from_secs(1))
+            .expect("second completion");
+
+        assert_eq!(
+            first_completion.result.unwrap().submission_id,
+            SubmissionId("accepted-sig-early-release-1".into())
+        );
+        assert_eq!(
+            second_completion.result.unwrap().submission_id,
+            SubmissionId("accepted-sig-early-release-2".into())
+        );
+        assert_eq!(dispatcher.pending_count(), 0);
     }
 
     #[test]

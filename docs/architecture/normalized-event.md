@@ -60,8 +60,10 @@ pub struct LatencyMetadata {
 ```
 
 - `source_latency` est optionnel
-- les sources wire JSONL/UDP initialisent aujourd’hui `source_latency` à `None`
-- les producteurs peuvent enrichir cette mesure plus tard sans casser le contrat
+- `ShredStreamSource` en UDP laisse aujourd’hui `source_latency` à `None`
+- la source gRPC live peut renseigner une vraie `source_latency` quand l'upstream fournit `created_at`
+- les consommateurs doivent donc traiter `None` comme "non disponible", pas comme "zéro"
+- les producteurs peuvent enrichir cette mesure sans casser le contrat
 
 ## Payloads
 

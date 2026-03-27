@@ -47,12 +47,26 @@ pub struct ExecutionRecord {
     pub submit_mode: SubmitMode,
     pub submit_endpoint: String,
     pub submit_status: SubmitStatus,
-    pub build_slot: u64,
+    pub quoted_slot: u64,
+    pub blockhash_slot: Option<u64>,
+    pub submitted_slot: Option<u64>,
     pub inclusion_status: InclusionStatus,
     pub outcome: ExecutionOutcome,
     pub failure_detail: Option<ExecutionFailureDetail>,
-    pub created_at: SystemTime,
+    pub submitted_at: SystemTime,
     pub last_updated_at: SystemTime,
+}
+
+impl ExecutionRecord {
+    pub fn expiry_reference_slot(&self) -> Option<u64> {
+        self.submitted_slot.or(self.blockhash_slot)
+    }
+
+    pub fn slot_fallback(&self) -> u64 {
+        self.submitted_slot
+            .or(self.blockhash_slot)
+            .unwrap_or(self.quoted_slot)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -61,15 +75,21 @@ pub struct ExecutionTracker {
 }
 
 impl ExecutionTracker {
+    pub fn upsert_record(&mut self, record: ExecutionRecord) {
+        self.history.insert(record);
+    }
+
     pub fn register_submission(
         &mut self,
         route_id: RouteId,
         chain_signature: String,
-        build_slot: u64,
+        quoted_slot: u64,
+        blockhash_slot: Option<u64>,
+        submitted_slot: Option<u64>,
+        submitted_at: SystemTime,
         submit_mode: SubmitMode,
         result: SubmitResult,
     ) -> ExecutionRecord {
-        let now = SystemTime::now();
         let (inclusion_status, outcome) = match result.status {
             SubmitStatus::Accepted => (InclusionStatus::Submitted, ExecutionOutcome::Pending),
             SubmitStatus::Rejected => (
@@ -84,12 +104,14 @@ impl ExecutionTracker {
             submit_mode,
             submit_endpoint: result.endpoint.clone(),
             submit_status: result.status,
-            build_slot,
+            quoted_slot,
+            blockhash_slot,
+            submitted_slot,
             inclusion_status,
             outcome,
             failure_detail: None,
-            created_at: now,
-            last_updated_at: now,
+            submitted_at,
+            last_updated_at: submitted_at,
         };
         self.history.insert(record.clone());
         record

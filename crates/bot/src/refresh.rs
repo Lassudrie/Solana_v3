@@ -247,7 +247,7 @@ fn lookup_tables_update(
         .zip(fetched.ordered_values(lookup_table_keys))
         .filter_map(|(account_key, account)| decode_lookup_table(account_key, account, slot))
         .collect::<Vec<_>>();
-    lookup_table_cache.replace(slot, tables.clone());
+    lookup_table_cache.merge(slot, tables.clone());
     Ok(RefreshUpdate::LookupTables(LookupTablesRefresh {
         tables,
         slot,

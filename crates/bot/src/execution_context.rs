@@ -5,6 +5,7 @@ pub struct ExecutionContext {
     rpc_slot: Option<u64>,
     latest_blockhash: Option<String>,
     blockhash_slot: Option<u64>,
+    current_leader: Option<String>,
     alt_revision: u64,
     lookup_tables: Vec<LookupTableSnapshot>,
     wallet_balance_lamports: u64,
@@ -34,6 +35,14 @@ impl ExecutionContext {
 
     pub fn set_rpc_slot(&mut self, slot: u64) {
         self.rpc_slot = Some(self.rpc_slot.unwrap_or(0).max(slot));
+    }
+
+    pub fn set_current_leader(&mut self, leader: Option<String>) {
+        self.current_leader = leader;
+    }
+
+    pub fn current_leader(&self) -> Option<String> {
+        self.current_leader.clone()
     }
 
     pub fn set_wallet_state(&mut self, balance_lamports: u64, ready: bool) {

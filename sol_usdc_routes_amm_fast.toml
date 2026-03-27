@@ -2,16 +2,16 @@
 profile = "ultra_fast"
 
 [state]
-max_snapshot_slot_lag = 2048
+max_snapshot_slot_lag = 256
 
 [strategy]
-max_snapshot_slot_lag = 2048
+max_snapshot_slot_lag = 256
 
 [shredstream.reducers]
 raydium_simple_pool = "active"
 raydium_clmm = "active"
 orca_whirlpool = "active"
-orca_simple_pool = "disabled"
+orca_simple_pool = "active"
 
 [signing]
 owner_pubkey = "3KD9WKqrrErCsRp7oFoJ58RLqrNJfz8jS3Do8oJ3Gzx1"

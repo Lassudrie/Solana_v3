@@ -20,6 +20,7 @@ solana-message-legacy = { package = "solana-message", version = "=2.2.1" }
 solana-pubkey-legacy = { package = "solana-pubkey", version = "=2.2.1" }
 solana-sdk.workspace = true
 solana-transaction-legacy = { package = "solana-transaction", version = "=2.2.1" }
+strategy = { path = "../strategy" }
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
 tonic = { version = "0.13", features = ["tls-webpki-roots"] }

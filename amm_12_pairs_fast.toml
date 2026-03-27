@@ -16,7 +16,7 @@ jito_tip_lamports = 1000
 raydium_simple_pool = "active"
 raydium_clmm = "active"
 orca_whirlpool = "active"
-orca_simple_pool = "disabled"
+orca_simple_pool = "active"
 
 [signing]
 owner_pubkey = "3KD9WKqrrErCsRp7oFoJ58RLqrNJfz8jS3Do8oJ3Gzx1"

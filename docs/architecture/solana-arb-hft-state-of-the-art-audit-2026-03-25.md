@@ -4,6 +4,8 @@ Date: 2026-03-25
 Base auditée: arbre courant du workspace `/root/bot/Solana_v3`  
 Validation locale: `cargo test --workspace` et `cargo check --workspace` passent sur l'arbre courant
 
+Note 2026-03-27: ce document est un audit date. L'implementation a deja diverge sur plusieurs points; il faut donc le lire comme une photo historique. En particulier, le submit live passe maintenant par un dispatcher async, et `source_latency` est desormais source-dependent au lieu d'etre uniformement nulle.
+
 ## Verdict exécutif
 
 Verdict: **compétitif sur la plomberie**, **pas encore state of the art sur l'alpha et le profit live**.
@@ -130,7 +132,7 @@ Le builder dérive des ATA utilisateur, mais il n'y a pas encore:
 
 Mais il manque encore:
 
-- mesure réelle de `source_latency`;
+- couverture homogène de `source_latency` sur toutes les sources;
 - redondance multi-feed/région;
 - politique de reconnexion/backoff mieux structurée.
 
@@ -163,7 +165,7 @@ Points forts:
 
 Limites:
 
-- `source_latency` toujours à zéro;
+- `source_latency` dépend encore de la source: gRPC live peut la renseigner, UDP shredstream reste aujourd'hui sans timestamp amont;
 - pas de redondance régionale;
 - pas de preuve du gain d'avance informationnelle.
 

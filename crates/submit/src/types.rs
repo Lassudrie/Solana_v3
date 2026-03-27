@@ -13,6 +13,7 @@ pub struct SubmissionId(pub String);
 pub struct SubmitRequest {
     pub envelope: SignedTransactionEnvelope,
     pub mode: SubmitMode,
+    pub leader: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

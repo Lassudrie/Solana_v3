@@ -7,6 +7,7 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     message::{AddressLookupTableAccount, Message, VersionedMessage, v0},
     pubkey::Pubkey,
+    transaction::MAX_TX_ACCOUNT_LOCKS,
 };
 use solana_system_interface::instruction;
 
@@ -31,6 +32,10 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNs
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
 const RAYDIUM_SWAP_BASE_OUT_TAG: u8 = 11;
+const SIGNATURE_BYTES: usize = 64;
+const MAX_SERIALIZED_TRANSACTION_BYTES: usize = 1_232;
+#[allow(deprecated)]
+const MAX_TRANSACTION_ACCOUNT_LOCKS: usize = MAX_TX_ACCOUNT_LOCKS;
 
 pub trait TransactionBuilder: Send + Sync {
     fn build(&self, request: BuildRequest) -> BuildResult;
@@ -147,6 +152,11 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
         };
         let compiled_message_bytes = serialize(&versioned_message)
             .expect("versioned Solana message should serialize deterministically");
+        if let Err(reason) =
+            validate_compiled_transaction_limits(&versioned_message, &compiled_message_bytes)
+        {
+            return rejected(reason);
+        }
 
         let resolved_lookup_tables =
             used_lookup_tables(&versioned_message, &route_lookup_tables).unwrap_or_default();
@@ -190,7 +200,8 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             status: BuildStatus::Built,
             envelope: Some(UnsignedTransactionEnvelope {
                 route_id: request.candidate.route_id,
-                build_slot: request.candidate.quoted_slot,
+                quoted_slot: request.candidate.quoted_slot,
+                blockhash_slot: request.dynamic.recent_blockhash_slot,
                 recent_blockhash: request.dynamic.recent_blockhash,
                 fee_payer_pubkey: request.dynamic.fee_payer_pubkey,
                 leg_plans,
@@ -217,6 +228,71 @@ fn rejected(reason: BuildRejectionReason) -> BuildResult {
         envelope: None,
         rejection: Some(reason),
     }
+}
+
+fn validate_compiled_transaction_limits(
+    versioned_message: &VersionedMessage,
+    compiled_message_bytes: &[u8],
+) -> Result<(), BuildRejectionReason> {
+    let serialized_bytes =
+        serialized_transaction_size_bytes(versioned_message, compiled_message_bytes.len());
+    if serialized_bytes > MAX_SERIALIZED_TRANSACTION_BYTES {
+        return Err(BuildRejectionReason::TransactionTooLarge {
+            serialized_bytes,
+            maximum: MAX_SERIALIZED_TRANSACTION_BYTES,
+        });
+    }
+
+    let account_locks = transaction_account_lock_count(versioned_message);
+    if account_locks > MAX_TRANSACTION_ACCOUNT_LOCKS {
+        return Err(BuildRejectionReason::TooManyAccountLocks {
+            account_locks,
+            maximum: MAX_TRANSACTION_ACCOUNT_LOCKS,
+        });
+    }
+
+    Ok(())
+}
+
+fn serialized_transaction_size_bytes(
+    versioned_message: &VersionedMessage,
+    compiled_message_bytes_len: usize,
+) -> usize {
+    let signature_count = usize::from(versioned_message.header().num_required_signatures);
+    shortvec_encoded_len(signature_count)
+        .saturating_add(signature_count.saturating_mul(SIGNATURE_BYTES))
+        .saturating_add(compiled_message_bytes_len)
+}
+
+fn transaction_account_lock_count(versioned_message: &VersionedMessage) -> usize {
+    versioned_message
+        .static_account_keys()
+        .len()
+        .saturating_add(
+            versioned_message
+                .address_table_lookups()
+                .map(|lookups| {
+                    lookups
+                        .iter()
+                        .map(|lookup| {
+                            lookup
+                                .writable_indexes
+                                .len()
+                                .saturating_add(lookup.readonly_indexes.len())
+                        })
+                        .sum::<usize>()
+                })
+                .unwrap_or_default(),
+        )
+}
+
+fn shortvec_encoded_len(mut value: usize) -> usize {
+    let mut bytes = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes = bytes.saturating_add(1);
+    }
+    bytes
 }
 
 fn route_matches_execution(
@@ -593,7 +669,14 @@ fn used_lookup_tables(
 
 #[cfg(test)]
 mod tests {
-    use solana_sdk::{hash::hashv, pubkey::Pubkey};
+    use bincode::serialize;
+    use solana_sdk::{
+        hash::{Hash, hashv},
+        message::{MessageHeader, compiled_instruction::CompiledInstruction},
+        pubkey::Pubkey,
+        signature::Signature,
+        transaction::VersionedTransaction,
+    };
 
     use crate::types::SwapAmountMode;
 
@@ -607,6 +690,56 @@ mod tests {
         let mut bytes = [0u8; 8];
         bytes.copy_from_slice(&data[offset..offset + 8]);
         u64::from_le_bytes(bytes)
+    }
+
+    fn legacy_message(compiled_instruction: CompiledInstruction) -> VersionedMessage {
+        VersionedMessage::Legacy(Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![
+                parse_static_pubkey(&test_pubkey("fee-payer")),
+                parse_static_pubkey(&test_pubkey("program")),
+            ],
+            recent_blockhash: Hash::new_from_array(hashv(&[b"legacy-blockhash"]).to_bytes()),
+            instructions: vec![compiled_instruction],
+        })
+    }
+
+    fn v0_message_with_lookup_accounts(dynamic_accounts: usize) -> VersionedMessage {
+        let writable_count = dynamic_accounts.min(u8::MAX as usize);
+        let readonly_count = dynamic_accounts.saturating_sub(writable_count);
+        let writable_indexes = (0..writable_count)
+            .map(|index| u8::try_from(index).expect("lookup index should fit in u8"))
+            .collect::<Vec<_>>();
+        let readonly_indexes = (0..readonly_count)
+            .map(|index| u8::try_from(index).expect("lookup index should fit in u8"))
+            .collect::<Vec<_>>();
+
+        VersionedMessage::V0(v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![
+                parse_static_pubkey(&test_pubkey("fee-payer")),
+                parse_static_pubkey(&test_pubkey("program")),
+            ],
+            recent_blockhash: Hash::new_from_array(hashv(&[b"v0-blockhash"]).to_bytes()),
+            instructions: vec![CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![0],
+                data: vec![1],
+            }],
+            address_table_lookups: vec![v0::MessageAddressTableLookup {
+                account_key: parse_static_pubkey(&test_pubkey("lookup-table")),
+                writable_indexes,
+                readonly_indexes,
+            }],
+        })
     }
 
     #[test]
@@ -723,6 +856,67 @@ mod tests {
         assert_eq!(instruction.data[0], RAYDIUM_SWAP_BASE_OUT_TAG);
         assert_eq!(read_u64(&instruction.data, 1), 777);
         assert_eq!(read_u64(&instruction.data, 9), 888);
+    }
+
+    #[test]
+    fn serialized_transaction_size_matches_versioned_transaction_serialization() {
+        let versioned_message = legacy_message(CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![0],
+            data: vec![7; 96],
+        });
+        let compiled_message_bytes =
+            serialize(&versioned_message).expect("versioned message should serialize");
+        #[allow(deprecated)]
+        let actual = serialize(&VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: versioned_message.clone(),
+        })
+        .expect("versioned transaction should serialize")
+        .len();
+
+        assert_eq!(
+            serialized_transaction_size_bytes(&versioned_message, compiled_message_bytes.len()),
+            actual
+        );
+    }
+
+    #[test]
+    fn rejects_transactions_that_exceed_packet_size_limit() {
+        let versioned_message = legacy_message(CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![0],
+            data: vec![9; MAX_SERIALIZED_TRANSACTION_BYTES],
+        });
+        let compiled_message_bytes =
+            serialize(&versioned_message).expect("versioned message should serialize");
+
+        assert_eq!(
+            validate_compiled_transaction_limits(&versioned_message, &compiled_message_bytes),
+            Err(BuildRejectionReason::TransactionTooLarge {
+                serialized_bytes: serialized_transaction_size_bytes(
+                    &versioned_message,
+                    compiled_message_bytes.len(),
+                ),
+                maximum: MAX_SERIALIZED_TRANSACTION_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_transactions_that_exceed_account_lock_limit() {
+        let dynamic_accounts = MAX_TRANSACTION_ACCOUNT_LOCKS.saturating_sub(1);
+        let versioned_message = v0_message_with_lookup_accounts(dynamic_accounts);
+        let compiled_message_bytes =
+            serialize(&versioned_message).expect("versioned message should serialize");
+
+        assert_eq!(
+            validate_compiled_transaction_limits(&versioned_message, &compiled_message_bytes),
+            Err(BuildRejectionReason::TooManyAccountLocks {
+                account_locks: transaction_account_lock_count(&versioned_message),
+                maximum: MAX_TRANSACTION_ACCOUNT_LOCKS,
+            })
+        );
     }
 }
 

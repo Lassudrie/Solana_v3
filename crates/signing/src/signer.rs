@@ -47,6 +47,11 @@ pub enum SigningError {
     MalformedResponse(String),
     #[error("signer returned a signature that failed local verification")]
     InvalidSignature,
+    #[error("serialized transaction too large: {serialized_bytes} bytes exceeds {maximum} bytes")]
+    SerializedTransactionTooLarge {
+        serialized_bytes: usize,
+        maximum: usize,
+    },
     #[error("signing failed: {0}")]
     SigningFailed(String),
 }
@@ -87,6 +92,7 @@ enum SignerMaterial {
 }
 
 const MAX_POOLED_SIGNER_CONNECTIONS: usize = 2;
+const MAX_SERIALIZED_TRANSACTION_BYTES: usize = 1_232;
 
 impl LocalWalletSigner {
     pub fn new(
@@ -401,15 +407,17 @@ fn finalize_signed_envelope(
     }
 
     let route_id = envelope.route_id.clone();
-    let build_slot = envelope.build_slot;
+    let quoted_slot = envelope.quoted_slot;
+    let blockhash_slot = envelope.blockhash_slot;
     let recent_blockhash = envelope.recent_blockhash.clone();
     Ok(SignedTransactionEnvelope {
         route_id,
         recent_blockhash,
         signature: signature.to_string(),
         signer_id: signer_id.to_string(),
-        signed_message: serialize_transaction(&signature, &envelope),
-        build_slot,
+        signed_message: serialize_transaction(&signature, &envelope)?,
+        quoted_slot,
+        blockhash_slot,
         signed_at: SystemTime::now(),
     })
 }
@@ -424,13 +432,22 @@ fn parse_pubkey(value: &str, remote: bool) -> Result<Pubkey, SigningError> {
     })
 }
 
-fn serialize_transaction(signature: &Signature, envelope: &UnsignedTransactionEnvelope) -> Vec<u8> {
+fn serialize_transaction(
+    signature: &Signature,
+    envelope: &UnsignedTransactionEnvelope,
+) -> Result<Vec<u8>, SigningError> {
     let mut serialized =
         Vec::with_capacity(1 + signature.as_ref().len() + envelope.compiled_message_bytes.len());
     write_shortvec_len(1, &mut serialized);
     serialized.extend_from_slice(signature.as_ref());
     serialized.extend_from_slice(&envelope.compiled_message_bytes);
-    serialized
+    if serialized.len() > MAX_SERIALIZED_TRANSACTION_BYTES {
+        return Err(SigningError::SerializedTransactionTooLarge {
+            serialized_bytes: serialized.len(),
+            maximum: MAX_SERIALIZED_TRANSACTION_BYTES,
+        });
+    }
+    Ok(serialized)
 }
 
 fn map_transport_error(error: std::io::Error, context: &str) -> SigningError {
@@ -594,6 +611,32 @@ mod tests {
         server.join();
     }
 
+    #[test]
+    fn local_signer_rejects_oversized_serialized_transaction() {
+        let keypair = Keypair::new_from_array([15; 32]);
+        let signer = LocalWalletSigner::new("wallet-g", None, Some(keypair.to_base58_string()));
+        let wallet = ready_wallet(keypair.pubkey().to_string());
+
+        let error = signer
+            .sign(
+                &wallet,
+                SigningRequest {
+                    envelope: unsigned_envelope(vec![0; MAX_SERIALIZED_TRANSACTION_BYTES]),
+                },
+            )
+            .expect_err("oversized transaction must be rejected before submit");
+
+        assert_eq!(
+            error,
+            SigningError::SerializedTransactionTooLarge {
+                serialized_bytes: 1
+                    + Signature::default().as_ref().len()
+                    + MAX_SERIALIZED_TRANSACTION_BYTES,
+                maximum: MAX_SERIALIZED_TRANSACTION_BYTES,
+            }
+        );
+    }
+
     fn ready_wallet(owner_pubkey: String) -> HotWallet {
         HotWallet {
             wallet_id: "wallet".into(),
@@ -606,7 +649,8 @@ mod tests {
     fn unsigned_envelope(message: Vec<u8>) -> UnsignedTransactionEnvelope {
         UnsignedTransactionEnvelope {
             route_id: RouteId("route-a".into()),
-            build_slot: 42,
+            quoted_slot: 42,
+            blockhash_slot: Some(41),
             recent_blockhash: hashv(&[b"blockhash"]).to_string(),
             fee_payer_pubkey: Keypair::new_from_array([13; 32]).pubkey().to_string(),
             leg_plans: [

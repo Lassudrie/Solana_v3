@@ -1,5 +1,10 @@
 # Analyse de latence statique - 2026-03-26
 
+Note 2026-03-27: ce document est une photo datee. L'implementation actuelle a deja diverge sur deux points importants:
+
+- la soumission live passe maintenant par un `SubmitDispatcher` asynchrone, donc le thread principal ne porte plus directement l'I/O reseau de submit;
+- `source_latency` est source-dependent: la source gRPC live peut la renseigner quand l'upstream fournit `created_at`, tandis que la source UDP shredstream laisse encore ce champ a `None`.
+
 ## Perimetre
 
 Cette analyse est une revue **statique** du code et des points de mesure exposes par le bot.
@@ -15,14 +20,14 @@ Les conclusions ci-dessous decrivent donc:
 ## Verdict court
 
 Le hot path CPU local (`state -> select -> build -> sign`) est globalement court et deterministe.
-Le principal contributeur a la latence et au p99 est aujourd'hui `submit`, loin devant les autres etapes, parce qu'il execute un appel HTTP bloquant avec retry.
+Le path de soumission reste un contributeur majeur a la latence reseau et au p99, mais il n'execute plus directement l'I/O HTTP sur le thread principal: le risque s'est deplace vers la saturation du dispatcher async, ses workers et la file de soumission.
 
 Le deuxieme risque n'est pas une etape CPU lente mais la **saturation de la boucle mono-consommateur**: `queue_wait` peut monter sous charge, tandis que l'ingestion live peut aussi **dropper** des evenements quand le buffer est plein.
 
 La mesure actuelle est utile mais incomplete:
 
 - `quote` n'est pas isole de `select`;
-- `source_latency` n'est pas renseignee de bout en bout;
+- `source_latency` n'est pas disponible de bout en bout sur toutes les sources;
 - Prometheus expose surtout des totaux, pas des percentiles par stage;
 - une faible `queue_wait` ne prouve pas l'absence de saturation si la source droppe avant d'enqueuer.
 
@@ -66,7 +71,7 @@ Les trades exposes par `/monitor/trades` ajoutent:
 `ingest` correspond a `source_received_at -> normalized_at` dans [`runtime.rs`](../../crates/bot/src/runtime.rs).
 Dans l'etat actuel, cette etape est legere: normalisation locale, enrichissement metadata, emission de `NormalizedEvent`.
 
-Le point faible n'est pas le cout CPU mais l'absence de vraie `source_latency`: le champ reste optionnel et souvent nul cote sources actuelles. Voir [`normalized-event.md`](../architecture/normalized-event.md).
+Le point faible n'est pas le cout CPU mais la couverture inegale de `source_latency`: le champ reste optionnel, il peut etre renseigne cote gRPC live, mais reste absent cote UDP shredstream. Voir [`normalized-event.md`](../architecture/normalized-event.md).
 
 Conclusion:
 
@@ -162,29 +167,20 @@ Conclusion:
 
 ### 7. Submit
 
-`submit` est aujourd'hui le **goulot de latence principal**.
+`submit` reste un poste de latence important, mais son architecture a change: la boucle daemon pousse maintenant les soumissions vers un dispatcher async, et la tentative reseau est executee hors du thread principal.
 
-Le submitter Jito utilise `reqwest::blocking::Client` et execute un POST HTTP bloquant dans le hot path. Voir [`jito.rs`](../../crates/submit/src/jito.rs).
+Ce qui reste determinant aujourd'hui:
 
-Defaults config:
-
-- `connect_timeout_ms = 300`
-- `request_timeout_ms = 1000`
-- `retry_attempts = 3`
-- `retry_backoff_ms = 50`
-
-En cas de transport failure, le submitter peut faire jusqu'a 3 tentatives avec backoff exponentiel simple.
-Sur la branche la plus defavorable, on obtient un ordre de grandeur theorique d'environ:
-
-- `3 x 1000 ms` de timeout requete
-- `50 ms + 100 ms` de backoff
-- puis un `ws.probe()` supplementaire sans borne explicite visible dans cette couche
+- la latence reseau du ou des submitters sous-jacents;
+- la taille de file et le nombre de workers du dispatcher;
+- les retries/timeouts du submitter;
+- la congestion locale si le path async sature.
 
 Conclusion:
 
-- `submit` domine vraisemblablement le p95/p99 de `source_to_submit`;
-- la tail latency peut facilement depasser 3 s avant echec franc;
-- tant que `submit` reste synchrone dans la boucle hot path, il amplifie aussi `queue_wait` pour les evenements suivants.
+- `submit` peut toujours dominer le p95/p99 de `source_to_submit`;
+- cette latence ne se traduit plus automatiquement en head-of-line blocking dans la boucle principale;
+- le risque principal n'est plus "HTTP bloquant dans `process_event`", mais "dispatcher ou lane de soumission satures".
 
 ### 8. Submit to Terminal
 
@@ -205,15 +201,16 @@ Conclusion:
 
 ## Risques majeurs
 
-### P0. `submit` bloque toute la boucle
+### P0. Saturation du path de soumission asynchrone
 
-Tant que `submit` reste dans `process_event`, un reseau lent ou des retries Jito ralentissent non seulement la route courante mais aussi l'ingestion chaude des evenements suivants.
+Un reseau lent, une lane degradee ou des retries peuvent encore saturer le dispatcher de soumission, meme si le thread principal n'execute plus directement l'appel reseau.
 
 Impact:
 
 - hausse de `submit_nanos`
 - hausse de `total_to_submit_nanos`
-- hausse indirecte de `queue_wait_nanos`
+- rejets `PathCongested` ou `TooManyInflight`
+- hausse indirecte de `queue_wait_nanos` si la selection continue a produire des candidats alors que la capacite de sortie est saturee
 
 ### P0. Saturation silencieuse de la file live
 
@@ -243,7 +240,7 @@ Impact:
 
 ### P1. `source_latency` encore inutilisable
 
-Sans timestamp source fiable et transporte de bout en bout, la mesure d'avance informationnelle reste partielle.
+Sans timestamp source fiable et transporte de bout en bout sur toutes les sources, la mesure d'avance informationnelle reste partielle.
 
 Impact:
 
@@ -272,7 +269,7 @@ Impact:
 
 ### Architecture
 
-1. Decoupler `submit` du coeur `process_event` si l'objectif prioritaire est de proteger `queue_wait`.
+1. Garder `submit` hors du thread principal et verifier regulierement que `worker_count`, `queue_capacity` et les timeouts restent coherents avec le profil runtime.
 2. Garder `ultra_fast` comme profil de base pour les campagnes de mesure latence.
 3. Verifier si `ws.probe()` doit avoir un timeout explicite pour ne pas allonger le p99 d'echec.
 

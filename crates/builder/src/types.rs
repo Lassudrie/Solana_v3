@@ -78,7 +78,8 @@ pub struct BuildRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsignedTransactionEnvelope {
     pub route_id: RouteId,
-    pub build_slot: u64,
+    pub quoted_slot: u64,
+    pub blockhash_slot: Option<u64>,
     pub recent_blockhash: String,
     pub fee_payer_pubkey: String,
     pub leg_plans: [AtomicLegPlan; 2],
@@ -106,6 +107,8 @@ pub enum BuildRejectionReason {
     MissingBlockhash,
     MissingFeePayer,
     KillSwitchActive,
+    ExecutionPathCongested,
+    ExecutionPathUnavailable,
     UnsupportedRouteShape,
     MissingRouteExecution,
     MissingLookupTable,
@@ -114,6 +117,14 @@ pub enum BuildRejectionReason {
     MessageCompilationFailed,
     MissingExecutionHint,
     UnsupportedVenue,
+    TransactionTooLarge {
+        serialized_bytes: usize,
+        maximum: usize,
+    },
+    TooManyAccountLocks {
+        account_locks: usize,
+        maximum: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

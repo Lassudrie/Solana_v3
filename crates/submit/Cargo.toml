@@ -12,4 +12,3 @@ serde.workspace = true
 serde_json.workspace = true
 signing = { path = "../signing" }
 thiserror.workspace = true
-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

@@ -7,7 +7,7 @@ pub mod quote_models;
 pub mod types;
 pub mod warmup;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 use domain::{
@@ -40,6 +40,7 @@ pub struct StatePlane {
     account_store: AccountStore,
     decoder_registry: DecoderRegistry,
     dependency_graph: DependencyGraph,
+    route_execution_max_slot_lag: HashMap<crate::types::RouteId, u64>,
     pool_snapshots: PoolSnapshotStore,
     concentrated_quote_models: ConcentratedQuoteModelStore,
     warmup: WarmupManager,
@@ -53,6 +54,7 @@ impl StatePlane {
             account_store: AccountStore::default(),
             decoder_registry: DecoderRegistry::default(),
             dependency_graph: DependencyGraph::default(),
+            route_execution_max_slot_lag: HashMap::default(),
             pool_snapshots: PoolSnapshotStore::default(),
             concentrated_quote_models: ConcentratedQuoteModelStore::default(),
             warmup: WarmupManager::default(),
@@ -66,6 +68,15 @@ impl StatePlane {
     }
 
     pub fn register_route(&mut self, route_id: crate::types::RouteId, required_pools: Vec<PoolId>) {
+        self.register_route_with_execution_lag(route_id, required_pools, self.max_slot_lag);
+    }
+
+    pub fn register_route_with_execution_lag(
+        &mut self,
+        route_id: crate::types::RouteId,
+        required_pools: Vec<PoolId>,
+        max_quote_slot_lag: u64,
+    ) {
         let mut deduped_pools = Vec::with_capacity(required_pools.len());
         let mut seen = HashSet::with_capacity(required_pools.len());
         for pool_id in required_pools {
@@ -78,6 +89,8 @@ impl StatePlane {
             self.dependency_graph
                 .register_pool_route(pool_id.clone(), route_id.clone());
         }
+        self.route_execution_max_slot_lag
+            .insert(route_id.clone(), max_quote_slot_lag);
         self.warmup.register_route(route_id, deduped_pools);
     }
 
@@ -181,6 +194,11 @@ impl StatePlane {
             return false;
         }
 
+        let max_quote_slot_lag = self
+            .route_execution_max_slot_lag
+            .get(route_id)
+            .copied()
+            .unwrap_or(self.max_slot_lag);
         let pool_ids = self.dependency_graph.route_pools(route_id);
         !pool_ids.is_empty()
             && pool_ids.iter().all(|pool_id| {
@@ -190,6 +208,8 @@ impl StatePlane {
                         snapshot.is_executable()
                             && self.pool_has_executable_quote_model(pool_id)
                             && !snapshot.freshness.is_stale
+                            && self.latest_slot.saturating_sub(snapshot.last_update_slot)
+                                <= max_quote_slot_lag
                     })
                     .unwrap_or(false)
             })
@@ -393,12 +413,26 @@ impl StatePlane {
     }
 
     fn apply_pool_invalidation(&mut self, invalidation: &PoolInvalidation) -> StateApplyOutcome {
+        self.latest_slot = self.latest_slot.max(invalidation.slot);
         let pool_id = crate::types::PoolId(invalidation.pool_id.clone());
-        let impacted_pools = vec![pool_id.clone()];
-        self.pool_snapshots
-            .invalidate(&pool_id, self.latest_slot, self.max_slot_lag);
-        self.concentrated_quote_models.remove(&pool_id);
-        self.state_outcome(AccountUpdateStatus::Applied, impacted_pools)
+        let update_status = if self.pool_snapshots.invalidate(
+            &pool_id,
+            invalidation.slot,
+            invalidation.write_version,
+            self.latest_slot,
+            self.max_slot_lag,
+        ) {
+            self.concentrated_quote_models.remove(&pool_id);
+            AccountUpdateStatus::Applied
+        } else {
+            AccountUpdateStatus::StaleRejected
+        };
+        let impacted_pools = if update_status == AccountUpdateStatus::Applied {
+            vec![pool_id]
+        } else {
+            Vec::new()
+        };
+        self.state_outcome(update_status, impacted_pools)
     }
 
     fn state_outcome(
@@ -729,6 +763,8 @@ mod tests {
             88,
             PoolInvalidation {
                 pool_id: pool_id.0.clone(),
+                slot: 88,
+                write_version: 2,
             },
         );
         plane.apply_event(&invalidation).unwrap();
@@ -757,12 +793,99 @@ mod tests {
                 10,
                 PoolInvalidation {
                     pool_id: pool_id.0.clone(),
+                    slot: 10,
+                    write_version: 2,
                 },
             ))
             .unwrap();
 
         assert!(!plane.pool_has_executable_quote_model(&pool_id));
         assert!(plane.concentrated_quote_model(&pool_id).is_none());
+    }
+
+    #[test]
+    fn stale_pool_invalidation_is_rejected_against_newer_snapshot() {
+        let pool_id = PoolId("pool-ordered".into());
+        let mut plane = StatePlane::new(2);
+
+        plane
+            .apply_event(&concentrated_snapshot_event(1, &pool_id, 100, 5))
+            .unwrap();
+        plane
+            .apply_event(&quote_model_event(2, &pool_id, 100, 5))
+            .unwrap();
+
+        let outcome = plane
+            .apply_event(&NormalizedEvent::pool_invalidation(
+                EventSourceKind::ShredStream,
+                3,
+                99,
+                PoolInvalidation {
+                    pool_id: pool_id.0.clone(),
+                    slot: 99,
+                    write_version: 6,
+                },
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            outcome.update_status,
+            crate::types::AccountUpdateStatus::StaleRejected
+        );
+        assert!(outcome.impacted_pools.is_empty());
+        assert_eq!(
+            plane.pool_snapshot(&pool_id).unwrap().confidence,
+            crate::types::PoolConfidence::Executable
+        );
+        assert!(plane.concentrated_quote_model(&pool_id).is_some());
+    }
+
+    #[test]
+    fn pool_invalidation_without_snapshot_blocks_older_snapshot_replay() {
+        let pool_id = PoolId("pool-reordered".into());
+        let mut plane = StatePlane::new(2);
+
+        let invalidation = plane
+            .apply_event(&NormalizedEvent::pool_invalidation(
+                EventSourceKind::ShredStream,
+                1,
+                100,
+                PoolInvalidation {
+                    pool_id: pool_id.0.clone(),
+                    slot: 100,
+                    write_version: 5,
+                },
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            invalidation.update_status,
+            crate::types::AccountUpdateStatus::Applied
+        );
+
+        let stale_snapshot = plane
+            .apply_event(&concentrated_snapshot_event(2, &pool_id, 99, 4))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale_snapshot.update_status,
+            crate::types::AccountUpdateStatus::StaleRejected
+        );
+        assert!(plane.pool_snapshot(&pool_id).is_none());
+
+        let fresh_snapshot = plane
+            .apply_event(&concentrated_snapshot_event(3, &pool_id, 100, 6))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fresh_snapshot.update_status,
+            crate::types::AccountUpdateStatus::Applied
+        );
+        assert_eq!(
+            plane.pool_snapshot(&pool_id).unwrap().confidence,
+            crate::types::PoolConfidence::Executable
+        );
     }
 
     #[test]
@@ -816,6 +939,62 @@ mod tests {
             ))
             .unwrap();
 
+        assert_eq!(plane.tradable_route_count(), 0);
+    }
+
+    #[test]
+    fn tradable_route_count_respects_route_execution_slot_lag() {
+        let route_id = RouteId("route-tight".into());
+        let pool_a = PoolId("pool-a".into());
+        let pool_b = PoolId("pool-b".into());
+        let mut plane = StatePlane::new(2_048);
+        plane.register_route_with_execution_lag(route_id, vec![pool_a.clone(), pool_b.clone()], 4);
+
+        for (sequence, pool_id) in [(1, &pool_a), (2, &pool_b)] {
+            plane
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::ShredStream,
+                    sequence,
+                    100,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.0.clone(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 1_000,
+                        reserve_a: Some(1_000),
+                        reserve_b: Some(1_000),
+                        active_liquidity: Some(1_000),
+                        sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: "mint-a".into(),
+                        token_mint_b: "mint-b".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot: 100,
+                        write_version: 1,
+                    },
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(plane.tradable_route_count(), 1);
+
+        plane
+            .apply_event(&NormalizedEvent::with_payload(
+                EventSourceKind::ShredStream,
+                3,
+                105,
+                domain::MarketEvent::SlotBoundary(domain::SlotBoundary {
+                    slot: 105,
+                    leader: None,
+                }),
+            ))
+            .unwrap();
+
+        assert!(!plane.pool_snapshot(&pool_a).unwrap().freshness.is_stale);
+        assert!(!plane.pool_snapshot(&pool_b).unwrap().freshness.is_stale);
         assert_eq!(plane.tradable_route_count(), 0);
     }
 
@@ -919,5 +1098,52 @@ mod tests {
         assert!(plane.pool_has_executable_quote_model(&pool_a));
         assert!(plane.concentrated_quote_model(&pool_a).is_some());
         assert_eq!(plane.tradable_route_count(), 1);
+    }
+
+    #[test]
+    fn partial_concentrated_quote_model_still_counts_as_executable() {
+        let pool_id = PoolId("pool-clmm".into());
+        let mut plane = StatePlane::new(2);
+
+        plane
+            .apply_event(&concentrated_snapshot_event(1, &pool_id, 10, 1))
+            .unwrap();
+        plane
+            .apply_event(&NormalizedEvent::pool_quote_model_update(
+                EventSourceKind::ShredStream,
+                2,
+                10,
+                PoolQuoteModelUpdate {
+                    pool_id: pool_id.0.clone(),
+                    liquidity: 1_000,
+                    sqrt_price_x64: 1u128 << 64,
+                    current_tick_index: 0,
+                    tick_spacing: 64,
+                    required_a_to_b: true,
+                    required_b_to_a: false,
+                    a_to_b: Some(DirectionalPoolQuoteModelUpdate {
+                        loaded_tick_arrays: 1,
+                        expected_tick_arrays: 3,
+                        complete: false,
+                        windows: vec![TickArrayWindowUpdate {
+                            start_tick_index: -64,
+                            end_tick_index: 0,
+                            initialized_tick_count: 1,
+                        }],
+                        initialized_ticks: vec![InitializedTickUpdate {
+                            tick_index: 0,
+                            liquidity_net: 10,
+                            liquidity_gross: 10,
+                        }],
+                    }),
+                    b_to_a: None,
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+
+        assert!(plane.pool_has_executable_quote_model(&pool_id));
+        assert!(plane.concentrated_quote_model(&pool_id).is_some());
     }
 }

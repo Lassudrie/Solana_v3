@@ -32,7 +32,6 @@ const MOCK_SCHEME: &str = "mock://";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JitoConfig {
     pub endpoint: String,
-    pub ws_endpoint: String,
     pub auth_token: Option<String>,
     pub bundle_enabled: bool,
     pub connect_timeout_ms: u64,
@@ -46,13 +45,12 @@ impl Default for JitoConfig {
     fn default() -> Self {
         Self {
             endpoint: "https://mainnet.block-engine.jito.wtf".into(),
-            ws_endpoint: "wss://bundles.jito.wtf/api/v1/bundles/tip_stream".into(),
             auth_token: None,
             bundle_enabled: true,
             connect_timeout_ms: 300,
-            request_timeout_ms: 1_000,
-            retry_attempts: 3,
-            retry_backoff_ms: 50,
+            request_timeout_ms: 400,
+            retry_attempts: 1,
+            retry_backoff_ms: 0,
             idempotency_cache_size: 1_024,
         }
     }

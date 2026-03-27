@@ -1,14 +1,9 @@
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Default)]
-struct ShredstreamRateState {
-    last_observed_second: u64,
-    events_in_second: u64,
-}
+const PIPELINE_STAGE_COUNT: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PipelineStage {
@@ -22,7 +17,33 @@ pub enum PipelineStage {
     Reconcile,
 }
 
-#[derive(Debug, Default)]
+impl PipelineStage {
+    pub const ALL: [Self; PIPELINE_STAGE_COUNT] = [
+        Self::Detect,
+        Self::StateApply,
+        Self::Quote,
+        Self::Select,
+        Self::Build,
+        Self::Sign,
+        Self::Submit,
+        Self::Reconcile,
+    ];
+
+    const fn as_index(self) -> usize {
+        match self {
+            Self::Detect => 0,
+            Self::StateApply => 1,
+            Self::Quote => 2,
+            Self::Select => 3,
+            Self::Build => 4,
+            Self::Sign => 5,
+            Self::Submit => 6,
+            Self::Reconcile => 7,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct PipelineMetrics {
     detect_events: AtomicU64,
     stale_updates: AtomicU64,
@@ -34,7 +55,7 @@ pub struct PipelineMetrics {
     transport_failed_count: AtomicU64,
     chain_failed_count: AtomicU64,
     expired_count: AtomicU64,
-    stage_latency_nanos: Mutex<BTreeMap<PipelineStage, u128>>,
+    stage_latency_nanos: [AtomicU64; PIPELINE_STAGE_COUNT],
     shredstream_events: AtomicU64,
     shredstream_sequence_gaps: AtomicU64,
     shredstream_sequence_reorders: AtomicU64,
@@ -44,7 +65,8 @@ pub struct PipelineMetrics {
     shredstream_interarrival_latency_nanos: AtomicU64,
     shredstream_interarrival_latency_count: AtomicU64,
     shredstream_events_per_second: AtomicU64,
-    shredstream_rate_state: Mutex<ShredstreamRateState>,
+    shredstream_last_observed_second: AtomicU64,
+    shredstream_events_in_second: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,9 +95,10 @@ pub struct MetricsSnapshot {
 
 impl PipelineMetrics {
     pub fn record_stage_latency(&self, stage: PipelineStage, duration: Duration) {
-        let mut latencies = self.stage_latency_nanos.lock().expect("latencies lock");
-        let entry = latencies.entry(stage).or_insert(0);
-        *entry += duration.as_nanos();
+        saturating_add_atomic(
+            &self.stage_latency_nanos[stage.as_index()],
+            as_u128_to_u64(duration.as_nanos()),
+        );
     }
 
     pub fn increment_detect(&self) {
@@ -161,18 +184,37 @@ impl PipelineMetrics {
         }
 
         let now_second = current_observed_second(source_received_at);
-        let mut guard = self
-            .shredstream_rate_state
-            .lock()
-            .expect("shredstream rate lock");
-        if guard.last_observed_second != now_second {
-            guard.last_observed_second = now_second;
-            guard.events_in_second = 1;
-        } else {
-            guard.events_in_second += 1;
+        loop {
+            let last_second = self
+                .shredstream_last_observed_second
+                .load(Ordering::Relaxed);
+            if last_second == now_second {
+                let count = self
+                    .shredstream_events_in_second
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                self.shredstream_events_per_second
+                    .store(count, Ordering::Relaxed);
+                break;
+            }
+
+            match self.shredstream_last_observed_second.compare_exchange(
+                last_second,
+                now_second,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    self.shredstream_events_in_second
+                        .store(1, Ordering::Relaxed);
+                    self.shredstream_events_per_second
+                        .store(1, Ordering::Relaxed);
+                    break;
+                }
+                Err(observed_second) if observed_second == now_second => continue,
+                Err(_) => continue,
+            }
         }
-        self.shredstream_events_per_second
-            .store(guard.events_in_second, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -187,11 +229,14 @@ impl PipelineMetrics {
             transport_failed_count: self.transport_failed_count.load(Ordering::Relaxed),
             chain_failed_count: self.chain_failed_count.load(Ordering::Relaxed),
             expired_count: self.expired_count.load(Ordering::Relaxed),
-            stage_latency_nanos: self
-                .stage_latency_nanos
-                .lock()
-                .expect("latencies lock")
-                .clone(),
+            stage_latency_nanos: PipelineStage::ALL
+                .into_iter()
+                .filter_map(|stage| {
+                    let latency =
+                        self.stage_latency_nanos[stage.as_index()].load(Ordering::Relaxed);
+                    (latency > 0).then_some((stage, u128::from(latency)))
+                })
+                .collect(),
             shredstream_events: self.shredstream_events.load(Ordering::Relaxed),
             shredstream_sequence_gaps: self.shredstream_sequence_gaps.load(Ordering::Relaxed),
             shredstream_sequence_reorders: self
@@ -219,8 +264,43 @@ impl PipelineMetrics {
     }
 }
 
+impl Default for PipelineMetrics {
+    fn default() -> Self {
+        Self {
+            detect_events: AtomicU64::new(0),
+            stale_updates: AtomicU64::new(0),
+            rejection_count: AtomicU64::new(0),
+            build_count: AtomicU64::new(0),
+            submit_count: AtomicU64::new(0),
+            inclusion_count: AtomicU64::new(0),
+            submit_rejected_count: AtomicU64::new(0),
+            transport_failed_count: AtomicU64::new(0),
+            chain_failed_count: AtomicU64::new(0),
+            expired_count: AtomicU64::new(0),
+            stage_latency_nanos: std::array::from_fn(|_| AtomicU64::new(0)),
+            shredstream_events: AtomicU64::new(0),
+            shredstream_sequence_gaps: AtomicU64::new(0),
+            shredstream_sequence_reorders: AtomicU64::new(0),
+            shredstream_sequence_duplicates: AtomicU64::new(0),
+            shredstream_ingest_latency_nanos: AtomicU64::new(0),
+            shredstream_ingest_latency_count: AtomicU64::new(0),
+            shredstream_interarrival_latency_nanos: AtomicU64::new(0),
+            shredstream_interarrival_latency_count: AtomicU64::new(0),
+            shredstream_events_per_second: AtomicU64::new(0),
+            shredstream_last_observed_second: AtomicU64::new(0),
+            shredstream_events_in_second: AtomicU64::new(0),
+        }
+    }
+}
+
 fn as_u128_to_u64(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn saturating_add_atomic(counter: &AtomicU64, delta: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(delta))
+    });
 }
 
 fn current_observed_second(timestamp: SystemTime) -> u64 {
@@ -228,4 +308,37 @@ fn current_observed_second(timestamp: SystemTime) -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    use super::{PipelineMetrics, PipelineStage};
+
+    #[test]
+    fn stage_latencies_are_accumulated_without_zero_entries() {
+        let metrics = PipelineMetrics::default();
+        metrics.record_stage_latency(PipelineStage::Select, Duration::from_nanos(11));
+        metrics.record_stage_latency(PipelineStage::Select, Duration::from_nanos(7));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.stage_latency_nanos.len(), 1);
+        assert_eq!(
+            snapshot.stage_latency_nanos.get(&PipelineStage::Select),
+            Some(&18)
+        );
+    }
+
+    #[test]
+    fn shredstream_rate_uses_current_second_without_mutex_state() {
+        let metrics = PipelineMetrics::default();
+        let now = UNIX_EPOCH + Duration::from_secs(10);
+        metrics.record_shredstream_event(None, now, None, Duration::from_nanos(1));
+        metrics.record_shredstream_event(None, now, None, Duration::from_nanos(1));
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.shredstream_events, 2);
+        assert_eq!(snapshot.shredstream_events_per_second, 2);
+    }
 }

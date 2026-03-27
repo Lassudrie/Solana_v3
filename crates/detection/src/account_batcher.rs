@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{
         Arc, RwLock,
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
@@ -122,6 +122,33 @@ impl LookupTableCacheHandle {
             *guard = next;
         }
     }
+
+    pub fn merge(&self, revision: u64, tables: Vec<LookupTableSnapshot>) {
+        let current = self.snapshot();
+        let mut tables_by_key = current.tables_by_key.clone();
+        for table in tables {
+            let should_replace = tables_by_key
+                .get(&table.account_key)
+                .map(|existing| {
+                    (table.fetched_slot, table.last_extended_slot)
+                        >= (existing.fetched_slot, existing.last_extended_slot)
+                })
+                .unwrap_or(true);
+            if should_replace {
+                tables_by_key.insert(table.account_key.clone(), table);
+            }
+        }
+        let mut tables_vec = tables_by_key.values().cloned().collect::<Vec<_>>();
+        tables_vec.sort_by(|left, right| left.account_key.cmp(&right.account_key));
+        let next = Arc::new(LookupTableCacheSnapshot {
+            revision: revision.max(current.revision),
+            tables_vec,
+            tables_by_key,
+        });
+        if let Ok(mut guard) = self.snapshot.write() {
+            *guard = next;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -230,13 +257,23 @@ fn run_batcher(endpoint: String, receiver: Receiver<BatchRequest>) {
             }
         }
 
-        let result = fetch_batch(&http, &endpoint, &pending);
+        let mut groups = BTreeMap::<Option<u64>, Vec<BatchRequest>>::new();
         for request in pending {
-            let response = result
-                .as_ref()
-                .map(|fetched| fetched.subset_for(&request.account_keys))
-                .map_err(Clone::clone);
-            let _ = request.response_tx.send(response);
+            groups
+                .entry(request.min_context_slot)
+                .or_default()
+                .push(request);
+        }
+
+        for group in groups.into_values() {
+            let result = fetch_batch(&http, &endpoint, &group);
+            for request in group {
+                let response = result
+                    .as_ref()
+                    .map(|fetched| fetched.subset_for(&request.account_keys))
+                    .map_err(Clone::clone);
+                let _ = request.response_tx.send(response);
+            }
         }
 
         if disconnected {
@@ -486,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn batches_requests_with_maximum_min_context_slot() {
+    fn separates_requests_with_distinct_min_context_slots() {
         let seen_min_context_slot = Arc::new(Mutex::new(Vec::<Option<u64>>::new()));
         let endpoint = spawn_mock_rpc_server({
             let seen_min_context_slot = Arc::clone(&seen_min_context_slot);
@@ -536,8 +573,38 @@ mod tests {
                 .lock()
                 .expect("min context slots")
                 .as_slice(),
-            &[Some(45)]
+            &[Some(40), Some(45)]
         );
+    }
+
+    #[test]
+    fn lookup_table_cache_merge_preserves_existing_entries() {
+        let cache = LookupTableCacheHandle::default();
+        cache.replace(
+            11,
+            vec![LookupTableSnapshot {
+                account_key: "table-a".into(),
+                addresses: vec!["addr-1".into(), "addr-2".into()],
+                last_extended_slot: 9,
+                fetched_slot: 11,
+            }],
+        );
+        cache.merge(
+            12,
+            vec![LookupTableSnapshot {
+                account_key: "table-b".into(),
+                addresses: vec!["addr-3".into()],
+                last_extended_slot: 12,
+                fetched_slot: 12,
+            }],
+        );
+
+        let snapshot = cache.snapshot();
+
+        assert_eq!(snapshot.revision, 12);
+        assert_eq!(snapshot.tables_vec.len(), 2);
+        assert!(snapshot.tables_by_key.contains_key("table-a"));
+        assert!(snapshot.tables_by_key.contains_key("table-b"));
     }
 
     fn multiple_accounts_response(slot: u64, keys: &[String]) -> String {

@@ -14,6 +14,8 @@ pub struct BotConfig {
     pub signing: SigningConfig,
     pub submit: SubmitConfig,
     pub jito: JitoSubmitConfig,
+    #[serde(default)]
+    pub rpc_submit: RpcSubmitConfig,
     pub reconciliation: ReconciliationConfig,
     pub risk: RiskConfig,
     pub runtime: RuntimeConfig,
@@ -30,6 +32,7 @@ impl Default for BotConfig {
             signing: SigningConfig::default(),
             submit: SubmitConfig::default(),
             jito: JitoSubmitConfig::default(),
+            rpc_submit: RpcSubmitConfig::default(),
             reconciliation: ReconciliationConfig::default(),
             risk: RiskConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -90,22 +93,38 @@ impl BotConfig {
             return;
         }
 
-        // Ultra-fast mode prefers fail-fast submits over worker-local retry backoff.
+        let shredstream_live = self.runtime.event_source.mode == EventSourceMode::Shredstream;
+
+        // Ultra-fast mode keeps the async submit path short and fail-fast.
+        self.submit.worker_count = 2;
+        self.submit.queue_capacity = 4;
+        self.submit.congestion_threshold_pct = 50;
+        self.submit.single_transaction_policy = SingleTransactionSubmitPolicyConfig::LeaderAware;
+        self.jito.request_timeout_ms = 250;
         self.jito.retry_attempts = 1;
         self.jito.retry_backoff_ms = 0;
+        self.rpc_submit.enabled = true;
+        self.rpc_submit.request_timeout_ms = 250;
+        self.rpc_submit.max_retries = 0;
         self.runtime.control.idle_sleep_millis = 0;
         self.runtime.control.max_events_per_tick = 4_096;
         self.reconciliation.poll_interval_millis = 25;
         self.runtime.refresh.enabled = true;
-        self.runtime.refresh.blockhash_refresh_millis = 500;
-        self.runtime.refresh.slot_refresh_millis = 250;
-        self.runtime.refresh.alt_refresh_millis = 2_000;
-        self.runtime.refresh.wallet_refresh_millis = 2_000;
+        self.runtime.refresh.blockhash_refresh_millis = if shredstream_live { 5_000 } else { 500 };
+        self.runtime.refresh.slot_refresh_millis = if shredstream_live { 0 } else { 250 };
+        self.runtime.refresh.alt_refresh_millis = if shredstream_live { 0 } else { 2_000 };
+        self.runtime.refresh.wallet_refresh_millis = if shredstream_live { 0 } else { 2_000 };
+
+        if shredstream_live {
+            promote_shadow_reducer(&mut self.shredstream.reducers.raydium_simple_pool);
+            promote_shadow_reducer(&mut self.shredstream.reducers.orca_whirlpool);
+            promote_shadow_reducer(&mut self.shredstream.reducers.raydium_clmm);
+        }
     }
 
     fn from_toml_str(path: &Path, text: &str) -> Result<Self, ConfigError> {
         match toml::from_str::<Self>(text) {
-            Ok(config) => Ok(config),
+            Ok(config) => Ok(Self::with_applied_profile_defaults(config)),
             Err(_) => {
                 let overlay =
                     toml::from_str::<toml::Value>(text).map_err(|source| ConfigError::Toml {
@@ -122,7 +141,7 @@ impl BotConfig {
 
     fn from_json_str(path: &Path, text: &str) -> Result<Self, ConfigError> {
         match serde_json::from_str::<Self>(text) {
-            Ok(config) => Ok(config),
+            Ok(config) => Ok(Self::with_applied_profile_defaults(config)),
             Err(_) => {
                 let overlay = serde_json::from_str::<JsonValue>(text).map_err(|source| {
                     ConfigError::Json {
@@ -139,10 +158,16 @@ impl BotConfig {
         let mut merged =
             serde_json::to_value(Self::default()).expect("BotConfig::default should serialize");
         merge_json_value(&mut merged, overlay);
-        serde_json::from_value(merged).map_err(|source| ConfigError::Deserialize {
+        let config = serde_json::from_value(merged).map_err(|source| ConfigError::Deserialize {
             path: path.display().to_string(),
             source,
-        })
+        })?;
+        Ok(Self::with_applied_profile_defaults(config))
+    }
+
+    fn with_applied_profile_defaults(mut config: Self) -> Self {
+        config.apply_runtime_profile_defaults();
+        config
     }
 }
 
@@ -159,6 +184,12 @@ fn merge_json_value(base: &mut JsonValue, overlay: JsonValue) {
             }
         }
         (base_value, overlay_value) => *base_value = overlay_value,
+    }
+}
+
+fn promote_shadow_reducer(mode: &mut ReducerRolloutMode) {
+    if *mode == ReducerRolloutMode::Shadow {
+        *mode = ReducerRolloutMode::Active;
     }
 }
 
@@ -209,9 +240,9 @@ impl Default for LiveReducerConfig {
     fn default() -> Self {
         Self {
             orca_simple_pool: ReducerRolloutMode::Active,
-            raydium_simple_pool: ReducerRolloutMode::Shadow,
-            orca_whirlpool: ReducerRolloutMode::Shadow,
-            raydium_clmm: ReducerRolloutMode::Shadow,
+            raydium_simple_pool: ReducerRolloutMode::Active,
+            orca_whirlpool: ReducerRolloutMode::Active,
+            raydium_clmm: ReducerRolloutMode::Active,
         }
     }
 }
@@ -508,8 +539,14 @@ pub struct SigningConfig {
     pub connect_timeout_ms: u64,
     #[serde(default = "default_signing_read_timeout_ms")]
     pub read_timeout_ms: u64,
+    #[serde(default = "default_validate_execution_accounts")]
+    pub validate_execution_accounts: bool,
     pub bootstrap_balance_lamports: u64,
     pub wallet_ready: bool,
+}
+
+fn default_validate_execution_accounts() -> bool {
+    true
 }
 
 impl Default for SigningConfig {
@@ -523,6 +560,7 @@ impl Default for SigningConfig {
             socket_path: None,
             connect_timeout_ms: default_signing_connect_timeout_ms(),
             read_timeout_ms: default_signing_read_timeout_ms(),
+            validate_execution_accounts: default_validate_execution_accounts(),
             bootstrap_balance_lamports: 1_000_000,
             wallet_ready: true,
         }
@@ -536,6 +574,7 @@ pub struct SubmitConfig {
     pub worker_count: usize,
     pub queue_capacity: usize,
     pub congestion_threshold_pct: u8,
+    pub single_transaction_policy: SingleTransactionSubmitPolicyConfig,
 }
 
 impl Default for SubmitConfig {
@@ -545,20 +584,21 @@ impl Default for SubmitConfig {
             worker_count: default_submit_worker_count(),
             queue_capacity: default_submit_queue_capacity(),
             congestion_threshold_pct: default_submit_congestion_threshold_pct(),
+            single_transaction_policy: SingleTransactionSubmitPolicyConfig::default(),
         }
     }
 }
 
 fn default_submit_worker_count() -> usize {
-    4
+    2
 }
 
 fn default_submit_queue_capacity() -> usize {
-    256
+    8
 }
 
 fn default_submit_congestion_threshold_pct() -> u8 {
-    75
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -568,11 +608,20 @@ pub enum SubmitModeConfig {
     Bundle,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SingleTransactionSubmitPolicyConfig {
+    #[default]
+    JitoOnly,
+    RpcOnly,
+    Fanout,
+    LeaderAware,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct JitoSubmitConfig {
     pub endpoint: String,
-    pub ws_endpoint: String,
     pub auth_token: Option<String>,
     pub bundle_enabled: bool,
     pub connect_timeout_ms: u64,
@@ -586,13 +635,38 @@ impl Default for JitoSubmitConfig {
     fn default() -> Self {
         Self {
             endpoint: "https://mainnet.block-engine.jito.wtf".into(),
-            ws_endpoint: "wss://bundles.jito.wtf/api/v1/bundles/tip_stream".into(),
             auth_token: None,
             bundle_enabled: true,
             connect_timeout_ms: 300,
-            request_timeout_ms: 1_000,
-            retry_attempts: 3,
-            retry_backoff_ms: 50,
+            request_timeout_ms: 400,
+            retry_attempts: 1,
+            retry_backoff_ms: 0,
+            idempotency_cache_size: 1_024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RpcSubmitConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub connect_timeout_ms: u64,
+    pub request_timeout_ms: u64,
+    pub skip_preflight: bool,
+    pub max_retries: usize,
+    pub idempotency_cache_size: usize,
+}
+
+impl Default for RpcSubmitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            connect_timeout_ms: 200,
+            request_timeout_ms: 250,
+            skip_preflight: true,
+            max_retries: 0,
             idempotency_cache_size: 1_024,
         }
     }
@@ -825,7 +899,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{BotConfig, EventSourceMode, ReducerRolloutMode, RuntimeProfileConfig};
+    use super::{
+        BotConfig, EventSourceMode, ReducerRolloutMode, RuntimeProfileConfig,
+        SingleTransactionSubmitPolicyConfig,
+    };
 
     #[test]
     fn loads_toml_config_from_path() {
@@ -848,13 +925,101 @@ mod tests {
         config.runtime.profile = RuntimeProfileConfig::UltraFast;
         config.apply_runtime_profile_defaults();
 
+        assert_eq!(config.submit.worker_count, 2);
+        assert_eq!(config.submit.queue_capacity, 4);
+        assert_eq!(config.submit.congestion_threshold_pct, 50);
+        assert_eq!(
+            config.submit.single_transaction_policy,
+            SingleTransactionSubmitPolicyConfig::LeaderAware
+        );
         assert_eq!(config.runtime.control.idle_sleep_millis, 0);
         assert_eq!(config.runtime.control.max_events_per_tick, 4_096);
         assert_eq!(config.reconciliation.poll_interval_millis, 25);
+        assert_eq!(config.jito.request_timeout_ms, 250);
         assert_eq!(config.jito.retry_attempts, 1);
         assert_eq!(config.jito.retry_backoff_ms, 0);
+        assert!(config.rpc_submit.enabled);
+        assert_eq!(config.rpc_submit.request_timeout_ms, 250);
         assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 500);
         assert_eq!(config.runtime.refresh.slot_refresh_millis, 250);
+    }
+
+    #[test]
+    fn default_submit_and_jito_config_are_fail_fast() {
+        let config = BotConfig::default();
+
+        assert_eq!(config.submit.worker_count, 2);
+        assert_eq!(config.submit.queue_capacity, 8);
+        assert_eq!(config.submit.congestion_threshold_pct, 50);
+        assert_eq!(
+            config.submit.single_transaction_policy,
+            SingleTransactionSubmitPolicyConfig::JitoOnly
+        );
+        assert_eq!(config.jito.request_timeout_ms, 400);
+        assert_eq!(config.jito.retry_attempts, 1);
+        assert_eq!(config.jito.retry_backoff_ms, 0);
+        assert!(!config.rpc_submit.enabled);
+        assert_eq!(config.rpc_submit.request_timeout_ms, 250);
+    }
+
+    #[test]
+    fn ultra_fast_shredstream_profile_uses_lighter_refresh_budget() {
+        let mut config = BotConfig::default();
+        config.runtime.profile = RuntimeProfileConfig::UltraFast;
+        config.runtime.event_source.mode = EventSourceMode::Shredstream;
+        config.apply_runtime_profile_defaults();
+
+        assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 5_000);
+        assert_eq!(config.runtime.refresh.slot_refresh_millis, 0);
+        assert_eq!(config.runtime.refresh.alt_refresh_millis, 0);
+        assert_eq!(config.runtime.refresh.wallet_refresh_millis, 0);
+        assert_eq!(
+            config.shredstream.reducers.raydium_simple_pool,
+            ReducerRolloutMode::Active
+        );
+        assert_eq!(
+            config.shredstream.reducers.orca_whirlpool,
+            ReducerRolloutMode::Active
+        );
+        assert_eq!(
+            config.shredstream.reducers.raydium_clmm,
+            ReducerRolloutMode::Active
+        );
+    }
+
+    #[test]
+    fn ultra_fast_shredstream_profile_preserves_explicit_disabled_reducers() {
+        let mut config = BotConfig::default();
+        config.runtime.profile = RuntimeProfileConfig::UltraFast;
+        config.runtime.event_source.mode = EventSourceMode::Shredstream;
+        config.shredstream.reducers.raydium_simple_pool = ReducerRolloutMode::Disabled;
+        config.shredstream.reducers.orca_whirlpool = ReducerRolloutMode::Disabled;
+        config.shredstream.reducers.raydium_clmm = ReducerRolloutMode::Disabled;
+
+        config.apply_runtime_profile_defaults();
+
+        assert_eq!(
+            config.shredstream.reducers.raydium_simple_pool,
+            ReducerRolloutMode::Disabled
+        );
+        assert_eq!(
+            config.shredstream.reducers.orca_whirlpool,
+            ReducerRolloutMode::Disabled
+        );
+        assert_eq!(
+            config.shredstream.reducers.raydium_clmm,
+            ReducerRolloutMode::Disabled
+        );
+    }
+
+    #[test]
+    fn live_reducer_defaults_are_active() {
+        let reducers = super::LiveReducerConfig::default();
+
+        assert_eq!(reducers.orca_simple_pool, ReducerRolloutMode::Active);
+        assert_eq!(reducers.raydium_simple_pool, ReducerRolloutMode::Active);
+        assert_eq!(reducers.orca_whirlpool, ReducerRolloutMode::Active);
+        assert_eq!(reducers.raydium_clmm, ReducerRolloutMode::Active);
     }
 
     #[test]
@@ -954,6 +1119,11 @@ default_jito_tip_lamports = 5000
         );
         assert_eq!(loaded.shredstream.grpc_endpoint, "http://127.0.0.1:50051");
         assert_eq!(loaded.signing.owner_pubkey, "owner-pubkey");
+        assert_eq!(
+            loaded.submit.single_transaction_policy,
+            SingleTransactionSubmitPolicyConfig::LeaderAware
+        );
+        assert!(loaded.rpc_submit.enabled);
         assert_eq!(loaded.routes.definitions.len(), 1);
         assert_eq!(loaded.routes.definitions[0].route_id, "route-a");
 
@@ -982,8 +1152,13 @@ default_jito_tip_lamports = 5000
             ReducerRolloutMode::Active
         );
         assert_eq!(
+            loaded.submit.single_transaction_policy,
+            SingleTransactionSubmitPolicyConfig::LeaderAware
+        );
+        assert!(loaded.rpc_submit.enabled);
+        assert_eq!(
             loaded.shredstream.reducers.orca_simple_pool,
-            ReducerRolloutMode::Disabled
+            ReducerRolloutMode::Active
         );
         assert_eq!(
             loaded.signing.owner_pubkey,

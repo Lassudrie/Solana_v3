@@ -90,6 +90,15 @@ pub enum QuoteError {
     ExecutionCostNotConvertible,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConcentratedSwapState {
+    pub sqrt_price_x64: u128,
+    pub liquidity: u128,
+    pub current_tick_index: i32,
+    pub input_amount: u64,
+    pub output_amount: u64,
+}
+
 pub trait QuoteEngine: Send + Sync {
     fn quote<'a>(
         &self,
@@ -454,16 +463,22 @@ fn apply_concentrated_price(
     })
 }
 
-fn simulate_concentrated_exact_input(
-    snapshot: &PoolSnapshot,
+pub fn apply_concentrated_exact_input_update(
+    venue: PoolVenue,
     model: &ConcentratedQuoteModel,
     direction: &DirectionalConcentratedQuoteModel,
     a_to_b: bool,
     input_amount: u64,
     fee_bps: u16,
-) -> Result<u64, QuoteError> {
+) -> Result<ConcentratedSwapState, QuoteError> {
     if input_amount == 0 {
-        return Ok(0);
+        return Ok(ConcentratedSwapState {
+            sqrt_price_x64: model.sqrt_price_x64,
+            liquidity: model.liquidity,
+            current_tick_index: model.current_tick_index,
+            input_amount: 0,
+            output_amount: 0,
+        });
     }
 
     let mut amount_remaining = input_amount;
@@ -487,7 +502,18 @@ fn simulate_concentrated_exact_input(
 
     while amount_remaining > 0 {
         iterations = iterations.saturating_add(1);
-        if iterations > 512 {
+        if iterations > 4_096 {
+            eprintln!(
+                "concentrated quote iteration limit exceeded: pool_id={}, venue={:?}, a_to_b={}, input_amount={}, amount_remaining={}, current_tick={}, sqrt_price_x64={}, liquidity={}",
+                model.pool_id.0,
+                Some(venue),
+                a_to_b,
+                input_amount,
+                amount_remaining,
+                current_tick,
+                sqrt_price,
+                liquidity
+            );
             return Err(QuoteError::ArithmeticOverflow);
         }
 
@@ -499,7 +525,7 @@ fn simulate_concentrated_exact_input(
         } else {
             upper_bound_tick
         };
-        let target_price = tick_sqrt_price(snapshot.venue, target_tick)?;
+        let target_price = tick_sqrt_price(Some(venue), target_tick)?;
         if let Some(tick) = next_tick {
             if sqrt_price == target_price {
                 liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
@@ -516,7 +542,26 @@ fn simulate_concentrated_exact_input(
             amount_remaining,
             fee_bps,
             a_to_b,
-        )?;
+        )
+        .map_err(|error| {
+            if matches!(error, QuoteError::ArithmeticOverflow) {
+                eprintln!(
+                    "concentrated quote step overflow: pool_id={}, venue={:?}, a_to_b={}, input_amount={}, amount_remaining={}, current_tick={}, next_tick={:?}, target_tick={}, sqrt_price_x64={}, target_price_x64={}, liquidity={}",
+                    model.pool_id.0,
+                    Some(venue),
+                    a_to_b,
+                    input_amount,
+                    amount_remaining,
+                    current_tick,
+                    next_tick,
+                    target_tick,
+                    sqrt_price,
+                    target_price,
+                    liquidity
+                );
+            }
+            error
+        })?;
         if step.amount_in == 0 && step.fee_amount == 0 && step.amount_out == 0 {
             return Err(QuoteError::InvalidSnapshotLiquidity);
         }
@@ -531,13 +576,39 @@ fn simulate_concentrated_exact_input(
 
         if let Some(tick) = next_tick {
             if step.sqrt_price_next_x64 == target_price {
-                liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
+                liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b).map_err(|error| {
+                    if matches!(error, QuoteError::ArithmeticOverflow) {
+                        eprintln!(
+                            "concentrated quote cross overflow: pool_id={}, venue={:?}, a_to_b={}, tick={}, current_tick={}, liquidity={}",
+                            model.pool_id.0,
+                            Some(venue),
+                            a_to_b,
+                            tick,
+                            current_tick,
+                            liquidity
+                        );
+                    }
+                    error
+                })?;
                 current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
                 continue;
             }
         }
 
-        current_tick = tick_from_sqrt_price(snapshot.venue, sqrt_price)?;
+        current_tick = tick_from_sqrt_price(Some(venue), sqrt_price).map_err(|error| {
+            if matches!(error, QuoteError::ArithmeticOverflow) {
+                eprintln!(
+                    "concentrated quote tick overflow: pool_id={}, venue={:?}, a_to_b={}, sqrt_price_x64={}, liquidity={}, amount_remaining={}",
+                    model.pool_id.0,
+                    Some(venue),
+                    a_to_b,
+                    sqrt_price,
+                    liquidity,
+                    amount_remaining
+                );
+            }
+            error
+        })?;
         if amount_remaining > 0 {
             if a_to_b && current_tick < lower_bound_tick {
                 return Err(QuoteError::ConcentratedWindowExceeded);
@@ -551,7 +622,201 @@ fn simulate_concentrated_exact_input(
         }
     }
 
-    Ok(amount_out_total)
+    Ok(ConcentratedSwapState {
+        sqrt_price_x64: sqrt_price,
+        liquidity,
+        current_tick_index: current_tick,
+        input_amount,
+        output_amount: amount_out_total,
+    })
+}
+
+pub fn apply_concentrated_exact_output_update(
+    venue: PoolVenue,
+    model: &ConcentratedQuoteModel,
+    direction: &DirectionalConcentratedQuoteModel,
+    a_to_b: bool,
+    output_amount: u64,
+    fee_bps: u16,
+) -> Result<ConcentratedSwapState, QuoteError> {
+    if output_amount == 0 {
+        return Ok(ConcentratedSwapState {
+            sqrt_price_x64: model.sqrt_price_x64,
+            liquidity: model.liquidity,
+            current_tick_index: model.current_tick_index,
+            input_amount: 0,
+            output_amount: 0,
+        });
+    }
+
+    let mut amount_remaining = output_amount;
+    let mut amount_in_total = 0u64;
+    let mut sqrt_price = model.sqrt_price_x64;
+    let mut liquidity = model.liquidity;
+    let mut current_tick = model.current_tick_index;
+    let mut iterations = 0usize;
+    let lower_bound_tick = direction
+        .windows
+        .iter()
+        .map(|window| window.start_tick_index)
+        .min()
+        .ok_or(QuoteError::QuoteModelNotExecutable)?;
+    let upper_bound_tick = direction
+        .windows
+        .iter()
+        .map(|window| window.end_tick_index)
+        .max()
+        .ok_or(QuoteError::QuoteModelNotExecutable)?;
+
+    while amount_remaining > 0 {
+        iterations = iterations.saturating_add(1);
+        if iterations > 4_096 {
+            eprintln!(
+                "concentrated exact-out iteration limit exceeded: pool_id={}, venue={:?}, a_to_b={}, output_amount={}, amount_remaining={}, current_tick={}, sqrt_price_x64={}, liquidity={}",
+                model.pool_id.0,
+                Some(venue),
+                a_to_b,
+                output_amount,
+                amount_remaining,
+                current_tick,
+                sqrt_price,
+                liquidity
+            );
+            return Err(QuoteError::ArithmeticOverflow);
+        }
+
+        let next_tick = next_initialized_tick(direction, current_tick, a_to_b);
+        let target_tick = if let Some(tick) = next_tick {
+            tick
+        } else if a_to_b {
+            lower_bound_tick
+        } else {
+            upper_bound_tick
+        };
+        let target_price = tick_sqrt_price(Some(venue), target_tick)?;
+        if let Some(tick) = next_tick {
+            if sqrt_price == target_price {
+                liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
+                current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                continue;
+            }
+        } else if sqrt_price == target_price {
+            return Err(QuoteError::ConcentratedWindowExceeded);
+        }
+
+        let step = compute_concentrated_swap_step_exact_output(
+            sqrt_price,
+            target_price,
+            liquidity,
+            amount_remaining,
+            fee_bps,
+            a_to_b,
+        )
+        .map_err(|error| {
+            if matches!(error, QuoteError::ArithmeticOverflow) {
+                eprintln!(
+                    "concentrated exact-out step overflow: pool_id={}, venue={:?}, a_to_b={}, output_amount={}, amount_remaining={}, current_tick={}, next_tick={:?}, target_tick={}, sqrt_price_x64={}, target_price_x64={}, liquidity={}",
+                    model.pool_id.0,
+                    Some(venue),
+                    a_to_b,
+                    output_amount,
+                    amount_remaining,
+                    current_tick,
+                    next_tick,
+                    target_tick,
+                    sqrt_price,
+                    target_price,
+                    liquidity
+                );
+            }
+            error
+        })?;
+        if step.amount_in == 0 && step.fee_amount == 0 && step.amount_out == 0 {
+            return Err(QuoteError::InvalidSnapshotLiquidity);
+        }
+
+        amount_remaining = amount_remaining
+            .checked_sub(step.amount_out)
+            .ok_or(QuoteError::ArithmeticOverflow)?;
+        amount_in_total = amount_in_total
+            .checked_add(step.amount_in.saturating_add(step.fee_amount))
+            .ok_or(QuoteError::ArithmeticOverflow)?;
+        sqrt_price = step.sqrt_price_next_x64;
+
+        if let Some(tick) = next_tick {
+            if step.sqrt_price_next_x64 == target_price {
+                liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b).map_err(|error| {
+                    if matches!(error, QuoteError::ArithmeticOverflow) {
+                        eprintln!(
+                            "concentrated exact-out cross overflow: pool_id={}, venue={:?}, a_to_b={}, tick={}, current_tick={}, liquidity={}",
+                            model.pool_id.0,
+                            Some(venue),
+                            a_to_b,
+                            tick,
+                            current_tick,
+                            liquidity
+                        );
+                    }
+                    error
+                })?;
+                current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                continue;
+            }
+        }
+
+        current_tick = tick_from_sqrt_price(Some(venue), sqrt_price).map_err(|error| {
+            if matches!(error, QuoteError::ArithmeticOverflow) {
+                eprintln!(
+                    "concentrated exact-out tick overflow: pool_id={}, venue={:?}, a_to_b={}, sqrt_price_x64={}, liquidity={}, amount_remaining={}",
+                    model.pool_id.0,
+                    Some(venue),
+                    a_to_b,
+                    sqrt_price,
+                    liquidity,
+                    amount_remaining
+                );
+            }
+            error
+        })?;
+        if amount_remaining > 0 {
+            if a_to_b && current_tick < lower_bound_tick {
+                return Err(QuoteError::ConcentratedWindowExceeded);
+            }
+            if !a_to_b && current_tick > upper_bound_tick {
+                return Err(QuoteError::ConcentratedWindowExceeded);
+            }
+        }
+        if next_tick.is_none() && amount_remaining > 0 {
+            return Err(QuoteError::ConcentratedWindowExceeded);
+        }
+    }
+
+    Ok(ConcentratedSwapState {
+        sqrt_price_x64: sqrt_price,
+        liquidity,
+        current_tick_index: current_tick,
+        input_amount: amount_in_total,
+        output_amount,
+    })
+}
+
+fn simulate_concentrated_exact_input(
+    snapshot: &PoolSnapshot,
+    model: &ConcentratedQuoteModel,
+    direction: &DirectionalConcentratedQuoteModel,
+    a_to_b: bool,
+    input_amount: u64,
+    fee_bps: u16,
+) -> Result<u64, QuoteError> {
+    apply_concentrated_exact_input_update(
+        snapshot.venue.ok_or(QuoteError::InvalidSnapshotPrice)?,
+        model,
+        direction,
+        a_to_b,
+        input_amount,
+        fee_bps,
+    )
+    .map(|state| state.output_amount)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -580,13 +845,13 @@ fn compute_concentrated_swap_step(
         fee_denominator.saturating_sub(u64::from(fee_bps)),
         fee_denominator,
     )?;
-    let amount_in_max = amount_in_between_prices(
+    let amount_in_max = amount_in_between_prices_u256(
         sqrt_price_current_x64,
         sqrt_price_target_x64,
         liquidity,
         a_to_b,
     )?;
-    let sqrt_price_next_x64 = if amount_remaining_less_fee >= amount_in_max {
+    let sqrt_price_next_x64 = if U256::from(amount_remaining_less_fee) >= amount_in_max {
         sqrt_price_target_x64
     } else {
         next_sqrt_price_from_input(
@@ -629,21 +894,85 @@ fn compute_concentrated_swap_step(
     })
 }
 
+fn compute_concentrated_swap_step_exact_output(
+    sqrt_price_current_x64: u128,
+    sqrt_price_target_x64: u128,
+    liquidity: u128,
+    amount_remaining: u64,
+    fee_bps: u16,
+    a_to_b: bool,
+) -> Result<ConcentratedSwapStep, QuoteError> {
+    let fee_denominator = 10_000u64;
+    if fee_bps >= fee_denominator as u16 {
+        return Err(QuoteError::InvalidSnapshotLiquidity);
+    }
+
+    let amount_out_max = amount_out_between_prices(
+        sqrt_price_current_x64,
+        sqrt_price_target_x64,
+        liquidity,
+        a_to_b,
+    )?;
+    let sqrt_price_next_x64 = if amount_remaining >= amount_out_max {
+        sqrt_price_target_x64
+    } else {
+        next_sqrt_price_from_output(sqrt_price_current_x64, liquidity, amount_remaining, a_to_b)?
+    };
+    let amount_out = amount_out_between_prices(
+        sqrt_price_current_x64,
+        sqrt_price_next_x64,
+        liquidity,
+        a_to_b,
+    )?;
+    let amount_in = amount_in_between_prices(
+        sqrt_price_current_x64,
+        sqrt_price_next_x64,
+        liquidity,
+        a_to_b,
+    )?;
+    let fee_amount = mul_div_ceil_u64(
+        amount_in,
+        u64::from(fee_bps),
+        fee_denominator.saturating_sub(u64::from(fee_bps)),
+    )?;
+
+    Ok(ConcentratedSwapStep {
+        sqrt_price_next_x64,
+        amount_in,
+        amount_out,
+        fee_amount,
+    })
+}
+
 fn amount_in_between_prices(
     sqrt_price_current_x64: u128,
     sqrt_price_target_x64: u128,
     liquidity: u128,
     a_to_b: bool,
 ) -> Result<u64, QuoteError> {
+    u256_to_u64(amount_in_between_prices_u256(
+        sqrt_price_current_x64,
+        sqrt_price_target_x64,
+        liquidity,
+        a_to_b,
+    )?)
+}
+
+fn amount_in_between_prices_u256(
+    sqrt_price_current_x64: u128,
+    sqrt_price_target_x64: u128,
+    liquidity: u128,
+    a_to_b: bool,
+) -> Result<U256, QuoteError> {
     if a_to_b {
-        delta_amount_0(
+        delta_amount_0_u256(
             sqrt_price_target_x64,
             sqrt_price_current_x64,
             liquidity,
             true,
         )
     } else {
-        delta_amount_1(
+        delta_amount_1_u256(
             sqrt_price_current_x64,
             sqrt_price_target_x64,
             liquidity,
@@ -685,6 +1014,19 @@ fn next_sqrt_price_from_input(
         next_sqrt_price_from_amount_0_rounding_up(sqrt_price_x64, liquidity, amount_in, true)
     } else {
         next_sqrt_price_from_amount_1_rounding_down(sqrt_price_x64, liquidity, amount_in, true)
+    }
+}
+
+fn next_sqrt_price_from_output(
+    sqrt_price_x64: u128,
+    liquidity: u128,
+    amount_out: u64,
+    a_to_b: bool,
+) -> Result<u128, QuoteError> {
+    if a_to_b {
+        next_sqrt_price_from_amount_1_rounding_down(sqrt_price_x64, liquidity, amount_out, false)
+    } else {
+        next_sqrt_price_from_amount_0_rounding_up(sqrt_price_x64, liquidity, amount_out, false)
     }
 }
 
@@ -760,22 +1102,12 @@ fn delta_amount_0(
     liquidity: u128,
     round_up: bool,
 ) -> Result<u64, QuoteError> {
-    let (lower, upper) = increasing_price_order(sqrt_ratio_a_x64, sqrt_ratio_b_x64);
-    let numerator_1 = U256::from(liquidity) << 64;
-    let numerator_2 = U256::from(upper.saturating_sub(lower));
-    let intermediate = if round_up {
-        mul_div_ceil_u256(numerator_1, numerator_2, U256::from(upper))?
-    } else {
-        mul_div_floor_u256(numerator_1, numerator_2, U256::from(upper))?
-    };
-    let result = if round_up {
-        div_rounding_up_u256(intermediate, U256::from(lower))?
-    } else {
-        intermediate
-            .checked_div(U256::from(lower))
-            .ok_or(QuoteError::ArithmeticOverflow)?
-    };
-    u256_to_u64(result)
+    u256_to_u64(delta_amount_0_u256(
+        sqrt_ratio_a_x64,
+        sqrt_ratio_b_x64,
+        liquidity,
+        round_up,
+    )?)
 }
 
 fn delta_amount_1(
@@ -784,21 +1116,57 @@ fn delta_amount_1(
     liquidity: u128,
     round_up: bool,
 ) -> Result<u64, QuoteError> {
+    u256_to_u64(delta_amount_1_u256(
+        sqrt_ratio_a_x64,
+        sqrt_ratio_b_x64,
+        liquidity,
+        round_up,
+    )?)
+}
+
+fn delta_amount_0_u256(
+    sqrt_ratio_a_x64: u128,
+    sqrt_ratio_b_x64: u128,
+    liquidity: u128,
+    round_up: bool,
+) -> Result<U256, QuoteError> {
     let (lower, upper) = increasing_price_order(sqrt_ratio_a_x64, sqrt_ratio_b_x64);
-    let result = if round_up {
-        mul_div_ceil_u256(
-            U256::from(liquidity),
-            U256::from(upper.saturating_sub(lower)),
-            U256::from(1u128 << 64),
-        )?
+    let numerator_1 = U256::from(liquidity) << 64;
+    let numerator_2 = U256::from(upper.saturating_sub(lower));
+    let intermediate = if round_up {
+        mul_div_ceil_u256(numerator_1, numerator_2, U256::from(upper))?
     } else {
-        mul_div_floor_u256(
+        mul_div_floor_u256(numerator_1, numerator_2, U256::from(upper))?
+    };
+    if round_up {
+        div_rounding_up_u256(intermediate, U256::from(lower))
+    } else {
+        intermediate
+            .checked_div(U256::from(lower))
+            .ok_or(QuoteError::ArithmeticOverflow)
+    }
+}
+
+fn delta_amount_1_u256(
+    sqrt_ratio_a_x64: u128,
+    sqrt_ratio_b_x64: u128,
+    liquidity: u128,
+    round_up: bool,
+) -> Result<U256, QuoteError> {
+    let (lower, upper) = increasing_price_order(sqrt_ratio_a_x64, sqrt_ratio_b_x64);
+    if round_up {
+        Ok(mul_div_ceil_u256(
             U256::from(liquidity),
             U256::from(upper.saturating_sub(lower)),
             U256::from(1u128 << 64),
-        )?
-    };
-    u256_to_u64(result)
+        )?)
+    } else {
+        Ok(mul_div_floor_u256(
+            U256::from(liquidity),
+            U256::from(upper.saturating_sub(lower)),
+            U256::from(1u128 << 64),
+        )?)
+    }
 }
 
 fn apply_tick_cross(
@@ -876,6 +1244,10 @@ fn orca_sqrt_price_at_tick(tick: i32) -> u128 {
         let product = U256::from(left).saturating_mul(U256::from(right));
         (product >> 96).low_u128()
     };
+    const MUL_SHIFT_64: fn(u128, u128) -> u128 = |left, right| {
+        let product = U256::from(left).saturating_mul(U256::from(right));
+        (product >> 64).low_u128()
+    };
     if tick >= 0 {
         let mut ratio = if tick & 1 != 0 {
             79_232_123_823_359_799_118_286_999_567u128
@@ -945,58 +1317,58 @@ fn orca_sqrt_price_at_tick(tick: i32) -> u128 {
             18_446_744_073_709_551_616u128
         };
         if abs_tick & 2 != 0 {
-            ratio = (ratio * 18_444_899_583_751_176_498) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_444_899_583_751_176_498);
         }
         if abs_tick & 4 != 0 {
-            ratio = (ratio * 18_443_055_278_223_354_162) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_443_055_278_223_354_162);
         }
         if abs_tick & 8 != 0 {
-            ratio = (ratio * 18_439_367_220_385_604_838) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_439_367_220_385_604_838);
         }
         if abs_tick & 16 != 0 {
-            ratio = (ratio * 18_431_993_317_065_449_817) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_431_993_317_065_449_817);
         }
         if abs_tick & 32 != 0 {
-            ratio = (ratio * 18_417_254_355_718_160_513) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_417_254_355_718_160_513);
         }
         if abs_tick & 64 != 0 {
-            ratio = (ratio * 18_387_811_781_193_591_352) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_387_811_781_193_591_352);
         }
         if abs_tick & 128 != 0 {
-            ratio = (ratio * 18_329_067_761_203_520_168) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_329_067_761_203_520_168);
         }
         if abs_tick & 256 != 0 {
-            ratio = (ratio * 18_212_142_134_806_087_854) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 18_212_142_134_806_087_854);
         }
         if abs_tick & 512 != 0 {
-            ratio = (ratio * 17_980_523_815_641_551_639) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 17_980_523_815_641_551_639);
         }
         if abs_tick & 1024 != 0 {
-            ratio = (ratio * 17_526_086_738_831_147_013) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 17_526_086_738_831_147_013);
         }
         if abs_tick & 2048 != 0 {
-            ratio = (ratio * 16_651_378_430_235_024_244) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 16_651_378_430_235_024_244);
         }
         if abs_tick & 4096 != 0 {
-            ratio = (ratio * 15_030_750_278_693_429_944) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 15_030_750_278_693_429_944);
         }
         if abs_tick & 8192 != 0 {
-            ratio = (ratio * 12_247_334_978_882_834_399) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 12_247_334_978_882_834_399);
         }
         if abs_tick & 16_384 != 0 {
-            ratio = (ratio * 8_131_365_268_884_726_200) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 8_131_365_268_884_726_200);
         }
         if abs_tick & 32_768 != 0 {
-            ratio = (ratio * 3_584_323_654_723_342_297) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 3_584_323_654_723_342_297);
         }
         if abs_tick & 65_536 != 0 {
-            ratio = (ratio * 696_457_651_847_595_233) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 696_457_651_847_595_233);
         }
         if abs_tick & 131_072 != 0 {
-            ratio = (ratio * 26_294_789_957_452_057) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 26_294_789_957_452_057);
         }
         if abs_tick & 262_144 != 0 {
-            ratio = (ratio * 37_481_735_321_082) >> 64;
+            ratio = MUL_SHIFT_64(ratio, 37_481_735_321_082);
         }
         ratio
     }
@@ -1189,7 +1561,11 @@ mod tests {
     };
 
     use crate::{
-        quote::{QuoteError, RouteQuote, SOL_MINT, apply_concentrated_price},
+        quote::{
+            QuoteError, RouteQuote, SOL_MINT, amount_in_between_prices_u256,
+            apply_concentrated_price, compute_concentrated_swap_step, orca_sqrt_price_at_tick,
+            orca_tick_from_sqrt_price,
+        },
         route_registry::{RouteDefinition, RouteLeg, SwapSide},
     };
 
@@ -1459,5 +1835,36 @@ mod tests {
 
         assert!(priced.gross_output >= priced.net_output);
         assert!(priced.net_output > 0);
+    }
+
+    #[test]
+    fn orca_negative_tick_sqrt_price_round_trips_large_ticks() {
+        for tick in [-1, -32, -1_024, -100_000, -221_818] {
+            let sqrt_price = orca_sqrt_price_at_tick(tick);
+            assert_eq!(orca_tick_from_sqrt_price(sqrt_price), tick);
+        }
+    }
+
+    #[test]
+    fn concentrated_swap_step_handles_amount_in_max_above_u64() {
+        let amount_in_max =
+            amount_in_between_prices_u256(1u128 << 64, 2u128 << 64, u128::MAX / 8, false)
+                .expect("amount-in-max should be representable in U256");
+        assert!(amount_in_max > u64::MAX.into());
+
+        let step = compute_concentrated_swap_step(
+            1u128 << 64,
+            2u128 << 64,
+            u128::MAX / 8,
+            1_000_000,
+            30,
+            false,
+        )
+        .expect("step should cap against a huge amount-in-max without overflowing");
+
+        assert_eq!(step.sqrt_price_next_x64, 1u128 << 64);
+        assert_eq!(step.amount_in, 0);
+        assert_eq!(step.amount_out, 0);
+        assert_eq!(step.fee_amount, 1_000_000);
     }
 }

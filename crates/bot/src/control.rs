@@ -45,6 +45,11 @@ pub enum RuntimeIssue {
         slot_lag: u64,
         maximum: u64,
     },
+    ExecutionPathCongested {
+        pending: usize,
+        capacity: usize,
+        workers: usize,
+    },
     SubmitPathCongested {
         pending: usize,
         capacity: usize,

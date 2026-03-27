@@ -19,6 +19,10 @@ impl TelemetryStack {
     }
 
     pub fn log(&self, level: LogLevel, target: &str, message: impl Into<String>) {
+        if !self.logs.enabled(level) {
+            return;
+        }
+
         self.logs.emit(StructuredLogEvent {
             level,
             target: target.into(),
