@@ -339,7 +339,7 @@ mod tests {
     };
     use domain::{
         EventSourceKind, ExecutionStateSnapshot, NormalizedEvent, PoolId, PoolSnapshotUpdate,
-        RouteId, SnapshotConfidence,
+        PoolVenue, RouteId, SnapshotConfidence,
     };
     use state::StatePlane;
 
@@ -502,6 +502,7 @@ mod tests {
                         reserve_b: Some(10_000_000),
                         active_liquidity: Some(10_000_000),
                         sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
                         confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "SOL".into(),
@@ -570,6 +571,7 @@ mod tests {
                         reserve_b: Some(10_000_000),
                         active_liquidity: Some(10_000_000),
                         sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
                         confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "SOL".into(),
@@ -630,6 +632,7 @@ mod tests {
                         reserve_b: Some(10_000_000),
                         active_liquidity: Some(10_000_000),
                         sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
                         confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "SOL".into(),

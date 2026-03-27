@@ -1157,12 +1157,15 @@ fn u256_to_u128(value: U256) -> Result<u128, QuoteError> {
 mod tests {
     use std::time::SystemTime;
 
+    use domain::quote_models::{
+        ConcentratedQuoteModel, DirectionalConcentratedQuoteModel, TickArrayWindow,
+    };
     use state::types::{
-        FreshnessState, LiquidityModel, PoolConfidence, PoolId, PoolSnapshot, RouteId,
+        FreshnessState, LiquidityModel, PoolConfidence, PoolId, PoolSnapshot, PoolVenue, RouteId,
     };
 
     use crate::{
-        quote::{QuoteError, RouteQuote, SOL_MINT},
+        quote::{QuoteError, RouteQuote, SOL_MINT, apply_concentrated_price},
         route_registry::{RouteDefinition, RouteLeg, SwapSide},
     };
 
@@ -1264,6 +1267,58 @@ mod tests {
         }
     }
 
+    fn concentrated_snapshot(venue: Option<PoolVenue>) -> PoolSnapshot {
+        let liquidity_model = LiquidityModel::ConcentratedLiquidity;
+        PoolSnapshot {
+            pool_id: PoolId("pool-clmm".into()),
+            price_bps: 10_000,
+            fee_bps: 30,
+            reserve_depth: 1_000_000,
+            reserve_a: None,
+            reserve_b: None,
+            active_liquidity: 1_000_000,
+            sqrt_price_x64: Some(1u128 << 64),
+            venue,
+            confidence: PoolConfidence::Executable,
+            repair_pending: false,
+            liquidity_model,
+            slippage_factor_bps: PoolSnapshot::default_slippage_factor_bps(liquidity_model, 64),
+            token_mint_a: "SOL".into(),
+            token_mint_b: "USDC".into(),
+            tick_spacing: 64,
+            current_tick_index: Some(0),
+            last_update_slot: 1,
+            derived_at: SystemTime::now(),
+            freshness: FreshnessState::at(1, 1, 1),
+        }
+    }
+
+    fn concentrated_model() -> ConcentratedQuoteModel {
+        ConcentratedQuoteModel {
+            pool_id: PoolId("pool-clmm".into()),
+            liquidity: 1_000_000,
+            sqrt_price_x64: 1u128 << 64,
+            current_tick_index: 0,
+            tick_spacing: 64,
+            required_a_to_b: true,
+            required_b_to_a: false,
+            a_to_b: Some(DirectionalConcentratedQuoteModel {
+                loaded_tick_arrays: 1,
+                expected_tick_arrays: 1,
+                complete: true,
+                windows: vec![TickArrayWindow {
+                    start_tick_index: -64,
+                    end_tick_index: 0,
+                    initialized_tick_count: 0,
+                }],
+                initialized_ticks: Vec::new(),
+            }),
+            b_to_a: None,
+            last_update_slot: 1,
+            write_version: 1,
+        }
+    }
+
     #[test]
     fn execution_cost_in_sol_quote_atoms_is_identity_for_sol_routes() {
         let route = route_definition("JTO", SOL_MINT, None);
@@ -1320,5 +1375,22 @@ mod tests {
             invalid,
             Err(QuoteError::ExecutionCostNotConvertible)
         ));
+    }
+
+    #[test]
+    fn concentrated_quote_uses_snapshot_venue_for_tick_math() {
+        let model = concentrated_model();
+        let missing_venue = concentrated_snapshot(None);
+        let with_venue = concentrated_snapshot(Some(PoolVenue::OrcaWhirlpool));
+
+        assert!(matches!(
+            apply_concentrated_price(&missing_venue, Some(&model), "SOL", "USDC", 1_000, 30),
+            Err(QuoteError::InvalidSnapshotPrice)
+        ));
+
+        let priced = apply_concentrated_price(&with_venue, Some(&model), "SOL", "USDC", 1_000, 30)
+            .expect("whirlpool venue should unlock concentrated tick math");
+        assert!(priced.gross_output >= priced.net_output);
+        assert!(priced.net_output > 0);
     }
 }

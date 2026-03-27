@@ -124,8 +124,8 @@ impl StrategyPlane {
 #[cfg(test)]
 mod tests {
     use domain::{
-        EventSourceKind, ExecutionSnapshot, NormalizedEvent, PoolId, PoolSnapshotUpdate, RouteId,
-        SnapshotConfidence,
+        EventSourceKind, ExecutionSnapshot, NormalizedEvent, PoolId, PoolSnapshotUpdate, PoolVenue,
+        RouteId, SnapshotConfidence,
     };
 
     use super::{
@@ -219,6 +219,7 @@ mod tests {
                     reserve_b: Some(reserve_b),
                     active_liquidity: Some(reserve_a.min(reserve_b)),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: SOL_MINT.into(),
@@ -380,6 +381,7 @@ mod tests {
                     reserve_b: Some(100_000),
                     active_liquidity: Some(100_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Verified,
                     repair_pending: Some(true),
                     token_mint_a: "SOL".into(),
@@ -405,6 +407,7 @@ mod tests {
                     reserve_b: Some(100_000),
                     active_liquidity: Some(100_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: "SOL".into(),
@@ -456,6 +459,7 @@ mod tests {
                     reserve_b: Some(100_000),
                     active_liquidity: Some(100_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Verified,
                     repair_pending: Some(false),
                     token_mint_a: "SOL".into(),
@@ -481,6 +485,7 @@ mod tests {
                     reserve_b: Some(100_000),
                     active_liquidity: Some(100_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: "SOL".into(),
@@ -532,6 +537,7 @@ mod tests {
                     reserve_b: None,
                     active_liquidity: Some(100_000),
                     sqrt_price_x64: Some(1u128 << 64),
+                    venue: PoolVenue::OrcaWhirlpool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: SOL_MINT.into(),
@@ -557,6 +563,7 @@ mod tests {
                     reserve_b: Some(100_000),
                     active_liquidity: Some(100_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: SOL_MINT.into(),

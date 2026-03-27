@@ -2,6 +2,8 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::PoolVenue;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSourceKind {
     ShredStream,
@@ -58,6 +60,7 @@ pub struct PoolSnapshotUpdate {
     pub reserve_b: Option<u64>,
     pub active_liquidity: Option<u64>,
     pub sqrt_price_x64: Option<u128>,
+    pub venue: PoolVenue,
     pub confidence: SnapshotConfidence,
     pub repair_pending: Option<bool>,
     pub token_mint_a: String,

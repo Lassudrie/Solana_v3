@@ -138,7 +138,7 @@ impl StatePlane {
         &self,
         pool_id: &PoolId,
     ) -> Option<&crate::quote_models::ConcentratedQuoteModel> {
-        self.concentrated_quote_models.get(pool_id)
+        self.aligned_concentrated_quote_model(pool_id)
     }
 
     pub fn route_state(&self, route_id: &crate::types::RouteId) -> crate::types::RouteState {
@@ -152,12 +152,28 @@ impl StatePlane {
         match snapshot.liquidity_model {
             LiquidityModel::ConstantProduct => true,
             LiquidityModel::ConcentratedLiquidity => self
-                .concentrated_quote_models
-                .get(pool_id)
+                .aligned_concentrated_quote_model(pool_id)
                 .map(|model| model.has_required_directions())
                 .unwrap_or(false),
             LiquidityModel::Unknown => false,
         }
+    }
+
+    fn aligned_concentrated_quote_model(
+        &self,
+        pool_id: &PoolId,
+    ) -> Option<&crate::quote_models::ConcentratedQuoteModel> {
+        let snapshot = self.pool_snapshots.get(pool_id)?;
+        if snapshot.liquidity_model != LiquidityModel::ConcentratedLiquidity {
+            return None;
+        }
+        let (snapshot_slot, snapshot_write_version) = self.pool_snapshots.version(pool_id)?;
+        let model = self.concentrated_quote_models.get(pool_id)?;
+        if model.last_update_slot != snapshot_slot || model.write_version != snapshot_write_version
+        {
+            return None;
+        }
+        Some(model)
     }
 
     fn route_is_tradable(&self, route_id: &crate::types::RouteId) -> bool {
@@ -269,6 +285,7 @@ impl StatePlane {
     ) -> Result<Option<StateApplyOutcome>, StateError> {
         self.latest_slot = self.latest_slot.max(update.slot);
         let pool_id = crate::types::PoolId(update.pool_id.clone());
+        let liquidity_model = update.venue.liquidity_model();
         let snapshot = crate::types::PoolSnapshot {
             pool_id: pool_id.clone(),
             price_bps: update.price_bps,
@@ -278,24 +295,16 @@ impl StatePlane {
             reserve_b: update.reserve_b,
             active_liquidity: update.active_liquidity.unwrap_or(update.reserve_depth),
             sqrt_price_x64: update.sqrt_price_x64,
-            venue: None,
+            venue: Some(update.venue),
             confidence: match update.confidence {
                 SnapshotConfidence::Decoded => PoolConfidence::Decoded,
                 SnapshotConfidence::Verified => PoolConfidence::Verified,
                 SnapshotConfidence::Executable => PoolConfidence::Executable,
             },
             repair_pending: update.repair_pending.unwrap_or(false),
-            liquidity_model: LiquidityModel::from_market_hints(
-                update.tick_spacing,
-                update.current_tick_index,
-                update.sqrt_price_x64,
-            ),
+            liquidity_model,
             slippage_factor_bps: crate::types::PoolSnapshot::default_slippage_factor_bps(
-                LiquidityModel::from_market_hints(
-                    update.tick_spacing,
-                    update.current_tick_index,
-                    update.sqrt_price_x64,
-                ),
+                liquidity_model,
                 update.tick_spacing,
             ),
             token_mint_a: update.token_mint_a.clone(),
@@ -388,6 +397,7 @@ impl StatePlane {
         let impacted_pools = vec![pool_id.clone()];
         self.pool_snapshots
             .invalidate(&pool_id, self.latest_slot, self.max_slot_lag);
+        self.concentrated_quote_models.remove(&pool_id);
         self.state_outcome(AccountUpdateStatus::Applied, impacted_pools)
     }
 
@@ -417,8 +427,9 @@ impl StatePlane {
 #[cfg(test)]
 mod tests {
     use domain::{
-        AccountUpdate, EventSourceKind, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
-        SnapshotConfidence,
+        AccountUpdate, DirectionalPoolQuoteModelUpdate, EventSourceKind, InitializedTickUpdate,
+        NormalizedEvent, PoolInvalidation, PoolQuoteModelUpdate, PoolSnapshotUpdate, PoolVenue,
+        SnapshotConfidence, TickArrayWindowUpdate,
     };
 
     use super::StatePlane;
@@ -433,6 +444,110 @@ mod tests {
         data.extend_from_slice(&fee_bps.to_le_bytes());
         data.extend_from_slice(&reserve_depth.to_le_bytes());
         data
+    }
+
+    fn concentrated_snapshot_event(
+        sequence: u64,
+        pool_id: &PoolId,
+        slot: u64,
+        write_version: u64,
+    ) -> NormalizedEvent {
+        NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::ShredStream,
+            sequence,
+            slot,
+            PoolSnapshotUpdate {
+                pool_id: pool_id.0.clone(),
+                price_bps: 10_000,
+                fee_bps: 30,
+                reserve_depth: 1_000,
+                reserve_a: None,
+                reserve_b: None,
+                active_liquidity: Some(1_000),
+                sqrt_price_x64: Some(1u128 << 64),
+                venue: PoolVenue::OrcaWhirlpool,
+                confidence: SnapshotConfidence::Executable,
+                repair_pending: Some(false),
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                tick_spacing: 64,
+                current_tick_index: Some(0),
+                slot,
+                write_version,
+            },
+        )
+    }
+
+    fn constant_product_snapshot_event(
+        sequence: u64,
+        pool_id: &PoolId,
+        slot: u64,
+        write_version: u64,
+    ) -> NormalizedEvent {
+        NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::ShredStream,
+            sequence,
+            slot,
+            PoolSnapshotUpdate {
+                pool_id: pool_id.0.clone(),
+                price_bps: 10_000,
+                fee_bps: 4,
+                reserve_depth: 1_000,
+                reserve_a: Some(1_000),
+                reserve_b: Some(1_000),
+                active_liquidity: Some(1_000),
+                sqrt_price_x64: None,
+                venue: PoolVenue::OrcaSimplePool,
+                confidence: SnapshotConfidence::Executable,
+                repair_pending: Some(false),
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                tick_spacing: 0,
+                current_tick_index: None,
+                slot,
+                write_version,
+            },
+        )
+    }
+
+    fn quote_model_event(
+        sequence: u64,
+        pool_id: &PoolId,
+        slot: u64,
+        write_version: u64,
+    ) -> NormalizedEvent {
+        NormalizedEvent::pool_quote_model_update(
+            EventSourceKind::ShredStream,
+            sequence,
+            slot,
+            PoolQuoteModelUpdate {
+                pool_id: pool_id.0.clone(),
+                liquidity: 1_000,
+                sqrt_price_x64: 1u128 << 64,
+                current_tick_index: 0,
+                tick_spacing: 64,
+                required_a_to_b: true,
+                required_b_to_a: false,
+                a_to_b: Some(DirectionalPoolQuoteModelUpdate {
+                    loaded_tick_arrays: 1,
+                    expected_tick_arrays: 1,
+                    complete: true,
+                    windows: vec![TickArrayWindowUpdate {
+                        start_tick_index: -64,
+                        end_tick_index: 0,
+                        initialized_tick_count: 1,
+                    }],
+                    initialized_ticks: vec![InitializedTickUpdate {
+                        tick_index: 0,
+                        liquidity_net: 10,
+                        liquidity_gross: 10,
+                    }],
+                }),
+                b_to_a: None,
+                slot,
+                write_version,
+            },
+        )
     }
 
     #[test]
@@ -511,6 +626,7 @@ mod tests {
                 reserve_b: None,
                 active_liquidity: Some(77_000),
                 sqrt_price_x64: None,
+                venue: PoolVenue::OrcaWhirlpool,
                 confidence: SnapshotConfidence::Decoded,
                 repair_pending: None,
                 token_mint_a: "mint-a".into(),
@@ -527,6 +643,10 @@ mod tests {
         assert_eq!(outcome.impacted_pools, vec![pool_id.clone()]);
         assert_eq!(outcome.latest_slot, 55);
         assert_eq!(plane.pool_snapshot(&pool_id).unwrap().price_bps, 10_250);
+        assert_eq!(
+            plane.pool_snapshot(&pool_id).unwrap().venue,
+            Some(PoolVenue::OrcaWhirlpool)
+        );
     }
 
     #[test]
@@ -555,6 +675,7 @@ mod tests {
                     reserve_b: Some(77_000),
                     active_liquidity: Some(77_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Decoded,
                     repair_pending: Some(false),
                     token_mint_a: "So11111111111111111111111111111111111111112".into(),
@@ -589,6 +710,7 @@ mod tests {
                 reserve_b: None,
                 active_liquidity: Some(1_000),
                 sqrt_price_x64: None,
+                venue: PoolVenue::OrcaWhirlpool,
                 confidence: SnapshotConfidence::Decoded,
                 repair_pending: None,
                 token_mint_a: "mint-a".into(),
@@ -615,6 +737,35 @@ mod tests {
     }
 
     #[test]
+    fn pool_invalidation_removes_concentrated_quote_model() {
+        let pool_id = PoolId("pool-clmm".into());
+        let mut plane = StatePlane::new(2);
+
+        plane
+            .apply_event(&concentrated_snapshot_event(1, &pool_id, 10, 1))
+            .unwrap();
+        plane
+            .apply_event(&quote_model_event(2, &pool_id, 10, 1))
+            .unwrap();
+        assert!(plane.pool_has_executable_quote_model(&pool_id));
+        assert!(plane.concentrated_quote_model(&pool_id).is_some());
+
+        plane
+            .apply_event(&NormalizedEvent::pool_invalidation(
+                EventSourceKind::ShredStream,
+                3,
+                10,
+                PoolInvalidation {
+                    pool_id: pool_id.0.clone(),
+                },
+            ))
+            .unwrap();
+
+        assert!(!plane.pool_has_executable_quote_model(&pool_id));
+        assert!(plane.concentrated_quote_model(&pool_id).is_none());
+    }
+
+    #[test]
     fn tradable_route_count_excludes_exact_but_stale_routes() {
         let route_id = RouteId("route-stale".into());
         let pool_a = PoolId("pool-a".into());
@@ -637,6 +788,7 @@ mod tests {
                         reserve_b: Some(1_000),
                         active_liquidity: Some(1_000),
                         sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
                         confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "mint-a".into(),
@@ -689,6 +841,7 @@ mod tests {
                     reserve_b: None,
                     active_liquidity: Some(1_000),
                     sqrt_price_x64: Some(1u128 << 64),
+                    venue: PoolVenue::OrcaWhirlpool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: "mint-a".into(),
@@ -714,6 +867,7 @@ mod tests {
                     reserve_b: Some(1_000),
                     active_liquidity: Some(1_000),
                     sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
                     confidence: SnapshotConfidence::Executable,
                     repair_pending: Some(false),
                     token_mint_a: "mint-a".into(),
@@ -727,5 +881,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(plane.tradable_route_count(), 0);
+    }
+
+    #[test]
+    fn stale_concentrated_quote_model_does_not_match_new_snapshot_version() {
+        let route_id = RouteId("route-clmm".into());
+        let pool_a = PoolId("pool-a".into());
+        let pool_b = PoolId("pool-b".into());
+        let mut plane = StatePlane::new(2);
+        plane.register_route(route_id, vec![pool_a.clone(), pool_b.clone()]);
+
+        plane
+            .apply_event(&concentrated_snapshot_event(1, &pool_a, 10, 1))
+            .unwrap();
+        plane
+            .apply_event(&quote_model_event(2, &pool_a, 10, 1))
+            .unwrap();
+        plane
+            .apply_event(&constant_product_snapshot_event(3, &pool_b, 10, 1))
+            .unwrap();
+
+        assert!(plane.pool_has_executable_quote_model(&pool_a));
+        assert!(plane.concentrated_quote_model(&pool_a).is_some());
+
+        plane
+            .apply_event(&concentrated_snapshot_event(4, &pool_a, 11, 2))
+            .unwrap();
+
+        assert!(!plane.pool_has_executable_quote_model(&pool_a));
+        assert!(plane.concentrated_quote_model(&pool_a).is_none());
+        assert_eq!(plane.tradable_route_count(), 0);
+
+        plane
+            .apply_event(&quote_model_event(5, &pool_a, 11, 2))
+            .unwrap();
+
+        assert!(plane.pool_has_executable_quote_model(&pool_a));
+        assert!(plane.concentrated_quote_model(&pool_a).is_some());
+        assert_eq!(plane.tradable_route_count(), 1);
     }
 }

@@ -816,7 +816,7 @@ mod tests {
 
     fn replay_event(pool_id: &str, sequence: u64, price_bps: u64) -> String {
         format!(
-            "{{\"type\":\"pool_snapshot_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pool_id\":\"{pool_id}\",\"price_bps\":{price_bps},\"fee_bps\":4,\"reserve_depth\":100000,\"reserve_a\":100000,\"reserve_b\":100000,\"active_liquidity\":100000,\"sqrt_price_x64\":null,\"confidence\":\"executable\",\"repair_pending\":false,\"token_mint_a\":\"SOL\",\"token_mint_b\":\"USDC\",\"tick_spacing\":0,\"current_tick_index\":null,\"slot\":{sequence},\"write_version\":1}}"
+            "{{\"type\":\"pool_snapshot_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pool_id\":\"{pool_id}\",\"price_bps\":{price_bps},\"fee_bps\":4,\"reserve_depth\":100000,\"reserve_a\":100000,\"reserve_b\":100000,\"active_liquidity\":100000,\"sqrt_price_x64\":null,\"venue\":\"orca_simple_pool\",\"confidence\":\"executable\",\"repair_pending\":false,\"token_mint_a\":\"SOL\",\"token_mint_b\":\"USDC\",\"tick_spacing\":0,\"current_tick_index\":null,\"slot\":{sequence},\"write_version\":1}}"
         )
     }
 

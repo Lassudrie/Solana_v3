@@ -48,6 +48,12 @@ impl PoolSnapshotStore {
         self.snapshots.get(pool_id)
     }
 
+    pub fn version(&self, pool_id: &PoolId) -> Option<(u64, u64)> {
+        self.versions
+            .get(pool_id)
+            .map(|version| (version.slot, version.write_version))
+    }
+
     pub fn invalidate(&mut self, pool_id: &PoolId, head_slot: u64, max_slot_lag: u64) -> bool {
         let Some(snapshot) = self.snapshots.get_mut(pool_id) else {
             return false;

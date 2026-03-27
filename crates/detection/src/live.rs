@@ -1007,16 +1007,26 @@ fn handle_entry_batch(
                         ExactMutationOutcome::RefreshRequired => schedule_exact_refresh(
                             &tracked_pool,
                             slot,
+                            source_received_at,
+                            source_latency,
+                            executable_states,
                             sync_tracker,
+                            event_tx,
                             repair_tx,
+                            sequence,
                             hooks,
                         ),
                         ExactMutationOutcome::Invalid if tracked_pool.uses_hybrid_refresh() => {
                             schedule_exact_refresh(
                                 &tracked_pool,
                                 slot,
+                                source_received_at,
+                                source_latency,
+                                executable_states,
                                 sync_tracker,
+                                event_tx,
                                 repair_tx,
+                                sequence,
                                 hooks,
                             )
                         }
@@ -1071,7 +1081,18 @@ fn handle_entry_batch(
                     continue;
                 }
                 if tracked_pool.uses_hybrid_refresh() {
-                    schedule_exact_refresh(&tracked_pool, slot, sync_tracker, repair_tx, hooks);
+                    schedule_exact_refresh(
+                        &tracked_pool,
+                        slot,
+                        source_received_at,
+                        source_latency,
+                        executable_states,
+                        sync_tracker,
+                        event_tx,
+                        repair_tx,
+                        sequence,
+                        hooks,
+                    );
                     continue;
                 }
                 invalidate_and_repair(
@@ -1570,24 +1591,16 @@ fn invalidate_and_repair(
     }
 
     if let Ok(mut store) = executable_states.write() {
-        let pool_id = PoolId(tracked_pool.pool_id.clone());
-        let next_write_version = store
-            .get(&pool_id)
-            .map(|state| state.write_version().saturating_add(1))
-            .unwrap_or(1);
-        let _ = store.invalidate(&pool_id, slot, next_write_version);
+        invalidate_live_snapshot(
+            tracked_pool,
+            slot,
+            &mut store,
+            source_received_at,
+            source_latency,
+            event_tx,
+            sequence,
+        );
     }
-
-    let event = event_with_timing(
-        next_sequence(sequence),
-        slot,
-        source_received_at,
-        source_latency,
-        crate::MarketEvent::PoolInvalidation(PoolInvalidation {
-            pool_id: tracked_pool.pool_id.clone(),
-        }),
-    );
-    let _ = try_send_event(event_tx, event);
     let _ = repair_tx.send(RepairRequest {
         pool_id: tracked_pool.pool_id.clone(),
         mode: SyncRequestMode::RepairAfterInvalidation,
@@ -1604,14 +1617,32 @@ fn invalidate_and_repair(
 fn schedule_exact_refresh(
     tracked_pool: &TrackedPool,
     slot: u64,
+    source_received_at: SystemTime,
+    source_latency: Option<Duration>,
+    executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
+    event_tx: &SyncSender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
+    sequence: &Arc<AtomicU64>,
     hooks: &dyn LiveHooks,
 ) {
     let (deadline_slot, should_enqueue) = match sync_tracker.lock() {
         Ok(mut tracker) => tracker.schedule_refresh(&tracked_pool.pool_id, slot),
         Err(_) => return,
     };
+    if should_enqueue {
+        if let Ok(mut store) = executable_states.write() {
+            invalidate_live_snapshot(
+                tracked_pool,
+                slot,
+                &mut store,
+                source_received_at,
+                source_latency,
+                event_tx,
+                sequence,
+            );
+        }
+    }
     hooks.publish_repair(LiveRepairEvent {
         pool_id: tracked_pool.pool_id.clone(),
         kind: LiveRepairEventKind::RefreshScheduled { deadline_slot },
@@ -1630,6 +1661,36 @@ fn schedule_exact_refresh(
             observed_slot: slot,
         });
     }
+}
+
+fn invalidate_live_snapshot(
+    tracked_pool: &TrackedPool,
+    slot: u64,
+    store: &mut ExecutablePoolStateStore,
+    source_received_at: SystemTime,
+    source_latency: Option<Duration>,
+    event_tx: &SyncSender<NormalizedEvent>,
+    sequence: &Arc<AtomicU64>,
+) {
+    let pool_id = PoolId(tracked_pool.pool_id.clone());
+    let next_write_version = store
+        .get(&pool_id)
+        .map(|state| state.write_version().saturating_add(1))
+        .unwrap_or(1);
+    if !store.invalidate(&pool_id, slot, next_write_version) {
+        return;
+    }
+
+    let event = event_with_timing(
+        next_sequence(sequence),
+        slot,
+        source_received_at,
+        source_latency,
+        crate::MarketEvent::PoolInvalidation(PoolInvalidation {
+            pool_id: tracked_pool.pool_id.clone(),
+        }),
+    );
+    let _ = try_send_event(event_tx, event);
 }
 
 fn expire_exact_refreshes(
@@ -1724,6 +1785,7 @@ fn publish_pool_snapshot_update(
             reserve_b: snapshot.reserve_b,
             active_liquidity: Some(snapshot.active_liquidity),
             sqrt_price_x64: snapshot.sqrt_price_x64,
+            venue: state.venue(),
             confidence: snapshot_confidence(snapshot.confidence),
             repair_pending: Some(snapshot.repair_pending),
             token_mint_a: snapshot.token_mint_a,
@@ -3008,30 +3070,35 @@ fn next_sequence(sequence: &AtomicU64) -> u64 {
 mod tests {
     use std::{
         collections::{BTreeSet, HashMap},
-        sync::{Arc, Mutex, RwLock, mpsc},
+        sync::{
+            Arc, Mutex, RwLock,
+            atomic::AtomicU64,
+            mpsc::{self, TryRecvError},
+        },
         time::{Duration, UNIX_EPOCH},
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use domain::{
-        ConstantProductPoolState, ExecutablePoolState, ExecutablePoolStateStore, PoolConfidence,
-        PoolId, PoolVenue,
+        ConcentratedLiquidityPoolState, ConstantProductPoolState, ExecutablePoolState,
+        ExecutablePoolStateStore, PoolConfidence, PoolId, PoolVenue,
     };
     use prost_types::Timestamp;
 
     use super::{
         CompiledInstruction, ExactMutationOutcome, GrpcEntriesConfig, LegacyVersionedMessage,
-        LegacyVersionedTransaction, ORCA_SWAP_INSTRUCTION_TAG, ORCA_SWAP_V2_DISCRIMINATOR_NAME,
-        ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME, ORCA_WHIRLPOOL_ACCOUNT_NAME,
-        OrcaSimpleTrackedConfig, OrcaWhirlpoolTrackedConfig, PoolMutation, PoolSyncTracker,
-        RAYDIUM_CLMM_ACCOUNT_NAME, RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME, RAYDIUM_SWAP_BASE_OUT_TAG,
-        RaydiumClmmTrackedConfig, RaydiumSimpleTrackedConfig, ReducerRolloutMode,
-        ResolvedInstruction, RpcAccountValue, TrackedPool, TrackedPoolKind, TrackedPoolRegistry,
+        LegacyVersionedTransaction, NoopLiveHooks, ORCA_SWAP_INSTRUCTION_TAG,
+        ORCA_SWAP_V2_DISCRIMINATOR_NAME, ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME,
+        ORCA_WHIRLPOOL_ACCOUNT_NAME, OrcaSimpleTrackedConfig, OrcaWhirlpoolTrackedConfig,
+        PoolMutation, PoolSyncTracker, RAYDIUM_CLMM_ACCOUNT_NAME,
+        RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME, RAYDIUM_SWAP_BASE_OUT_TAG, RaydiumClmmTrackedConfig,
+        RaydiumSimpleTrackedConfig, ReducerRolloutMode, ResolvedInstruction, RpcAccountValue,
+        SyncRequestMode, TrackedPool, TrackedPoolKind, TrackedPoolRegistry,
         anchor_account_discriminator, anchor_instruction_discriminator, associated_token_address,
         build_executable_state_from_accounts, constant_product_amount_in_for_output,
         constant_product_amount_out, parse_legacy_pubkey, reduce_orca_simple_swap,
-        reduce_raydium_simple_swap, resolve_transaction, seed_initial_repairs,
-        timestamp_to_system_time,
+        reduce_raydium_simple_swap, resolve_transaction, schedule_exact_refresh,
+        seed_initial_repairs, timestamp_to_system_time,
     };
 
     fn write_u16(data: &mut [u8], offset: usize, value: u16) {
@@ -3824,6 +3891,114 @@ mod tests {
             vec!["pool-a".to_string()]
         );
         assert!(!tracker.refresh_required("pool-a"));
+    }
+
+    #[test]
+    fn schedule_exact_refresh_invalidates_hybrid_pool_immediately() {
+        let tracked_pool = TrackedPool {
+            pool_id: "pool-orca-clmm".into(),
+            reducer_mode: ReducerRolloutMode::Active,
+            watch_accounts: vec![],
+            kind: TrackedPoolKind::OrcaWhirlpool(OrcaWhirlpoolTrackedConfig {
+                program_id: "orca-program".into(),
+                whirlpool: "whirlpool".into(),
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                token_vault_a: "vault-a".into(),
+                token_vault_b: "vault-b".into(),
+                tick_spacing: 64,
+                fee_bps: 30,
+                require_a_to_b: true,
+                require_b_to_a: true,
+            }),
+        };
+        let pool_id = PoolId(tracked_pool.pool_id.clone());
+        let executable_states = Arc::new(RwLock::new(ExecutablePoolStateStore::default()));
+        executable_states
+            .write()
+            .expect("store lock")
+            .upsert(ExecutablePoolState::OrcaWhirlpool(
+                ConcentratedLiquidityPoolState {
+                    pool_id: pool_id.clone(),
+                    venue: PoolVenue::OrcaWhirlpool,
+                    token_mint_a: "mint-a".into(),
+                    token_mint_b: "mint-b".into(),
+                    token_vault_a: "vault-a".into(),
+                    token_vault_b: "vault-b".into(),
+                    fee_bps: 30,
+                    active_liquidity: 1_000_000,
+                    liquidity: 1_000_000,
+                    sqrt_price_x64: 1u128 << 64,
+                    current_tick_index: 0,
+                    tick_spacing: 64,
+                    loaded_tick_arrays: 3,
+                    expected_tick_arrays: 3,
+                    last_update_slot: 99,
+                    write_version: 7,
+                    last_verified_slot: 99,
+                    confidence: PoolConfidence::Executable,
+                    repair_pending: false,
+                },
+            ));
+        let sync_tracker = Arc::new(Mutex::new(PoolSyncTracker::default()));
+        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (repair_tx, repair_rx) = mpsc::channel();
+        let sequence = Arc::new(AtomicU64::new(1));
+        let hooks = NoopLiveHooks;
+
+        schedule_exact_refresh(
+            &tracked_pool,
+            100,
+            UNIX_EPOCH,
+            None,
+            &executable_states,
+            &sync_tracker,
+            &event_tx,
+            &repair_tx,
+            &sequence,
+            &hooks,
+        );
+
+        let event = event_rx.recv().expect("invalidation event");
+        match event.payload {
+            crate::MarketEvent::PoolInvalidation(invalidation) => {
+                assert_eq!(invalidation.pool_id, tracked_pool.pool_id);
+            }
+            other => panic!("expected invalidation event, got {other:?}"),
+        }
+
+        let request = repair_rx.recv().expect("refresh request");
+        assert_eq!(request.pool_id, tracked_pool.pool_id);
+        assert_eq!(request.mode, SyncRequestMode::RefreshExact);
+        assert!(
+            sync_tracker
+                .lock()
+                .expect("tracker lock")
+                .refresh_required(&tracked_pool.pool_id)
+        );
+        let confidence = executable_states
+            .read()
+            .expect("store lock")
+            .get(&pool_id)
+            .expect("pool state")
+            .confidence();
+        assert_eq!(confidence, PoolConfidence::Invalid);
+
+        schedule_exact_refresh(
+            &tracked_pool,
+            101,
+            UNIX_EPOCH,
+            None,
+            &executable_states,
+            &sync_tracker,
+            &event_tx,
+            &repair_tx,
+            &sequence,
+            &hooks,
+        );
+
+        assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(repair_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]

@@ -145,7 +145,8 @@ impl GuardrailSet {
 mod tests {
     use domain::{
         EventSourceKind, ExecutionStateSnapshot, FreshnessState, LiquidityModel, NormalizedEvent,
-        PoolConfidence, PoolId, PoolSnapshot, PoolSnapshotUpdate, RouteId, SnapshotConfidence,
+        PoolConfidence, PoolId, PoolSnapshot, PoolSnapshotUpdate, PoolVenue, RouteId,
+        SnapshotConfidence,
     };
     use state::StatePlane;
 
@@ -233,6 +234,12 @@ mod tests {
                         reserve_b: snapshot.reserve_b,
                         active_liquidity: Some(snapshot.active_liquidity),
                         sqrt_price_x64: snapshot.sqrt_price_x64,
+                        venue: snapshot.venue.unwrap_or(match snapshot.liquidity_model {
+                            LiquidityModel::Unknown | LiquidityModel::ConstantProduct => {
+                                PoolVenue::OrcaSimplePool
+                            }
+                            LiquidityModel::ConcentratedLiquidity => PoolVenue::OrcaWhirlpool,
+                        }),
                         confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(snapshot.repair_pending),
                         token_mint_a: snapshot.token_mint_a.clone(),

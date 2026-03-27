@@ -653,6 +653,7 @@ impl BotRuntime {
 #[cfg(test)]
 mod tests {
     use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate, SnapshotConfidence};
+    use domain::PoolVenue;
     use signerd::{SecureSignerService, SecureSignerServiceConfig};
     use solana_sdk::{
         hash::hashv,
@@ -703,6 +704,7 @@ mod tests {
                 reserve_b: Some(100_000),
                 active_liquidity: Some(100_000),
                 sqrt_price_x64: None,
+                venue: PoolVenue::OrcaSimplePool,
                 confidence: SnapshotConfidence::Executable,
                 repair_pending: Some(false),
                 token_mint_a: "SOL".into(),

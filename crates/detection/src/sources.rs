@@ -8,6 +8,8 @@ use std::{
 
 use serde::Deserialize;
 
+use domain::PoolVenue;
+
 use crate::{
     AccountUpdate, EventSourceKind, Heartbeat, IngestError, LatencyMetadata, MarketEvent,
     MarketEventSource, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate, SlotBoundary,
@@ -186,6 +188,7 @@ enum WireEvent {
         reserve_b: Option<u64>,
         active_liquidity: Option<u64>,
         sqrt_price_x64: Option<u128>,
+        venue: PoolVenue,
         confidence: Option<SnapshotConfidence>,
         #[serde(default)]
         exact: Option<bool>,
@@ -282,6 +285,7 @@ fn parse_wire_event(
             reserve_b,
             active_liquidity,
             sqrt_price_x64,
+            venue,
             confidence,
             exact,
             repair_pending,
@@ -305,6 +309,7 @@ fn parse_wire_event(
                 reserve_b,
                 active_liquidity,
                 sqrt_price_x64,
+                venue,
                 confidence: confidence
                     .or_else(|| {
                         exact.map(|value| {
@@ -427,6 +432,8 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use domain::PoolVenue;
+
     use crate::{MarketEvent, MarketEventSource};
 
     use super::JsonlFileEventSource;
@@ -454,7 +461,7 @@ mod tests {
         let path = temp_file_path("detection-jsonl-live-source");
         fs::write(
             &path,
-            "{\"type\":\"pool_snapshot_update\",\"source\":\"shredstream\",\"sequence\":9,\"observed_slot\":33,\"pool_id\":\"pool-a\",\"price_bps\":10001,\"fee_bps\":4,\"reserve_depth\":5000,\"confidence\":\"decoded\",\"token_mint_a\":\"a\",\"token_mint_b\":\"b\",\"tick_spacing\":4,\"current_tick_index\":12,\"slot\":33,\"write_version\":2}\n",
+            "{\"type\":\"pool_snapshot_update\",\"source\":\"shredstream\",\"sequence\":9,\"observed_slot\":33,\"pool_id\":\"pool-a\",\"price_bps\":10001,\"fee_bps\":4,\"reserve_depth\":5000,\"venue\":\"orca_whirlpool\",\"confidence\":\"decoded\",\"token_mint_a\":\"a\",\"token_mint_b\":\"b\",\"tick_spacing\":4,\"current_tick_index\":12,\"slot\":33,\"write_version\":2}\n",
         )
         .unwrap();
 
@@ -462,7 +469,12 @@ mod tests {
         let event = source.poll_next().unwrap().expect("event");
 
         assert_eq!(event.source.sequence, 9);
-        assert!(matches!(event.payload, MarketEvent::PoolSnapshotUpdate(_)));
+        match event.payload {
+            MarketEvent::PoolSnapshotUpdate(update) => {
+                assert_eq!(update.venue, PoolVenue::OrcaWhirlpool);
+            }
+            other => panic!("expected pool snapshot update, got {other:?}"),
+        }
 
         let _ = fs::remove_file(path);
     }
