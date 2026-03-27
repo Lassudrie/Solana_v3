@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Mutex,
-    thread,
     time::Duration,
 };
 
@@ -13,10 +12,9 @@ use reqwest::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tungstenite::{client::IntoClientRequest, connect};
 
 use crate::{
-    submitter::{SubmitError, Submitter},
+    submitter::{SubmitAttemptOutcome, SubmitError, SubmitRetryPolicy, Submitter},
     types::{
         SubmissionId, SubmitMode, SubmitRejectionReason, SubmitRequest, SubmitResult, SubmitStatus,
     },
@@ -64,7 +62,6 @@ impl Default for JitoConfig {
 pub struct JitoSubmitter {
     config: JitoConfig,
     http: JitoHttpClient,
-    ws: JitoWsClient,
     idempotency: Mutex<IdempotencyCache>,
 }
 
@@ -72,67 +69,27 @@ impl JitoSubmitter {
     pub fn new(config: JitoConfig) -> Self {
         Self {
             http: JitoHttpClient::new(&config),
-            ws: JitoWsClient::new(&config),
             config,
             idempotency: Mutex::new(IdempotencyCache::default()),
         }
-    }
-
-    fn submit_live(
-        &self,
-        request: &SubmitRequest,
-        cache_key: IdempotencyKey,
-        encoded_message: &str,
-    ) -> Result<SubmitResult, SubmitError> {
-        let attempts = self.config.retry_attempts.max(1);
-        let mut saw_transport_failure = false;
-
-        for attempt in 0..attempts {
-            match self.send_once(request, encoded_message)? {
-                AttemptOutcome::Accepted(result) => {
-                    self.remember(cache_key.clone(), result.clone());
-                    return Ok(result);
-                }
-                AttemptOutcome::Rejected(result) => return Ok(result),
-                AttemptOutcome::RetryableRejection {
-                    result,
-                    retry_after,
-                } => {
-                    if attempt + 1 == attempts {
-                        return Ok(result);
-                    }
-                    thread::sleep(retry_after.unwrap_or_else(|| self.retry_delay(attempt)));
-                }
-                AttemptOutcome::RetryableTransport => {
-                    saw_transport_failure = true;
-                    if attempt + 1 == attempts {
-                        break;
-                    }
-                    thread::sleep(self.retry_delay(attempt));
-                }
-            }
-        }
-
-        if saw_transport_failure && self.ws.probe() {
-            return Ok(self.rejected_result(
-                request,
-                SubmitRejectionReason::ChannelUnavailable,
-                self.http.request_url(request.mode),
-            ));
-        }
-
-        Err(SubmitError::TransportUnavailable)
     }
 
     fn send_once(
         &self,
         request: &SubmitRequest,
         encoded_message: &str,
-    ) -> Result<AttemptOutcome, SubmitError> {
+    ) -> Result<SubmitAttemptOutcome, SubmitError> {
         let response = match self.http.send(request.mode, encoded_message) {
             Ok(response) => response,
             Err(SubmitError::TransportUnavailable) => {
-                return Ok(AttemptOutcome::RetryableTransport);
+                return Ok(SubmitAttemptOutcome::Retry {
+                    terminal_result: self.rejected_result(
+                        request,
+                        SubmitRejectionReason::ChannelUnavailable,
+                        self.http.request_url(request.mode),
+                    ),
+                    retry_after: None,
+                });
             }
             Err(error) => return Err(error),
         };
@@ -147,31 +104,23 @@ impl JitoSubmitter {
                 &response.body,
                 response.retry_after,
             );
-            let result =
-                self.rejected_result(request, rejection.reason, response.request_url.clone());
-            return Ok(if rejection.retryable {
-                AttemptOutcome::RetryableRejection {
-                    result,
-                    retry_after: rejection.retry_after,
-                }
-            } else {
-                AttemptOutcome::Rejected(result)
-            });
+            let result = self.rejected_result(
+                request,
+                rejection.reason.clone(),
+                response.request_url.clone(),
+            );
+            return Ok(attempt_outcome(result, &rejection));
         }
 
         if !response.status.is_success() {
             let rejection =
                 classify_rejection(response.status, None, &response.body, response.retry_after);
-            let result =
-                self.rejected_result(request, rejection.reason, response.request_url.clone());
-            return Ok(if rejection.retryable {
-                AttemptOutcome::RetryableRejection {
-                    result,
-                    retry_after: rejection.retry_after,
-                }
-            } else {
-                AttemptOutcome::Rejected(result)
-            });
+            let result = self.rejected_result(
+                request,
+                rejection.reason.clone(),
+                response.request_url.clone(),
+            );
+            return Ok(attempt_outcome(result, &rejection));
         }
 
         let result = response
@@ -186,7 +135,7 @@ impl JitoSubmitter {
             SubmitMode::Bundle => result,
         };
 
-        Ok(AttemptOutcome::Accepted(SubmitResult {
+        Ok(SubmitAttemptOutcome::Terminal(SubmitResult {
             status: SubmitStatus::Accepted,
             submission_id: SubmissionId(submission_id),
             endpoint: response.request_url,
@@ -225,11 +174,6 @@ impl JitoSubmitter {
             .and_then(|cache| cache.get(key))
     }
 
-    fn retry_delay(&self, attempt: usize) -> Duration {
-        let multiplier = 1_u64 << attempt.min(8);
-        Duration::from_millis(self.config.retry_backoff_ms.saturating_mul(multiplier))
-    }
-
     fn mock_submit(&self, request: &SubmitRequest) -> SubmitResult {
         let mode_suffix = match request.mode {
             SubmitMode::SingleTransaction => "single",
@@ -249,21 +193,21 @@ impl JitoSubmitter {
 }
 
 impl Submitter for JitoSubmitter {
-    fn submit(&self, request: SubmitRequest) -> Result<SubmitResult, SubmitError> {
+    fn submit_attempt(&self, request: SubmitRequest) -> Result<SubmitAttemptOutcome, SubmitError> {
         if request.envelope.signed_message.is_empty() {
-            return Ok(self.rejected_result(
+            return Ok(SubmitAttemptOutcome::Terminal(self.rejected_result(
                 &request,
                 SubmitRejectionReason::InvalidEnvelope,
                 self.http.request_url(request.mode),
-            ));
+            )));
         }
 
         if matches!(request.mode, SubmitMode::Bundle) && !self.config.bundle_enabled {
-            return Ok(self.rejected_result(
+            return Ok(SubmitAttemptOutcome::Terminal(self.rejected_result(
                 &request,
                 SubmitRejectionReason::BundleDisabled,
                 self.http.request_url(request.mode),
-            ));
+            )));
         }
 
         let cache_key = IdempotencyKey {
@@ -271,17 +215,30 @@ impl Submitter for JitoSubmitter {
             mode: request.mode,
         };
         if let Some(result) = self.cached(&cache_key) {
-            return Ok(result);
+            return Ok(SubmitAttemptOutcome::Terminal(result));
         }
 
         if self.http.is_mock() {
             let result = self.mock_submit(&request);
             self.remember(cache_key, result.clone());
-            return Ok(result);
+            return Ok(SubmitAttemptOutcome::Terminal(result));
         }
 
         let encoded_message = BASE64_STANDARD.encode(&request.envelope.signed_message);
-        self.submit_live(&request, cache_key, &encoded_message)
+        let outcome = self.send_once(&request, &encoded_message)?;
+        if let SubmitAttemptOutcome::Terminal(result) = &outcome {
+            if result.status == SubmitStatus::Accepted {
+                self.remember(cache_key, result.clone());
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn retry_policy(&self) -> SubmitRetryPolicy {
+        SubmitRetryPolicy {
+            max_attempts: self.config.retry_attempts.max(1),
+            retry_backoff: Duration::from_millis(self.config.retry_backoff_ms),
+        }
     }
 }
 
@@ -390,43 +347,6 @@ impl JitoHttpClient {
     }
 }
 
-#[derive(Debug, Clone)]
-struct JitoWsClient {
-    endpoint: String,
-    auth_token: Option<String>,
-}
-
-impl JitoWsClient {
-    fn new(config: &JitoConfig) -> Self {
-        Self {
-            endpoint: config.ws_endpoint.clone(),
-            auth_token: config.auth_token.clone(),
-        }
-    }
-
-    fn probe(&self) -> bool {
-        if self.endpoint.is_empty() || self.endpoint.starts_with(MOCK_SCHEME) {
-            return true;
-        }
-
-        let mut request = match self.endpoint.as_str().into_client_request() {
-            Ok(request) => request,
-            Err(_) => return false,
-        };
-        if let Some(token) = self.auth_token.as_deref() {
-            let Ok(value) = HeaderValue::from_str(token) else {
-                return false;
-            };
-            request.headers_mut().insert(auth_header_name(), value);
-        }
-
-        match connect(request) {
-            Ok((mut socket, _)) => socket.close(None).is_ok(),
-            Err(_) => false,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IdempotencyKey {
     signature: String,
@@ -486,18 +406,6 @@ struct JsonRpcError {
     message: String,
     #[serde(default)]
     data: Option<Value>,
-}
-
-#[derive(Debug)]
-enum AttemptOutcome {
-    Accepted(SubmitResult),
-    Rejected(SubmitResult),
-    RetryableRejection {
-        result: SubmitResult,
-        retry_after: Option<Duration>,
-    },
-    #[allow(dead_code)]
-    RetryableTransport,
 }
 
 #[derive(Debug)]
@@ -605,6 +513,17 @@ fn classify_rejection(
         reason,
         retryable,
         retry_after: retryable.then_some(retry_after).flatten(),
+    }
+}
+
+fn attempt_outcome(result: SubmitResult, rejection: &ClassifiedRejection) -> SubmitAttemptOutcome {
+    if rejection.retryable {
+        SubmitAttemptOutcome::Retry {
+            terminal_result: result,
+            retry_after: rejection.retry_after,
+        }
+    } else {
+        SubmitAttemptOutcome::Terminal(result)
     }
 }
 
