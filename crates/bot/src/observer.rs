@@ -1489,6 +1489,9 @@ fn route_health_label(state: RouteHealthState) -> &'static str {
         RouteHealthState::Eligible => "eligible",
         RouteHealthState::BlockedPoolStale => "blocked_pool_stale",
         RouteHealthState::BlockedPoolNotExecutable => "blocked_pool_not_executable",
+        RouteHealthState::BlockedPoolQuoteModelNotExecutable => {
+            "blocked_pool_quote_model_not_executable"
+        }
         RouteHealthState::BlockedPoolRepair => "blocked_pool_repair",
         RouteHealthState::BlockedPoolQuarantined => "blocked_pool_quarantined",
         RouteHealthState::BlockedPoolDisabled => "blocked_pool_disabled",

@@ -9,6 +9,7 @@ use submit::SubmitRejectionReason;
 use thiserror::Error;
 
 use crate::{
+    account_batcher::GetMultipleAccountsBatcher,
     bootstrap::{BootstrapError, bootstrap_with_health},
     config::{BotConfig, RuntimeControlConfig},
     control::{RuntimeIssue, RuntimeMode, RuntimeStatus, SharedRuntimeStatus},
@@ -87,7 +88,8 @@ impl BotDaemon {
         })?;
         let submit_dispatcher = SubmitDispatcher::from_config(&config)
             .map_err(|source| DaemonError::SubmitDispatcher { source })?;
-        let source = build_event_source(&config, observer.clone(), route_health)?;
+        let account_batcher =
+            GetMultipleAccountsBatcher::new(&config.reconciliation.rpc_http_endpoint);
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
         let lookup_table_keys = config
             .routes
@@ -108,7 +110,16 @@ impl BotDaemon {
             &config.reconciliation.rpc_http_endpoint,
             runtime.wallet_pubkey(),
             &lookup_table_keys,
+            account_batcher.clone(),
         );
+        let lookup_table_cache = refresher.lookup_table_cache_handle();
+        let source = build_event_source(
+            &config,
+            observer.clone(),
+            route_health,
+            account_batcher,
+            lookup_table_cache,
+        )?;
 
         let daemon = Self {
             runtime,

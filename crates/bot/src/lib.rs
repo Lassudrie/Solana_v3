@@ -1,3 +1,4 @@
+mod account_batcher;
 pub mod bootstrap;
 pub mod config;
 pub mod control;
@@ -6,6 +7,7 @@ mod live;
 pub mod observer;
 pub mod refresh;
 pub mod route_health;
+mod rpc;
 pub mod runtime;
 pub mod sources;
 mod submit_dispatch;

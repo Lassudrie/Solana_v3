@@ -3,7 +3,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant, SystemTime},
 };
@@ -69,13 +69,14 @@ pub struct LocalWalletSigner {
     signer_material: SignerMaterial,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SecureUnixWalletSigner {
     signer_id: String,
     socket_path: PathBuf,
     signer_pubkey: String,
     connect_timeout: Duration,
     io_timeout: Duration,
+    connection_pool: Mutex<Vec<UnixStream>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +85,8 @@ enum SignerMaterial {
     Missing,
     Invalid(String),
 }
+
+const MAX_POOLED_SIGNER_CONNECTIONS: usize = 2;
 
 impl LocalWalletSigner {
     pub fn new(
@@ -164,6 +167,7 @@ impl SecureUnixWalletSigner {
             signer_pubkey: String::new(),
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             io_timeout: Duration::from_millis(io_timeout_ms),
+            connection_pool: Mutex::new(Vec::new()),
         };
 
         let actual_pubkey = signer.request_public_key()?;
@@ -212,6 +216,21 @@ impl SecureUnixWalletSigner {
         }
     }
 
+    fn take_pooled_connection(&self) -> Option<UnixStream> {
+        self.connection_pool
+            .lock()
+            .ok()
+            .and_then(|mut pool| pool.pop())
+    }
+
+    fn return_connection(&self, stream: UnixStream) {
+        if let Ok(mut pool) = self.connection_pool.lock() {
+            if pool.len() < MAX_POOLED_SIGNER_CONNECTIONS {
+                pool.push(stream);
+            }
+        }
+    }
+
     fn request_public_key(&self) -> Result<String, SigningError> {
         match self.send_request(SignerRequest::GetPublicKey)? {
             SignerResponse::PublicKey { pubkey } => parse_pubkey(&pubkey, true).map(|_| pubkey),
@@ -239,7 +258,24 @@ impl SecureUnixWalletSigner {
     }
 
     fn send_request(&self, request: SignerRequest) -> Result<SignerResponse, SigningError> {
+        if let Some(mut stream) = self.take_pooled_connection() {
+            if let Ok(response) = self.send_request_on_stream(&mut stream, &request) {
+                self.return_connection(stream);
+                return Ok(response);
+            }
+        }
+
         let mut stream = self.connect()?;
+        let response = self.send_request_on_stream(&mut stream, &request)?;
+        self.return_connection(stream);
+        Ok(response)
+    }
+
+    fn send_request_on_stream(
+        &self,
+        stream: &mut UnixStream,
+        request: &SignerRequest,
+    ) -> Result<SignerResponse, SigningError> {
         let payload = serde_json::to_vec(&request).map_err(|error| {
             SigningError::SigningFailed(format!("failed to serialize signer request: {error}"))
         })?;
@@ -254,7 +290,11 @@ impl SecureUnixWalletSigner {
             .map_err(|error| map_transport_error(error, "failed to flush signer request"))?;
 
         let mut line = String::new();
-        let mut reader = BufReader::new(stream);
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|error| map_transport_error(error, "failed to clone signer stream"))?,
+        );
         reader
             .read_line(&mut line)
             .map_err(|error| map_transport_error(error, "failed to read signer response"))?;
@@ -424,7 +464,7 @@ mod tests {
         os::unix::net::UnixListener,
         path::PathBuf,
         process,
-        sync::mpsc,
+        sync::{Arc, mpsc},
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -605,11 +645,16 @@ mod tests {
 
     struct MockSignerServer {
         pubkey: String,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
         join_handle: thread::JoinHandle<()>,
         socket_path: PathBuf,
     }
 
     impl MockSignerServer {
+        fn accepted_connections(&self) -> usize {
+            self.accepts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         fn join(self) {
             self.join_handle.join().expect("mock signer thread");
             let _ = std::fs::remove_file(self.socket_path);
@@ -630,63 +675,111 @@ mod tests {
         request_count: usize,
     ) -> MockSignerServer {
         let pubkey = keypair.pubkey().to_string();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (ready_tx, ready_rx) = mpsc::channel();
         let listener_path = socket_path.clone();
+        let accepts_for_thread = Arc::clone(&accepts);
         let join_handle = thread::spawn(move || {
             let listener = UnixListener::bind(&listener_path).expect("bind unix listener");
             ready_tx.send(()).expect("signal ready");
-            for _ in 0..request_count {
+            let mut handled_requests = 0usize;
+            while handled_requests < request_count {
                 let (mut stream, _) = listener.accept().expect("accept signer connection");
-                let mut line = String::new();
-                BufReader::new(stream.try_clone().expect("clone stream"))
-                    .read_line(&mut line)
-                    .expect("read signer request");
-                let request: SignerRequest =
-                    serde_json::from_str(line.trim_end()).expect("parse signer request");
-                match behavior {
-                    MockBehavior::Malformed => {
-                        stream
-                            .write_all(b"not-json\n")
-                            .expect("write malformed response");
+                accepts_for_thread.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut reader =
+                    BufReader::new(stream.try_clone().expect("clone stream for buffered reads"));
+                while handled_requests < request_count {
+                    let mut line = String::new();
+                    let bytes = reader.read_line(&mut line).expect("read signer request");
+                    if bytes == 0 {
+                        break;
                     }
-                    MockBehavior::Valid | MockBehavior::WrongSignature => {
-                        let response = match request {
-                            SignerRequest::GetPublicKey => SignerResponse::PublicKey {
-                                pubkey: keypair.pubkey().to_string(),
-                            },
-                            SignerRequest::SignMessage { message_base64 } => {
-                                let message = BASE64_STANDARD
-                                    .decode(message_base64)
-                                    .expect("decode message");
-                                let signature = match behavior {
-                                    MockBehavior::Valid => keypair
-                                        .try_sign_message(&message)
-                                        .expect("sign message")
-                                        .to_string(),
-                                    MockBehavior::WrongSignature => {
-                                        Keypair::new_from_array([3; 32])
+                    let request: SignerRequest =
+                        serde_json::from_str(line.trim_end()).expect("parse signer request");
+                    match behavior {
+                        MockBehavior::Malformed => {
+                            stream
+                                .write_all(b"not-json\n")
+                                .expect("write malformed response");
+                        }
+                        MockBehavior::Valid | MockBehavior::WrongSignature => {
+                            let response = match request {
+                                SignerRequest::GetPublicKey => SignerResponse::PublicKey {
+                                    pubkey: keypair.pubkey().to_string(),
+                                },
+                                SignerRequest::SignMessage { message_base64 } => {
+                                    let message = BASE64_STANDARD
+                                        .decode(message_base64)
+                                        .expect("decode message");
+                                    let signature = match behavior {
+                                        MockBehavior::Valid => keypair
                                             .try_sign_message(&message)
-                                            .expect("sign wrong message")
-                                            .to_string()
-                                    }
-                                    MockBehavior::Malformed => unreachable!(),
-                                };
-                                SignerResponse::Signature { signature }
-                            }
-                        };
-                        serde_json::to_writer(&mut stream, &response)
-                            .expect("write signer response");
-                        stream.write_all(b"\n").expect("finalize signer response");
+                                            .expect("sign message")
+                                            .to_string(),
+                                        MockBehavior::WrongSignature => {
+                                            Keypair::new_from_array([3; 32])
+                                                .try_sign_message(&message)
+                                                .expect("sign wrong message")
+                                                .to_string()
+                                        }
+                                        MockBehavior::Malformed => unreachable!(),
+                                    };
+                                    SignerResponse::Signature { signature }
+                                }
+                            };
+                            serde_json::to_writer(&mut stream, &response)
+                                .expect("write signer response");
+                            stream.write_all(b"\n").expect("finalize signer response");
+                        }
                     }
+                    handled_requests += 1;
                 }
             }
         });
         ready_rx.recv().expect("wait for signer ready");
         MockSignerServer {
             pubkey,
+            accepts,
             join_handle,
             socket_path,
         }
+    }
+
+    #[test]
+    fn secure_unix_signer_reuses_persistent_connection() {
+        let keypair = Keypair::new_from_array([14; 32]);
+        let socket_path = temp_socket_path("secure-unix-reuse");
+        let server = spawn_mock_signer_server(socket_path.clone(), keypair, MockBehavior::Valid, 3);
+        let signer = SecureUnixWalletSigner::new(
+            "wallet-f",
+            &socket_path,
+            Some(server.pubkey.clone()),
+            50,
+            50,
+        )
+        .expect("secure unix signer");
+        let wallet = ready_wallet(server.pubkey.clone());
+
+        let first = signer
+            .sign(
+                &wallet,
+                SigningRequest {
+                    envelope: unsigned_envelope(vec![7, 8, 9]),
+                },
+            )
+            .expect("first signature");
+        let second = signer
+            .sign(
+                &wallet,
+                SigningRequest {
+                    envelope: unsigned_envelope(vec![10, 11, 12]),
+                },
+            )
+            .expect("second signature");
+
+        assert_ne!(first.signature, second.signature);
+        assert_eq!(server.accepted_connections(), 1);
+        server.join();
     }
 
     fn temp_socket_path(label: &str) -> PathBuf {

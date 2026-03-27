@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+primitive-types.workspace = true
 state = { path = "../state" }
 thiserror.workspace = true
 

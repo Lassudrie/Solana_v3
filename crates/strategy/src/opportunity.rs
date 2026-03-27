@@ -6,6 +6,7 @@ use state::types::RouteId;
 pub struct OpportunityCandidate {
     pub route_id: RouteId,
     pub quoted_slot: u64,
+    pub leg_snapshot_slots: [u64; 2],
     pub trade_size: u64,
     pub active_execution_buffer_bps: Option<u16>,
     pub expected_net_output: u64,
@@ -15,6 +16,12 @@ pub struct OpportunityCandidate {
     pub estimated_execution_cost_quote_atoms: u64,
     pub expected_net_profit_quote_atoms: i64,
     pub leg_quotes: [LegQuote; 2],
+}
+
+impl OpportunityCandidate {
+    pub fn oldest_leg_snapshot_slot(&self) -> u64 {
+        self.leg_snapshot_slots[0].min(self.leg_snapshot_slots[1])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

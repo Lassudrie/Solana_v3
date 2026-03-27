@@ -4,6 +4,7 @@ pub mod dependency_graph;
 pub mod executable_pool_state;
 pub mod execution_state;
 pub mod pool_snapshots;
+pub mod quote_models;
 pub mod types;
 pub mod warmup;
 
@@ -12,7 +13,8 @@ use std::time::SystemTime;
 
 use detection::events::SnapshotConfidence;
 use detection::{
-    AccountUpdate, MarketEvent, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
+    AccountUpdate, MarketEvent, NormalizedEvent, PoolInvalidation, PoolQuoteModelUpdate,
+    PoolSnapshotUpdate,
 };
 use thiserror::Error;
 
@@ -22,6 +24,7 @@ use crate::{
     dependency_graph::DependencyGraph,
     execution_state::ExecutionState,
     pool_snapshots::PoolSnapshotStore,
+    quote_models::ConcentratedQuoteModelStore,
     types::{
         AccountKey, AccountRecord, AccountUpdateStatus, ExecutionStateSnapshot, LiquidityModel,
         PoolConfidence, PoolId, StateApplyOutcome, WarmupStatus,
@@ -41,6 +44,7 @@ pub struct StatePlane {
     decoder_registry: DecoderRegistry,
     dependency_graph: DependencyGraph,
     pool_snapshots: PoolSnapshotStore,
+    concentrated_quote_models: ConcentratedQuoteModelStore,
     execution_state: ExecutionState,
     warmup: WarmupManager,
     latest_slot: u64,
@@ -54,6 +58,7 @@ impl StatePlane {
             decoder_registry: DecoderRegistry::default(),
             dependency_graph: DependencyGraph::default(),
             pool_snapshots: PoolSnapshotStore::default(),
+            concentrated_quote_models: ConcentratedQuoteModelStore::default(),
             execution_state: ExecutionState::default(),
             warmup: WarmupManager::default(),
             latest_slot: 0,
@@ -142,8 +147,30 @@ impl StatePlane {
             .collect()
     }
 
+    pub fn concentrated_quote_model(
+        &self,
+        pool_id: &PoolId,
+    ) -> Option<&crate::quote_models::ConcentratedQuoteModel> {
+        self.concentrated_quote_models.get(pool_id)
+    }
+
     pub fn route_state(&self, route_id: &crate::types::RouteId) -> crate::types::RouteState {
         self.warmup.route_state(route_id)
+    }
+
+    pub fn pool_has_executable_quote_model(&self, pool_id: &PoolId) -> bool {
+        let Some(snapshot) = self.pool_snapshots.get(pool_id) else {
+            return false;
+        };
+        match snapshot.liquidity_model {
+            LiquidityModel::ConstantProduct => true,
+            LiquidityModel::ConcentratedLiquidity => self
+                .concentrated_quote_models
+                .get(pool_id)
+                .map(|model| model.has_required_directions())
+                .unwrap_or(false),
+            LiquidityModel::Unknown => false,
+        }
     }
 
     fn route_is_tradable(&self, route_id: &crate::types::RouteId) -> bool {
@@ -158,7 +185,7 @@ impl StatePlane {
                     .get(pool_id)
                     .map(|snapshot| {
                         snapshot.is_executable()
-                            && snapshot.has_executable_quote_model()
+                            && self.pool_has_executable_quote_model(pool_id)
                             && !snapshot.freshness.is_stale
                     })
                     .unwrap_or(false)
@@ -172,6 +199,7 @@ impl StatePlane {
         match &event.payload {
             MarketEvent::AccountUpdate(update) => self.apply_account_update(update),
             MarketEvent::PoolSnapshotUpdate(update) => self.apply_pool_snapshot_update(update),
+            MarketEvent::PoolQuoteModelUpdate(update) => self.apply_pool_quote_model_update(update),
             MarketEvent::PoolInvalidation(invalidation) => {
                 Ok(Some(self.apply_pool_invalidation(invalidation)))
             }
@@ -299,6 +327,63 @@ impl StatePlane {
             .pool_snapshots
             .upsert_with_version(snapshot, update.write_version)
         {
+            AccountUpdateStatus::Applied
+        } else {
+            AccountUpdateStatus::StaleRejected
+        };
+        let impacted_pools = if update_status == AccountUpdateStatus::Applied {
+            vec![pool_id]
+        } else {
+            Vec::new()
+        };
+        Ok(Some(self.state_outcome(update_status, impacted_pools)))
+    }
+
+    fn apply_pool_quote_model_update(
+        &mut self,
+        update: &PoolQuoteModelUpdate,
+    ) -> Result<Option<StateApplyOutcome>, StateError> {
+        self.latest_slot = self.latest_slot.max(update.slot);
+        let pool_id = crate::types::PoolId(update.pool_id.clone());
+        let to_directional = |direction: &detection::DirectionalPoolQuoteModelUpdate| {
+            crate::quote_models::DirectionalConcentratedQuoteModel {
+                loaded_tick_arrays: direction.loaded_tick_arrays,
+                expected_tick_arrays: direction.expected_tick_arrays,
+                complete: direction.complete,
+                windows: direction
+                    .windows
+                    .iter()
+                    .map(|window| crate::quote_models::TickArrayWindow {
+                        start_tick_index: window.start_tick_index,
+                        end_tick_index: window.end_tick_index,
+                        initialized_tick_count: window.initialized_tick_count,
+                    })
+                    .collect(),
+                initialized_ticks: direction
+                    .initialized_ticks
+                    .iter()
+                    .map(|tick| crate::quote_models::InitializedTick {
+                        tick_index: tick.tick_index,
+                        liquidity_net: tick.liquidity_net,
+                        liquidity_gross: tick.liquidity_gross,
+                    })
+                    .collect(),
+            }
+        };
+        let model = crate::quote_models::ConcentratedQuoteModel {
+            pool_id: pool_id.clone(),
+            liquidity: update.liquidity,
+            sqrt_price_x64: update.sqrt_price_x64,
+            current_tick_index: update.current_tick_index,
+            tick_spacing: update.tick_spacing,
+            required_a_to_b: update.required_a_to_b,
+            required_b_to_a: update.required_b_to_a,
+            a_to_b: update.a_to_b.as_ref().map(to_directional),
+            b_to_a: update.b_to_a.as_ref().map(to_directional),
+            last_update_slot: update.slot,
+            write_version: update.write_version,
+        };
+        let update_status = if self.concentrated_quote_models.upsert(model) {
             AccountUpdateStatus::Applied
         } else {
             AccountUpdateStatus::StaleRejected

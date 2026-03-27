@@ -858,6 +858,9 @@ fn route_health_label(state: bot::RouteHealthState) -> &'static str {
         bot::RouteHealthState::Eligible => "eligible",
         bot::RouteHealthState::BlockedPoolStale => "blocked_pool_stale",
         bot::RouteHealthState::BlockedPoolNotExecutable => "blocked_pool_not_executable",
+        bot::RouteHealthState::BlockedPoolQuoteModelNotExecutable => {
+            "blocked_pool_quote_model_not_executable"
+        }
         bot::RouteHealthState::BlockedPoolRepair => "blocked_pool_repair",
         bot::RouteHealthState::BlockedPoolQuarantined => "blocked_pool_quarantined",
         bot::RouteHealthState::BlockedPoolDisabled => "blocked_pool_disabled",

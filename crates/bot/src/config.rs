@@ -90,14 +90,17 @@ impl BotConfig {
             return;
         }
 
+        // Ultra-fast mode prefers fail-fast submits over worker-local retry backoff.
+        self.jito.retry_attempts = 1;
+        self.jito.retry_backoff_ms = 0;
         self.runtime.control.idle_sleep_millis = 0;
         self.runtime.control.max_events_per_tick = 4_096;
         self.reconciliation.poll_interval_millis = 25;
         self.runtime.refresh.enabled = true;
-        self.runtime.refresh.blockhash_refresh_millis = 200;
-        self.runtime.refresh.slot_refresh_millis = 100;
-        self.runtime.refresh.alt_refresh_millis = 1_000;
-        self.runtime.refresh.wallet_refresh_millis = 1_000;
+        self.runtime.refresh.blockhash_refresh_millis = 500;
+        self.runtime.refresh.slot_refresh_millis = 250;
+        self.runtime.refresh.alt_refresh_millis = 2_000;
+        self.runtime.refresh.wallet_refresh_millis = 2_000;
     }
 
     fn from_toml_str(path: &Path, text: &str) -> Result<Self, ConfigError> {
@@ -848,8 +851,10 @@ mod tests {
         assert_eq!(config.runtime.control.idle_sleep_millis, 0);
         assert_eq!(config.runtime.control.max_events_per_tick, 4_096);
         assert_eq!(config.reconciliation.poll_interval_millis, 25);
-        assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 200);
-        assert_eq!(config.runtime.refresh.slot_refresh_millis, 100);
+        assert_eq!(config.jito.retry_attempts, 1);
+        assert_eq!(config.jito.retry_backoff_ms, 0);
+        assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 500);
+        assert_eq!(config.runtime.refresh.slot_refresh_millis, 250);
     }
 
     #[test]

@@ -1,8 +1,12 @@
 use crate::route_registry::SwapSide;
+use primitive_types::U256;
 use thiserror::Error;
 
 use crate::route_registry::RouteDefinition;
-use state::types::PoolSnapshot;
+use state::{
+    quote_models::{ConcentratedQuoteModel, DirectionalConcentratedQuoteModel},
+    types::{LiquidityModel, PoolSnapshot, PoolVenue},
+};
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
@@ -33,6 +37,12 @@ pub struct RouteQuote {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct QuoteExecutionAdjustments {
     pub extra_leg_slippage_bps: [u16; 2],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PoolPricingView<'a> {
+    pub snapshot: &'a PoolSnapshot,
+    pub concentrated: Option<&'a ConcentratedQuoteModel>,
 }
 
 impl RouteQuote {
@@ -67,15 +77,19 @@ pub enum QuoteError {
     InvalidSnapshotPrice,
     #[error("invalid snapshot liquidity")]
     InvalidSnapshotLiquidity,
+    #[error("pool quote model is not executable")]
+    QuoteModelNotExecutable,
+    #[error("trade exceeds loaded concentrated-liquidity window")]
+    ConcentratedWindowExceeded,
     #[error("unable to convert execution cost into quote atoms")]
     ExecutionCostNotConvertible,
 }
 
 pub trait QuoteEngine: Send + Sync {
-    fn quote(
+    fn quote<'a>(
         &self,
         route: &RouteDefinition,
-        snapshots: [&PoolSnapshot; 2],
+        views: [PoolPricingView<'a>; 2],
         quoted_slot: u64,
         input_amount: u64,
         adjustments: &QuoteExecutionAdjustments,
@@ -86,20 +100,20 @@ pub trait QuoteEngine: Send + Sync {
 pub struct LocalTwoLegQuoteEngine;
 
 impl QuoteEngine for LocalTwoLegQuoteEngine {
-    fn quote(
+    fn quote<'a>(
         &self,
         route: &RouteDefinition,
-        snapshots: [&PoolSnapshot; 2],
+        views: [PoolPricingView<'a>; 2],
         quoted_slot: u64,
         input_amount: u64,
         adjustments: &QuoteExecutionAdjustments,
     ) -> Result<RouteQuote, QuoteError> {
         let first = apply_additional_leg_slippage(
-            apply_route_price(route, &route.legs[0], input_amount, snapshots[0])?,
+            apply_route_price(route, &route.legs[0], input_amount, views[0])?,
             adjustments.extra_leg_slippage_bps[0],
         )?;
         let second = apply_additional_leg_slippage(
-            apply_route_price(route, &route.legs[1], first.net_output, snapshots[1])?,
+            apply_route_price(route, &route.legs[1], first.net_output, views[1])?,
             adjustments.extra_leg_slippage_bps[1],
         )?;
         let expected_gross_profit = second
@@ -125,7 +139,7 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
                     input_amount,
                     output_amount: first.net_output,
                     fee_paid: first.fee_paid,
-                    current_tick_index: snapshots[0].current_tick_index,
+                    current_tick_index: views[0].snapshot.current_tick_index,
                 },
                 LegQuote {
                     venue: route.legs[1].venue.clone(),
@@ -134,7 +148,7 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
                     input_amount: first.net_output,
                     output_amount: second.net_output,
                     fee_paid: second.fee_paid,
-                    current_tick_index: snapshots[1].current_tick_index,
+                    current_tick_index: views[1].snapshot.current_tick_index,
                 },
             ],
         })
@@ -303,8 +317,9 @@ fn apply_route_price(
     route: &RouteDefinition,
     leg: &crate::route_registry::RouteLeg,
     input_amount: u64,
-    snapshot: &PoolSnapshot,
+    view: PoolPricingView<'_>,
 ) -> Result<PricedAmount, QuoteError> {
+    let snapshot = view.snapshot;
     let fee_bps = leg.fee_bps.unwrap_or(snapshot.fee_bps);
     let Some(base_mint) = route.base_mint.as_deref() else {
         return apply_price(input_amount, snapshot.price_bps, fee_bps, snapshot);
@@ -327,6 +342,17 @@ fn apply_route_price(
         {
             return apply_constant_product_price(input_amount, reserve_in, reserve_out, fee_bps);
         }
+    }
+
+    if snapshot.liquidity_model == LiquidityModel::ConcentratedLiquidity {
+        return apply_concentrated_price(
+            snapshot,
+            view.concentrated,
+            input_mint,
+            output_mint,
+            input_amount,
+            fee_bps,
+        );
     }
 
     let price_bps = snapshot.price_bps;
@@ -362,6 +388,769 @@ fn apply_route_price(
         net_output,
         fee_paid,
     })
+}
+
+fn apply_concentrated_price(
+    snapshot: &PoolSnapshot,
+    model: Option<&ConcentratedQuoteModel>,
+    input_mint: &str,
+    output_mint: &str,
+    input_amount: u64,
+    fee_bps: u16,
+) -> Result<PricedAmount, QuoteError> {
+    let Some(model) = model else {
+        return Err(QuoteError::QuoteModelNotExecutable);
+    };
+    if input_amount == 0 {
+        return Err(QuoteError::InvalidSnapshotLiquidity);
+    }
+
+    let a_to_b = if input_mint == snapshot.token_mint_a && output_mint == snapshot.token_mint_b {
+        true
+    } else if input_mint == snapshot.token_mint_b && output_mint == snapshot.token_mint_a {
+        false
+    } else {
+        return Err(QuoteError::InvalidSnapshotPrice);
+    };
+    let Some(direction) = model.direction(a_to_b) else {
+        return Err(QuoteError::QuoteModelNotExecutable);
+    };
+    if !direction.is_executable() || model.tick_spacing == 0 || model.liquidity == 0 {
+        return Err(QuoteError::QuoteModelNotExecutable);
+    }
+
+    let net_output = simulate_concentrated_exact_input(
+        snapshot,
+        model,
+        direction,
+        a_to_b,
+        input_amount,
+        fee_bps,
+    )?;
+    let gross_output = if fee_bps == 0 {
+        net_output
+    } else {
+        simulate_concentrated_exact_input(snapshot, model, direction, a_to_b, input_amount, 0)?
+    };
+    Ok(PricedAmount {
+        gross_output,
+        net_output,
+        fee_paid: gross_output.saturating_sub(net_output),
+    })
+}
+
+fn simulate_concentrated_exact_input(
+    snapshot: &PoolSnapshot,
+    model: &ConcentratedQuoteModel,
+    direction: &DirectionalConcentratedQuoteModel,
+    a_to_b: bool,
+    input_amount: u64,
+    fee_bps: u16,
+) -> Result<u64, QuoteError> {
+    if input_amount == 0 {
+        return Ok(0);
+    }
+
+    let mut amount_remaining = input_amount;
+    let mut amount_out_total = 0u64;
+    let mut sqrt_price = model.sqrt_price_x64;
+    let mut liquidity = model.liquidity;
+    let mut current_tick = model.current_tick_index;
+    let mut iterations = 0usize;
+    let lower_bound_tick = direction
+        .windows
+        .iter()
+        .map(|window| window.start_tick_index)
+        .min()
+        .ok_or(QuoteError::QuoteModelNotExecutable)?;
+    let upper_bound_tick = direction
+        .windows
+        .iter()
+        .map(|window| window.end_tick_index)
+        .max()
+        .ok_or(QuoteError::QuoteModelNotExecutable)?;
+
+    while amount_remaining > 0 {
+        iterations = iterations.saturating_add(1);
+        if iterations > 512 {
+            return Err(QuoteError::ArithmeticOverflow);
+        }
+
+        let next_tick = next_initialized_tick(direction, current_tick, a_to_b);
+        let target_tick = if let Some(tick) = next_tick {
+            tick
+        } else if a_to_b {
+            lower_bound_tick
+        } else {
+            upper_bound_tick
+        };
+        let target_price = tick_sqrt_price(snapshot.venue, target_tick)?;
+        let step = compute_concentrated_swap_step(
+            sqrt_price,
+            target_price,
+            liquidity,
+            amount_remaining,
+            fee_bps,
+            a_to_b,
+        )?;
+        if step.amount_in == 0 && step.fee_amount == 0 && step.amount_out == 0 {
+            return Err(QuoteError::InvalidSnapshotLiquidity);
+        }
+
+        amount_remaining = amount_remaining
+            .checked_sub(step.amount_in.saturating_add(step.fee_amount))
+            .ok_or(QuoteError::ArithmeticOverflow)?;
+        amount_out_total = amount_out_total
+            .checked_add(step.amount_out)
+            .ok_or(QuoteError::ArithmeticOverflow)?;
+        sqrt_price = step.sqrt_price_next_x64;
+
+        if let Some(tick) = next_tick {
+            if step.sqrt_price_next_x64 == target_price {
+                liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
+                current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                continue;
+            }
+        }
+
+        current_tick = tick_from_sqrt_price(snapshot.venue, sqrt_price)?;
+        if amount_remaining > 0 {
+            if a_to_b && current_tick < lower_bound_tick {
+                return Err(QuoteError::ConcentratedWindowExceeded);
+            }
+            if !a_to_b && current_tick > upper_bound_tick {
+                return Err(QuoteError::ConcentratedWindowExceeded);
+            }
+        }
+        if next_tick.is_none() && amount_remaining > 0 {
+            return Err(QuoteError::ConcentratedWindowExceeded);
+        }
+    }
+
+    Ok(amount_out_total)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConcentratedSwapStep {
+    sqrt_price_next_x64: u128,
+    amount_in: u64,
+    amount_out: u64,
+    fee_amount: u64,
+}
+
+fn compute_concentrated_swap_step(
+    sqrt_price_current_x64: u128,
+    sqrt_price_target_x64: u128,
+    liquidity: u128,
+    amount_remaining: u64,
+    fee_bps: u16,
+    a_to_b: bool,
+) -> Result<ConcentratedSwapStep, QuoteError> {
+    let fee_denominator = 10_000u64;
+    if fee_bps >= fee_denominator as u16 {
+        return Err(QuoteError::InvalidSnapshotLiquidity);
+    }
+
+    let amount_remaining_less_fee = mul_div_floor_u64(
+        amount_remaining,
+        fee_denominator.saturating_sub(u64::from(fee_bps)),
+        fee_denominator,
+    )?;
+    let amount_in_max = amount_in_between_prices(
+        sqrt_price_current_x64,
+        sqrt_price_target_x64,
+        liquidity,
+        a_to_b,
+    )?;
+    let sqrt_price_next_x64 = if amount_remaining_less_fee >= amount_in_max {
+        sqrt_price_target_x64
+    } else {
+        next_sqrt_price_from_input(
+            sqrt_price_current_x64,
+            liquidity,
+            amount_remaining_less_fee,
+            a_to_b,
+        )?
+    };
+
+    let amount_in = amount_in_between_prices(
+        sqrt_price_current_x64,
+        sqrt_price_next_x64,
+        liquidity,
+        a_to_b,
+    )?;
+    let amount_out = amount_out_between_prices(
+        sqrt_price_current_x64,
+        sqrt_price_next_x64,
+        liquidity,
+        a_to_b,
+    )?;
+    let fee_amount = if sqrt_price_next_x64 != sqrt_price_target_x64 {
+        amount_remaining
+            .checked_sub(amount_in)
+            .ok_or(QuoteError::ArithmeticOverflow)?
+    } else {
+        mul_div_ceil_u64(
+            amount_in,
+            u64::from(fee_bps),
+            fee_denominator.saturating_sub(u64::from(fee_bps)),
+        )?
+    };
+
+    Ok(ConcentratedSwapStep {
+        sqrt_price_next_x64,
+        amount_in,
+        amount_out,
+        fee_amount,
+    })
+}
+
+fn amount_in_between_prices(
+    sqrt_price_current_x64: u128,
+    sqrt_price_target_x64: u128,
+    liquidity: u128,
+    a_to_b: bool,
+) -> Result<u64, QuoteError> {
+    if a_to_b {
+        delta_amount_0(
+            sqrt_price_target_x64,
+            sqrt_price_current_x64,
+            liquidity,
+            true,
+        )
+    } else {
+        delta_amount_1(
+            sqrt_price_current_x64,
+            sqrt_price_target_x64,
+            liquidity,
+            true,
+        )
+    }
+}
+
+fn amount_out_between_prices(
+    sqrt_price_current_x64: u128,
+    sqrt_price_target_x64: u128,
+    liquidity: u128,
+    a_to_b: bool,
+) -> Result<u64, QuoteError> {
+    if a_to_b {
+        delta_amount_1(
+            sqrt_price_target_x64,
+            sqrt_price_current_x64,
+            liquidity,
+            false,
+        )
+    } else {
+        delta_amount_0(
+            sqrt_price_current_x64,
+            sqrt_price_target_x64,
+            liquidity,
+            false,
+        )
+    }
+}
+
+fn next_sqrt_price_from_input(
+    sqrt_price_x64: u128,
+    liquidity: u128,
+    amount_in: u64,
+    a_to_b: bool,
+) -> Result<u128, QuoteError> {
+    if a_to_b {
+        next_sqrt_price_from_amount_0_rounding_up(sqrt_price_x64, liquidity, amount_in, true)
+    } else {
+        next_sqrt_price_from_amount_1_rounding_down(sqrt_price_x64, liquidity, amount_in, true)
+    }
+}
+
+fn next_sqrt_price_from_amount_0_rounding_up(
+    sqrt_price_x64: u128,
+    liquidity: u128,
+    amount: u64,
+    add: bool,
+) -> Result<u128, QuoteError> {
+    if amount == 0 {
+        return Ok(sqrt_price_x64);
+    }
+    let numerator_1 = U256::from(liquidity) << 64;
+    if add {
+        let product = U256::from(amount).saturating_mul(U256::from(sqrt_price_x64));
+        let denominator = numerator_1
+            .checked_add(product)
+            .ok_or(QuoteError::ArithmeticOverflow)?;
+        u256_to_u128(mul_div_ceil_u256(
+            numerator_1,
+            U256::from(sqrt_price_x64),
+            denominator,
+        )?)
+    } else {
+        let product = U256::from(amount).saturating_mul(U256::from(sqrt_price_x64));
+        let denominator = numerator_1
+            .checked_sub(product)
+            .ok_or(QuoteError::ArithmeticOverflow)?;
+        u256_to_u128(mul_div_ceil_u256(
+            numerator_1,
+            U256::from(sqrt_price_x64),
+            denominator,
+        )?)
+    }
+}
+
+fn next_sqrt_price_from_amount_1_rounding_down(
+    sqrt_price_x64: u128,
+    liquidity: u128,
+    amount: u64,
+    add: bool,
+) -> Result<u128, QuoteError> {
+    let quotient = if add {
+        (U256::from(amount) << 64)
+            .checked_div(U256::from(liquidity))
+            .ok_or(QuoteError::ArithmeticOverflow)?
+    } else {
+        div_rounding_up_u256(U256::from(amount) << 64, U256::from(liquidity))?
+    };
+    let next = if add {
+        U256::from(sqrt_price_x64)
+            .checked_add(quotient)
+            .ok_or(QuoteError::ArithmeticOverflow)?
+    } else {
+        U256::from(sqrt_price_x64)
+            .checked_sub(quotient)
+            .ok_or(QuoteError::ArithmeticOverflow)?
+    };
+    u256_to_u128(next)
+}
+
+fn increasing_price_order(sqrt_price_0: u128, sqrt_price_1: u128) -> (u128, u128) {
+    if sqrt_price_0 > sqrt_price_1 {
+        (sqrt_price_1, sqrt_price_0)
+    } else {
+        (sqrt_price_0, sqrt_price_1)
+    }
+}
+
+fn delta_amount_0(
+    sqrt_ratio_a_x64: u128,
+    sqrt_ratio_b_x64: u128,
+    liquidity: u128,
+    round_up: bool,
+) -> Result<u64, QuoteError> {
+    let (lower, upper) = increasing_price_order(sqrt_ratio_a_x64, sqrt_ratio_b_x64);
+    let numerator_1 = U256::from(liquidity) << 64;
+    let numerator_2 = U256::from(upper.saturating_sub(lower));
+    let intermediate = if round_up {
+        mul_div_ceil_u256(numerator_1, numerator_2, U256::from(upper))?
+    } else {
+        mul_div_floor_u256(numerator_1, numerator_2, U256::from(upper))?
+    };
+    let result = if round_up {
+        div_rounding_up_u256(intermediate, U256::from(lower))?
+    } else {
+        intermediate
+            .checked_div(U256::from(lower))
+            .ok_or(QuoteError::ArithmeticOverflow)?
+    };
+    u256_to_u64(result)
+}
+
+fn delta_amount_1(
+    sqrt_ratio_a_x64: u128,
+    sqrt_ratio_b_x64: u128,
+    liquidity: u128,
+    round_up: bool,
+) -> Result<u64, QuoteError> {
+    let (lower, upper) = increasing_price_order(sqrt_ratio_a_x64, sqrt_ratio_b_x64);
+    let result = if round_up {
+        mul_div_ceil_u256(
+            U256::from(liquidity),
+            U256::from(upper.saturating_sub(lower)),
+            U256::from(1u128 << 64),
+        )?
+    } else {
+        mul_div_floor_u256(
+            U256::from(liquidity),
+            U256::from(upper.saturating_sub(lower)),
+            U256::from(1u128 << 64),
+        )?
+    };
+    u256_to_u64(result)
+}
+
+fn apply_tick_cross(
+    liquidity: u128,
+    direction: &DirectionalConcentratedQuoteModel,
+    tick_index: i32,
+    a_to_b: bool,
+) -> Result<u128, QuoteError> {
+    let liquidity_net = direction
+        .initialized_ticks
+        .iter()
+        .find(|tick| tick.tick_index == tick_index)
+        .map(|tick| tick.liquidity_net)
+        .ok_or(QuoteError::ConcentratedWindowExceeded)?;
+    if a_to_b {
+        if liquidity_net >= 0 {
+            liquidity
+                .checked_sub(liquidity_net as u128)
+                .ok_or(QuoteError::ArithmeticOverflow)
+        } else {
+            liquidity
+                .checked_add(liquidity_net.unsigned_abs())
+                .ok_or(QuoteError::ArithmeticOverflow)
+        }
+    } else if liquidity_net >= 0 {
+        liquidity
+            .checked_add(liquidity_net as u128)
+            .ok_or(QuoteError::ArithmeticOverflow)
+    } else {
+        liquidity
+            .checked_sub(liquidity_net.unsigned_abs())
+            .ok_or(QuoteError::ArithmeticOverflow)
+    }
+}
+
+fn next_initialized_tick(
+    direction: &DirectionalConcentratedQuoteModel,
+    current_tick: i32,
+    a_to_b: bool,
+) -> Option<i32> {
+    if a_to_b {
+        direction
+            .initialized_ticks
+            .iter()
+            .rev()
+            .find(|tick| tick.tick_index <= current_tick)
+            .map(|tick| tick.tick_index)
+    } else {
+        direction
+            .initialized_ticks
+            .iter()
+            .find(|tick| tick.tick_index > current_tick)
+            .map(|tick| tick.tick_index)
+    }
+}
+
+fn tick_sqrt_price(venue: Option<PoolVenue>, tick: i32) -> Result<u128, QuoteError> {
+    match venue {
+        Some(PoolVenue::RaydiumClmm) => raydium_sqrt_price_at_tick(tick),
+        Some(PoolVenue::OrcaWhirlpool) => Ok(orca_sqrt_price_at_tick(tick)),
+        _ => Err(QuoteError::InvalidSnapshotPrice),
+    }
+}
+
+fn tick_from_sqrt_price(venue: Option<PoolVenue>, sqrt_price_x64: u128) -> Result<i32, QuoteError> {
+    match venue {
+        Some(PoolVenue::RaydiumClmm) => raydium_tick_from_sqrt_price(sqrt_price_x64),
+        Some(PoolVenue::OrcaWhirlpool) => Ok(orca_tick_from_sqrt_price(sqrt_price_x64)),
+        _ => Err(QuoteError::InvalidSnapshotPrice),
+    }
+}
+
+fn orca_sqrt_price_at_tick(tick: i32) -> u128 {
+    const MUL_SHIFT_96: fn(u128, u128) -> u128 = |left, right| {
+        let product = U256::from(left).saturating_mul(U256::from(right));
+        (product >> 96).low_u128()
+    };
+    if tick >= 0 {
+        let mut ratio = if tick & 1 != 0 {
+            79_232_123_823_359_799_118_286_999_567u128
+        } else {
+            79_228_162_514_264_337_593_543_950_336u128
+        };
+        if tick & 2 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_236_085_330_515_764_027_303_304_731);
+        }
+        if tick & 4 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_244_008_939_048_815_603_706_035_061);
+        }
+        if tick & 8 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_259_858_533_276_714_757_314_932_305);
+        }
+        if tick & 16 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_291_567_232_598_584_799_939_703_904);
+        }
+        if tick & 32 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_355_022_692_464_371_645_785_046_466);
+        }
+        if tick & 64 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_482_085_999_252_804_386_437_311_141);
+        }
+        if tick & 128 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 79_736_823_300_114_093_921_829_183_326);
+        }
+        if tick & 256 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 80_248_749_790_819_932_309_965_073_892);
+        }
+        if tick & 512 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 81_282_483_887_344_747_381_513_967_011);
+        }
+        if tick & 1024 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 83_390_072_131_320_151_908_154_831_281);
+        }
+        if tick & 2048 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 87_770_609_709_833_776_024_991_924_138);
+        }
+        if tick & 4096 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 97_234_110_755_111_693_312_479_820_773);
+        }
+        if tick & 8192 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 119_332_217_159_966_728_226_237_229_890);
+        }
+        if tick & 16_384 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 179_736_315_981_702_064_433_883_588_727);
+        }
+        if tick & 32_768 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 407_748_233_172_238_350_107_850_275_304);
+        }
+        if tick & 65_536 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 2_098_478_828_474_011_932_436_660_412_517);
+        }
+        if tick & 131_072 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 55_581_415_166_113_811_149_459_800_483_533);
+        }
+        if tick & 262_144 != 0 {
+            ratio = MUL_SHIFT_96(ratio, 38_992_368_544_603_139_932_233_054_999_993_551);
+        }
+        ratio >> 32
+    } else {
+        let abs_tick = tick.abs();
+        let mut ratio = if abs_tick & 1 != 0 {
+            18_445_821_805_675_392_311u128
+        } else {
+            18_446_744_073_709_551_616u128
+        };
+        if abs_tick & 2 != 0 {
+            ratio = (ratio * 18_444_899_583_751_176_498) >> 64;
+        }
+        if abs_tick & 4 != 0 {
+            ratio = (ratio * 18_443_055_278_223_354_162) >> 64;
+        }
+        if abs_tick & 8 != 0 {
+            ratio = (ratio * 18_439_367_220_385_604_838) >> 64;
+        }
+        if abs_tick & 16 != 0 {
+            ratio = (ratio * 18_431_993_317_065_449_817) >> 64;
+        }
+        if abs_tick & 32 != 0 {
+            ratio = (ratio * 18_417_254_355_718_160_513) >> 64;
+        }
+        if abs_tick & 64 != 0 {
+            ratio = (ratio * 18_387_811_781_193_591_352) >> 64;
+        }
+        if abs_tick & 128 != 0 {
+            ratio = (ratio * 18_329_067_761_203_520_168) >> 64;
+        }
+        if abs_tick & 256 != 0 {
+            ratio = (ratio * 18_212_142_134_806_087_854) >> 64;
+        }
+        if abs_tick & 512 != 0 {
+            ratio = (ratio * 17_980_523_815_641_551_639) >> 64;
+        }
+        if abs_tick & 1024 != 0 {
+            ratio = (ratio * 17_526_086_738_831_147_013) >> 64;
+        }
+        if abs_tick & 2048 != 0 {
+            ratio = (ratio * 16_651_378_430_235_024_244) >> 64;
+        }
+        if abs_tick & 4096 != 0 {
+            ratio = (ratio * 15_030_750_278_693_429_944) >> 64;
+        }
+        if abs_tick & 8192 != 0 {
+            ratio = (ratio * 12_247_334_978_882_834_399) >> 64;
+        }
+        if abs_tick & 16_384 != 0 {
+            ratio = (ratio * 8_131_365_268_884_726_200) >> 64;
+        }
+        if abs_tick & 32_768 != 0 {
+            ratio = (ratio * 3_584_323_654_723_342_297) >> 64;
+        }
+        if abs_tick & 65_536 != 0 {
+            ratio = (ratio * 696_457_651_847_595_233) >> 64;
+        }
+        if abs_tick & 131_072 != 0 {
+            ratio = (ratio * 26_294_789_957_452_057) >> 64;
+        }
+        if abs_tick & 262_144 != 0 {
+            ratio = (ratio * 37_481_735_321_082) >> 64;
+        }
+        ratio
+    }
+}
+
+fn orca_tick_from_sqrt_price(sqrt_price_x64: u128) -> i32 {
+    let msb = 128 - sqrt_price_x64.leading_zeros() - 1;
+    let log2p_integer_x32 = (msb as i128 - 64) << 32;
+    let mut bit = 0x8000_0000_0000_0000i128;
+    let mut precision = 0;
+    let mut log2p_fraction_x64 = 0i128;
+    let mut r = if msb >= 64 {
+        sqrt_price_x64 >> (msb - 63)
+    } else {
+        sqrt_price_x64 << (63 - msb)
+    };
+    while bit > 0 && precision < 14 {
+        r = r.saturating_mul(r);
+        let is_r_more_than_two = r >> 127;
+        r >>= 63 + is_r_more_than_two;
+        log2p_fraction_x64 += bit * is_r_more_than_two as i128;
+        bit >>= 1;
+        precision += 1;
+    }
+    let log2p_x32 = log2p_integer_x32 + (log2p_fraction_x64 >> 32);
+    let logbp_x64 = log2p_x32 * 59_543_866_431_248i128;
+    let tick_low = ((logbp_x64 - 184_467_440_737_095_516i128) >> 64) as i32;
+    let tick_high = ((logbp_x64 + 15_793_534_762_490_258_745i128) >> 64) as i32;
+    if tick_low == tick_high {
+        tick_low
+    } else if orca_sqrt_price_at_tick(tick_high) <= sqrt_price_x64 {
+        tick_high
+    } else {
+        tick_low
+    }
+}
+
+fn raydium_sqrt_price_at_tick(tick: i32) -> Result<u128, QuoteError> {
+    let abs_tick = tick.abs() as u32;
+    if abs_tick > 443_636 {
+        return Err(QuoteError::InvalidSnapshotPrice);
+    }
+    let mut ratio = if abs_tick & 0x1 != 0 {
+        U256::from(0xfffcb933bd6fb800u64)
+    } else {
+        U256::from(1u128 << 64)
+    };
+    const FACTORS: [u64; 18] = [
+        0xfff97272373d4000,
+        0xfff2e50f5f657000,
+        0xffe5caca7e10f000,
+        0xffcb9843d60f7000,
+        0xff973b41fa98e800,
+        0xff2ea16466c9b000,
+        0xfe5dee046a9a3800,
+        0xfcbe86c7900bb000,
+        0xf987a7253ac65800,
+        0xf3392b0822bb6000,
+        0xe7159475a2caf000,
+        0xd097f3bdfd2f2000,
+        0xa9f746462d9f8000,
+        0x70d869a156f31c00,
+        0x31be135f97ed3200,
+        0x09aa508b5b85a500,
+        0x005d6af8dedc582c,
+        0x00002216e584f5fa,
+    ];
+    for (bit, factor) in FACTORS.into_iter().enumerate() {
+        if abs_tick & (1 << (bit + 1)) != 0 {
+            ratio = (ratio * U256::from(factor)) >> 64;
+        }
+    }
+    if tick > 0 {
+        ratio = U256::MAX / ratio;
+    }
+    u256_to_u128(ratio)
+}
+
+fn raydium_tick_from_sqrt_price(sqrt_price_x64: u128) -> Result<i32, QuoteError> {
+    if !(4_295_048_016..79_226_673_521_066_979_257_578_248_091u128).contains(&sqrt_price_x64) {
+        return Err(QuoteError::InvalidSnapshotPrice);
+    }
+    let msb = 128 - sqrt_price_x64.leading_zeros() - 1;
+    let log2p_integer_x32 = (msb as i128 - 64) << 32;
+    let mut bit = 0x8000_0000_0000_0000i128;
+    let mut precision = 0;
+    let mut log2p_fraction_x64 = 0i128;
+    let mut r = if msb >= 64 {
+        sqrt_price_x64 >> (msb - 63)
+    } else {
+        sqrt_price_x64 << (63 - msb)
+    };
+    while bit > 0 && precision < 16 {
+        r = r.saturating_mul(r);
+        let is_r_more_than_two = r >> 127;
+        r >>= 63 + is_r_more_than_two;
+        log2p_fraction_x64 += bit * is_r_more_than_two as i128;
+        bit >>= 1;
+        precision += 1;
+    }
+    let log2p_x32 = log2p_integer_x32 + (log2p_fraction_x64 >> 32);
+    let log_sqrt_10001_x64 = log2p_x32 * 59_543_866_431_248i128;
+    let tick_low = ((log_sqrt_10001_x64 - 184_467_440_737_095_516i128) >> 64) as i32;
+    let tick_high = ((log_sqrt_10001_x64 + 15_793_534_762_490_258_745i128) >> 64) as i32;
+    if tick_low == tick_high {
+        Ok(tick_low)
+    } else if raydium_sqrt_price_at_tick(tick_high)? <= sqrt_price_x64 {
+        Ok(tick_high)
+    } else {
+        Ok(tick_low)
+    }
+}
+
+fn mul_div_floor_u64(value: u64, numerator: u64, denominator: u64) -> Result<u64, QuoteError> {
+    if denominator == 0 {
+        return Err(QuoteError::ArithmeticOverflow);
+    }
+    u256_to_u64(
+        U256::from(value)
+            .checked_mul(U256::from(numerator))
+            .ok_or(QuoteError::ArithmeticOverflow)?
+            / U256::from(denominator),
+    )
+}
+
+fn mul_div_ceil_u64(value: u64, numerator: u64, denominator: u64) -> Result<u64, QuoteError> {
+    if denominator == 0 {
+        return Err(QuoteError::ArithmeticOverflow);
+    }
+    u256_to_u64(div_rounding_up_u256(
+        U256::from(value)
+            .checked_mul(U256::from(numerator))
+            .ok_or(QuoteError::ArithmeticOverflow)?,
+        U256::from(denominator),
+    )?)
+}
+
+fn mul_div_floor_u256(left: U256, right: U256, denominator: U256) -> Result<U256, QuoteError> {
+    left.checked_mul(right)
+        .ok_or(QuoteError::ArithmeticOverflow)?
+        .checked_div(denominator)
+        .ok_or(QuoteError::ArithmeticOverflow)
+}
+
+fn mul_div_ceil_u256(left: U256, right: U256, denominator: U256) -> Result<U256, QuoteError> {
+    let numerator = left
+        .checked_mul(right)
+        .ok_or(QuoteError::ArithmeticOverflow)?;
+    div_rounding_up_u256(numerator, denominator)
+}
+
+fn div_rounding_up_u256(numerator: U256, denominator: U256) -> Result<U256, QuoteError> {
+    if denominator.is_zero() {
+        return Err(QuoteError::ArithmeticOverflow);
+    }
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.is_zero() {
+        Ok(quotient)
+    } else {
+        quotient
+            .checked_add(U256::one())
+            .ok_or(QuoteError::ArithmeticOverflow)
+    }
+}
+
+fn u256_to_u64(value: U256) -> Result<u64, QuoteError> {
+    if value > U256::from(u64::MAX) {
+        return Err(QuoteError::ArithmeticOverflow);
+    }
+    Ok(value.low_u64())
+}
+
+fn u256_to_u128(value: U256) -> Result<u128, QuoteError> {
+    if value > U256::from(u128::MAX) {
+        return Err(QuoteError::ArithmeticOverflow);
+    }
+    Ok(value.low_u128())
 }
 
 #[cfg(test)]

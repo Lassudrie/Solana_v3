@@ -127,6 +127,7 @@ mod tests {
         OpportunityCandidate {
             route_id: RouteId("route-a".into()),
             quoted_slot: 42,
+            leg_snapshot_slots: [42, 42],
             trade_size: 10_000,
             active_execution_buffer_bps: None,
             expected_net_output: 10_250,

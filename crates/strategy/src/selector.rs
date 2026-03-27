@@ -1,7 +1,7 @@
 use crate::{
     guards::GuardrailSet,
     opportunity::{OpportunityCandidate, OpportunityDecision, SelectionOutcome},
-    quote::{LocalTwoLegQuoteEngine, QuoteEngine, QuoteExecutionAdjustments},
+    quote::{LocalTwoLegQuoteEngine, PoolPricingView, QuoteEngine, QuoteExecutionAdjustments},
     reasons::RejectionReason,
     route_registry::{RouteDefinition, RouteRegistry, SwapSide},
 };
@@ -125,7 +125,7 @@ where
         if let Some(snapshot) = sol_quote_conversion_snapshot {
             snapshots.push(snapshot);
         }
-        self.guards.evaluate_snapshots(&snapshots)?;
+        self.guards.evaluate_snapshots(state, &snapshots)?;
 
         let mut best_candidate: Option<OpportunityCandidate> = None;
         let mut last_rejection = None;
@@ -135,7 +135,16 @@ where
                 .quote_engine
                 .quote(
                     route,
-                    [first, second],
+                    [
+                        PoolPricingView {
+                            snapshot: first,
+                            concentrated: state.concentrated_quote_model(&route.legs[0].pool_id),
+                        },
+                        PoolPricingView {
+                            snapshot: second,
+                            concentrated: state.concentrated_quote_model(&route.legs[1].pool_id),
+                        },
+                    ],
                     state.latest_slot(),
                     trade_size,
                     &adjustments,
@@ -166,6 +175,7 @@ where
                     let candidate = OpportunityCandidate {
                         route_id: route.route_id.clone(),
                         quoted_slot: quote.quoted_slot,
+                        leg_snapshot_slots: [first.last_update_slot, second.last_update_slot],
                         trade_size: quote.input_amount,
                         active_execution_buffer_bps: route
                             .execution_protection
@@ -320,14 +330,17 @@ mod tests {
     use super::{OpportunitySelector, trade_sizes};
     use crate::{
         guards::{GuardrailConfig, GuardrailSet},
-        quote::{LegQuote, QuoteEngine, QuoteError, QuoteExecutionAdjustments, RouteQuote},
+        quote::{
+            LegQuote, PoolPricingView, QuoteEngine, QuoteError, QuoteExecutionAdjustments,
+            RouteQuote,
+        },
         route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
     };
     use detection::events::SnapshotConfidence;
     use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate};
     use state::{
         StatePlane,
-        types::{ExecutionStateSnapshot, PoolId, PoolSnapshot, RouteId},
+        types::{ExecutionStateSnapshot, PoolId, RouteId},
     };
 
     #[derive(Debug, Default)]
@@ -337,7 +350,7 @@ mod tests {
         fn quote(
             &self,
             route: &RouteDefinition,
-            _snapshots: [&PoolSnapshot; 2],
+            _snapshots: [PoolPricingView<'_>; 2],
             quoted_slot: u64,
             input_amount: u64,
             adjustments: &QuoteExecutionAdjustments,
@@ -513,6 +526,7 @@ mod tests {
 
         assert_eq!(candidate.trade_size, 250_000);
         assert_eq!(candidate.expected_net_profit_quote_atoms, 25);
+        assert_eq!(candidate.leg_snapshot_slots, [10, 10]);
     }
 
     #[test]
@@ -585,5 +599,72 @@ mod tests {
 
         assert_eq!(candidate.trade_size, 500_000);
         assert_eq!(candidate.active_execution_buffer_bps, Some(50));
+    }
+
+    #[test]
+    fn selector_carries_leg_snapshot_slots_even_when_head_slot_is_newer() {
+        let route = route_definition();
+        let execution_state = ExecutionStateSnapshot {
+            head_slot: 12,
+            rpc_slot: Some(12),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(12),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        };
+        let selector = OpportunitySelector::new(
+            MockQuoteEngine,
+            GuardrailSet::new(GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: false,
+                ..GuardrailConfig::default()
+            }),
+        );
+        let mut state = StatePlane::new(4);
+        state
+            .execution_state_mut()
+            .set_wallet_state(1_000_000, true);
+        state.execution_state_mut().set_rpc_slot(12);
+        state.execution_state_mut().set_blockhash("blockhash-1", 12);
+
+        for (pool_id, slot) in [("pool-a", 8), ("pool-b", 11)] {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    1,
+                    slot,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.into(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 10_000_000,
+                        reserve_a: Some(10_000_000),
+                        reserve_b: Some(10_000_000),
+                        active_liquidity: Some(10_000_000),
+                        sqrt_price_x64: None,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: "SOL".into(),
+                        token_mint_b: "USDC".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot,
+                        write_version: 1,
+                    },
+                ))
+                .expect("snapshot update should apply");
+        }
+        state.set_latest_slot(12);
+
+        let candidate = selector
+            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .expect("candidate should be selected");
+
+        assert_eq!(candidate.quoted_slot, 12);
+        assert_eq!(candidate.leg_snapshot_slots, [8, 11]);
+        assert_eq!(candidate.oldest_leg_snapshot_slot(), 8);
     }
 }

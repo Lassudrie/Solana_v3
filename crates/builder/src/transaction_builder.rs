@@ -8,6 +8,7 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use solana_system_interface::instruction;
+use state::quote_models::{derive_orca_tick_arrays, derive_raydium_tick_arrays};
 
 use crate::{
     execution::{
@@ -30,8 +31,6 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNs
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
 const RAYDIUM_SWAP_BASE_OUT_TAG: u8 = 11;
-const ORCA_WHIRLPOOL_TICK_ARRAY_SIZE: i32 = 88;
-const RAYDIUM_CLMM_TICK_ARRAY_SIZE: i32 = 60;
 
 pub trait TransactionBuilder: Send + Sync {
     fn build(&self, request: BuildRequest) -> BuildResult;
@@ -83,7 +82,7 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
         if request
             .dynamic
             .head_slot
-            .saturating_sub(request.candidate.quoted_slot)
+            .saturating_sub(request.candidate.oldest_leg_snapshot_slot())
             > route_execution.max_quote_slot_lag
         {
             return rejected(BuildRejectionReason::QuoteStaleForExecution);
@@ -749,73 +748,8 @@ fn associated_token_address(owner: &Pubkey, mint: &Pubkey, token_program: &Pubke
     .0
 }
 
-fn derive_orca_tick_arrays(
-    program_id: Pubkey,
-    whirlpool: Pubkey,
-    tick_spacing: u16,
-    current_tick_index: i32,
-    a_to_b: bool,
-) -> [Pubkey; 3] {
-    let offsets = if a_to_b { [0, -1, -2] } else { [0, 1, 2] };
-    offsets.map(|offset| {
-        let start_tick_index = tick_array_start_index(
-            current_tick_index,
-            tick_spacing,
-            ORCA_WHIRLPOOL_TICK_ARRAY_SIZE,
-            offset,
-        );
-        Pubkey::find_program_address(
-            &[
-                b"tick_array",
-                whirlpool.as_ref(),
-                start_tick_index.to_string().as_bytes(),
-            ],
-            &program_id,
-        )
-        .0
-    })
-}
-
 fn derive_orca_oracle(program_id: Pubkey, whirlpool: Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"oracle", whirlpool.as_ref()], &program_id).0
-}
-
-fn derive_raydium_tick_arrays(
-    program_id: Pubkey,
-    pool_state: Pubkey,
-    tick_spacing: u16,
-    current_tick_index: i32,
-    zero_for_one: bool,
-) -> [Pubkey; 3] {
-    let offsets = if zero_for_one { [0, -1, -2] } else { [0, 1, 2] };
-    offsets.map(|offset| {
-        let start_tick_index = tick_array_start_index(
-            current_tick_index,
-            tick_spacing,
-            RAYDIUM_CLMM_TICK_ARRAY_SIZE,
-            offset,
-        );
-        Pubkey::find_program_address(
-            &[
-                b"tick_array",
-                pool_state.as_ref(),
-                &start_tick_index.to_be_bytes(),
-            ],
-            &program_id,
-        )
-        .0
-    })
-}
-
-fn tick_array_start_index(
-    current_tick_index: i32,
-    tick_spacing: u16,
-    tick_array_size: i32,
-    offset: i32,
-) -> i32 {
-    let ticks_in_array = i32::from(tick_spacing) * tick_array_size;
-    let real_index = current_tick_index.div_euclid(ticks_in_array);
-    (real_index + offset) * ticks_in_array
 }
 
 fn effective_u32(value: u32, default_value: u32) -> u32 {

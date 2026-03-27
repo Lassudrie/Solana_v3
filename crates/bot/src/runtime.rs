@@ -432,7 +432,15 @@ impl BotRuntime {
             .state
             .pool_snapshots_for(&state_outcome.impacted_pools);
         if let Ok(mut route_health) = self.route_health.lock() {
-            route_health.on_pool_snapshots(&pool_snapshots, pipeline_trace.observed_slot);
+            for snapshot in &pool_snapshots {
+                route_health.on_pool_snapshot(
+                    snapshot,
+                    self.hot_path
+                        .state
+                        .pool_has_executable_quote_model(&snapshot.pool_id),
+                    pipeline_trace.observed_slot,
+                );
+            }
         }
         if state_outcome.impacted_routes.is_empty() {
             return Ok(HotPathReport {

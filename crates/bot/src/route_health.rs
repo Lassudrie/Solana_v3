@@ -28,6 +28,7 @@ pub enum RouteHealthState {
     Eligible,
     BlockedPoolStale,
     BlockedPoolNotExecutable,
+    BlockedPoolQuoteModelNotExecutable,
     BlockedPoolRepair,
     BlockedPoolQuarantined,
     BlockedPoolDisabled,
@@ -90,6 +91,7 @@ struct PoolHealthRecord {
     repair_pending: bool,
     repair_in_flight: bool,
     snapshot_executable: bool,
+    snapshot_quote_model_executable: bool,
     snapshot_stale: bool,
     consecutive_refresh_failures: u32,
     consecutive_repair_failures: u32,
@@ -142,11 +144,17 @@ impl RouteHealthRegistry {
         }
     }
 
-    pub fn on_pool_snapshot(&mut self, snapshot: &PoolSnapshot, observed_slot: u64) {
+    pub fn on_pool_snapshot(
+        &mut self,
+        snapshot: &PoolSnapshot,
+        quote_model_executable: bool,
+        observed_slot: u64,
+    ) {
         let record = self.pools.entry(snapshot.pool_id.0.clone()).or_default();
         record.last_snapshot_slot = Some(snapshot.last_update_slot);
         record.last_live_mutation_slot = Some(observed_slot);
         record.snapshot_executable = snapshot.is_executable();
+        record.snapshot_quote_model_executable = quote_model_executable;
         record.snapshot_stale = snapshot.freshness.is_stale;
         record.repair_pending = snapshot.repair_pending || record.repair_pending;
         if snapshot.is_executable() {
@@ -156,12 +164,6 @@ impl RouteHealthRegistry {
         }
         if snapshot.is_executable() && !snapshot.freshness.is_stale {
             record.reset_on_executable_recovery(snapshot.last_update_slot);
-        }
-    }
-
-    pub fn on_pool_snapshots(&mut self, snapshots: &[PoolSnapshot], observed_slot: u64) {
-        for snapshot in snapshots {
-            self.on_pool_snapshot(snapshot, observed_slot);
         }
     }
 
@@ -460,6 +462,26 @@ impl RouteHealthRegistry {
                         ),
                     });
                 }
+                PoolBlock::QuoteModelNotExecutable => {
+                    return Some(RouteMonitorView {
+                        route_id: route_id.to_string(),
+                        health_state: RouteHealthState::BlockedPoolQuoteModelNotExecutable,
+                        eligible_live: false,
+                        pool_ids: route_pool_ids,
+                        blocking_pool_id: Some(pool_id.clone()),
+                        blocking_reason: Some("pool_quote_model_not_executable".into()),
+                        recent_chain_failure_count: recent_failures(
+                            &route_record.recent_failure_slots,
+                            observed_slot,
+                            self.config.route_failure_window_slots,
+                        ),
+                        last_success_slot: route_record.last_success_slot,
+                        shadow_until_slot: active_shadow_until(
+                            route_record.shadow_until_slot,
+                            observed_slot,
+                        ),
+                    });
+                }
             }
         }
 
@@ -525,6 +547,9 @@ impl RouteHealthRegistry {
         if !record.snapshot_executable {
             return PoolBlock::NotExecutable;
         }
+        if !record.snapshot_quote_model_executable {
+            return PoolBlock::QuoteModelNotExecutable;
+        }
         PoolBlock::None
     }
 
@@ -543,7 +568,9 @@ impl RouteHealthRegistry {
                     PoolHealthState::RepairPending
                 }
             }
-            PoolBlock::Stale | PoolBlock::NotExecutable => PoolHealthState::Degraded,
+            PoolBlock::Stale | PoolBlock::NotExecutable | PoolBlock::QuoteModelNotExecutable => {
+                PoolHealthState::Degraded
+            }
         }
     }
 }
@@ -599,6 +626,7 @@ enum PoolBlock {
     Repair,
     Stale,
     NotExecutable,
+    QuoteModelNotExecutable,
 }
 
 fn active_shadow_until(shadow_until_slot: Option<u64>, observed_slot: u64) -> Option<u64> {
@@ -677,10 +705,12 @@ mod tests {
         );
         registry.on_pool_snapshot(
             &snapshot("pool-a", 10, 10, PoolConfidence::Executable, false),
+            true,
             10,
         );
         registry.on_pool_snapshot(
             &snapshot("pool-b", 10, 10, PoolConfidence::Executable, false),
+            true,
             10,
         );
 
@@ -715,6 +745,7 @@ mod tests {
 
         registry.on_pool_snapshot(
             &snapshot("pool-a", 12, 12, PoolConfidence::Executable, false),
+            true,
             12,
         );
         registry.on_repair_transition("pool-a", PoolHealthTransition::RepairFailed, 20);
@@ -740,10 +771,12 @@ mod tests {
         );
         registry.on_pool_snapshot(
             &snapshot("pool-a", 10, 10, PoolConfidence::Executable, false),
+            true,
             10,
         );
         registry.on_pool_snapshot(
             &snapshot("pool-b", 10, 10, PoolConfidence::Executable, false),
+            true,
             10,
         );
         registry.on_execution_failure(

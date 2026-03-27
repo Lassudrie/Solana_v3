@@ -69,6 +69,44 @@ pub struct PoolSnapshotUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitializedTickUpdate {
+    pub tick_index: i32,
+    pub liquidity_net: i128,
+    pub liquidity_gross: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TickArrayWindowUpdate {
+    pub start_tick_index: i32,
+    pub end_tick_index: i32,
+    pub initialized_tick_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectionalPoolQuoteModelUpdate {
+    pub loaded_tick_arrays: usize,
+    pub expected_tick_arrays: usize,
+    pub complete: bool,
+    pub windows: Vec<TickArrayWindowUpdate>,
+    pub initialized_ticks: Vec<InitializedTickUpdate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolQuoteModelUpdate {
+    pub pool_id: String,
+    pub liquidity: u128,
+    pub sqrt_price_x64: u128,
+    pub current_tick_index: i32,
+    pub tick_spacing: u16,
+    pub required_a_to_b: bool,
+    pub required_b_to_a: bool,
+    pub a_to_b: Option<DirectionalPoolQuoteModelUpdate>,
+    pub b_to_a: Option<DirectionalPoolQuoteModelUpdate>,
+    pub slot: u64,
+    pub write_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolInvalidation {
     pub pool_id: String,
 }
@@ -89,6 +127,7 @@ pub struct Heartbeat {
 pub enum MarketEvent {
     AccountUpdate(AccountUpdate),
     PoolSnapshotUpdate(PoolSnapshotUpdate),
+    PoolQuoteModelUpdate(PoolQuoteModelUpdate),
     PoolInvalidation(PoolInvalidation),
     SlotBoundary(SlotBoundary),
     Heartbeat(Heartbeat),
@@ -127,6 +166,20 @@ impl NormalizedEvent {
             sequence,
             observed_slot,
             MarketEvent::PoolSnapshotUpdate(update),
+        )
+    }
+
+    pub fn pool_quote_model_update(
+        source: EventSourceKind,
+        sequence: u64,
+        observed_slot: u64,
+        update: PoolQuoteModelUpdate,
+    ) -> Self {
+        Self::with_payload(
+            source,
+            sequence,
+            observed_slot,
+            MarketEvent::PoolQuoteModelUpdate(update),
         )
     }
 

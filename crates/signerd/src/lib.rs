@@ -159,37 +159,97 @@ fn handle_client(
     keypair: Arc<Keypair>,
     mut stream: UnixStream,
 ) -> Result<(), SecureSignerServiceError> {
-    let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let response = match serde_json::from_str::<SignerRequest>(line.trim_end()) {
-        Ok(SignerRequest::GetPublicKey) => SignerResponse::PublicKey {
-            pubkey: keypair.pubkey().to_string(),
-        },
-        Ok(SignerRequest::SignMessage { message_base64 }) => {
-            match BASE64_STANDARD.decode(message_base64) {
-                Ok(message) => match keypair.try_sign_message(&message) {
-                    Ok(signature) => SignerResponse::Signature {
-                        signature: signature.to_string(),
+    let mut reader = BufReader::new(stream.try_clone()?);
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let response = match serde_json::from_str::<SignerRequest>(line.trim_end()) {
+            Ok(SignerRequest::GetPublicKey) => SignerResponse::PublicKey {
+                pubkey: keypair.pubkey().to_string(),
+            },
+            Ok(SignerRequest::SignMessage { message_base64 }) => {
+                match BASE64_STANDARD.decode(message_base64) {
+                    Ok(message) => match keypair.try_sign_message(&message) {
+                        Ok(signature) => SignerResponse::Signature {
+                            signature: signature.to_string(),
+                        },
+                        Err(error) => SignerResponse::Error {
+                            code: "sign_failed".into(),
+                            message: error.to_string(),
+                        },
                     },
                     Err(error) => SignerResponse::Error {
-                        code: "sign_failed".into(),
+                        code: "invalid_message".into(),
                         message: error.to_string(),
                     },
-                },
-                Err(error) => SignerResponse::Error {
-                    code: "invalid_message".into(),
-                    message: error.to_string(),
-                },
+                }
             }
-        }
-        Err(error) => SignerResponse::Error {
-            code: "invalid_request".into(),
-            message: error.to_string(),
-        },
+            Err(error) => SignerResponse::Error {
+                code: "invalid_request".into(),
+                message: error.to_string(),
+            },
+        };
+
+        serde_json::to_writer(&mut stream, &response)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixStream,
+        sync::Arc,
+        thread,
     };
 
-    serde_json::to_writer(&mut stream, &response)?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    Ok(())
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use signing::protocol::{SignerRequest, SignerResponse};
+    use solana_sdk::signer::keypair::Keypair;
+
+    use super::handle_client;
+
+    #[test]
+    fn handle_client_serves_multiple_requests_on_one_connection() {
+        let keypair = Arc::new(Keypair::new_from_array([21; 32]));
+        let (mut client, server) = UnixStream::pair().expect("unix pair");
+
+        let join = thread::spawn(move || handle_client(keypair, server).expect("handle client"));
+
+        serde_json::to_writer(&mut client, &SignerRequest::GetPublicKey)
+            .expect("write pubkey request");
+        client.write_all(b"\n").expect("newline");
+        serde_json::to_writer(
+            &mut client,
+            &SignerRequest::SignMessage {
+                message_base64: BASE64_STANDARD.encode(b"message"),
+            },
+        )
+        .expect("write sign request");
+        client.write_all(b"\n").expect("newline");
+        client.flush().expect("flush requests");
+
+        let mut reader = BufReader::new(client.try_clone().expect("clone client"));
+        let mut first = String::new();
+        reader.read_line(&mut first).expect("read first response");
+        let mut second = String::new();
+        reader.read_line(&mut second).expect("read second response");
+
+        let first: SignerResponse =
+            serde_json::from_str(first.trim_end()).expect("parse first response");
+        let second: SignerResponse =
+            serde_json::from_str(second.trim_end()).expect("parse second response");
+
+        assert!(matches!(first, SignerResponse::PublicKey { .. }));
+        assert!(matches!(second, SignerResponse::Signature { .. }));
+
+        drop(reader);
+        drop(client);
+        join.join().expect("join handler");
+    }
 }

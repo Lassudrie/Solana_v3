@@ -301,6 +301,8 @@ impl JitoHttpClient {
             .default_headers(default_headers)
             .connect_timeout(Duration::from_millis(config.connect_timeout_ms))
             .timeout(Duration::from_millis(config.request_timeout_ms))
+            .tcp_nodelay(true)
+            .pool_max_idle_per_host(config.retry_attempts.max(2))
             .build()
             .expect("jito HTTP client should build with valid static defaults");
 

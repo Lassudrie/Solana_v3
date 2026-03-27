@@ -57,7 +57,11 @@ impl GuardrailSet {
         Ok(())
     }
 
-    pub fn evaluate_snapshots(&self, snapshots: &[&PoolSnapshot]) -> Result<(), RejectionReason> {
+    pub fn evaluate_snapshots(
+        &self,
+        state: &StatePlane,
+        snapshots: &[&PoolSnapshot],
+    ) -> Result<(), RejectionReason> {
         for snapshot in snapshots {
             if snapshot.freshness.is_stale {
                 if snapshot.repair_pending {
@@ -80,7 +84,7 @@ impl GuardrailSet {
                     pool_id: snapshot.pool_id.clone(),
                 });
             }
-            if !snapshot.has_executable_quote_model() {
+            if !state.pool_has_executable_quote_model(&snapshot.pool_id) {
                 return Err(RejectionReason::PoolQuoteModelNotExecutable {
                     pool_id: snapshot.pool_id.clone(),
                 });
@@ -141,6 +145,9 @@ impl GuardrailSet {
 
 #[cfg(test)]
 mod tests {
+    use detection::events::SnapshotConfidence;
+    use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate};
+    use state::StatePlane;
     use state::types::{
         ExecutionStateSnapshot, FreshnessState, LiquidityModel, PoolConfidence, PoolId,
         PoolSnapshot, RouteId,
@@ -213,14 +220,47 @@ mod tests {
         }
     }
 
+    fn state_with_snapshots(snapshots: &[PoolSnapshot]) -> StatePlane {
+        let mut state = StatePlane::new(2);
+        for (index, snapshot) in snapshots.iter().enumerate() {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    index as u64 + 1,
+                    snapshot.last_update_slot,
+                    PoolSnapshotUpdate {
+                        pool_id: snapshot.pool_id.0.clone(),
+                        price_bps: snapshot.price_bps,
+                        fee_bps: snapshot.fee_bps,
+                        reserve_depth: snapshot.reserve_depth,
+                        reserve_a: snapshot.reserve_a,
+                        reserve_b: snapshot.reserve_b,
+                        active_liquidity: Some(snapshot.active_liquidity),
+                        sqrt_price_x64: snapshot.sqrt_price_x64,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(snapshot.repair_pending),
+                        token_mint_a: snapshot.token_mint_a.clone(),
+                        token_mint_b: snapshot.token_mint_b.clone(),
+                        tick_spacing: snapshot.tick_spacing,
+                        current_tick_index: snapshot.current_tick_index,
+                        slot: snapshot.last_update_slot,
+                        write_version: index as u64 + 1,
+                    },
+                ))
+                .expect("snapshot event should apply");
+        }
+        state
+    }
+
     #[test]
     fn rejects_exact_but_stale_snapshot() {
         let guards = GuardrailSet::new(GuardrailConfig::default());
         let first = executable_snapshot("pool-a", 3);
         let second = executable_snapshot("pool-b", 0);
+        let state = state_with_snapshots(&[first.clone(), second.clone()]);
 
         let rejection = guards
-            .evaluate_snapshots(&[&first, &second])
+            .evaluate_snapshots(&state, &[&first, &second])
             .expect_err("stale snapshots should be rejected");
 
         assert_eq!(
@@ -243,9 +283,10 @@ mod tests {
         first.reserve_a = None;
         first.reserve_b = None;
         let second = executable_snapshot("pool-b", 0);
+        let state = state_with_snapshots(&[first.clone(), second.clone()]);
 
         let rejection = guards
-            .evaluate_snapshots([&first, &second].as_slice())
+            .evaluate_snapshots(&state, [&first, &second].as_slice())
             .expect_err("clmm quotes should be blocked until tick-aware modeling exists");
 
         assert_eq!(

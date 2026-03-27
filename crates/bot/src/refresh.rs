@@ -4,16 +4,17 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
-use solana_address_lookup_table_interface::{program as alt_program, state::AddressLookupTable};
 use state::types::LookupTableSnapshot;
 
+use crate::account_batcher::{
+    GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcContext, decode_lookup_table,
+};
 use crate::config::AsyncRefreshConfig;
+use crate::rpc::{RpcError, RpcRateLimitBackoff, rpc_call};
 
-const JSON_RPC_VERSION: &str = "2.0";
 const MOCK_SCHEME: &str = "mock://";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,14 +66,16 @@ enum RefreshUpdate {
 
 pub struct AsyncStateRefresher {
     receiver: Receiver<RefreshUpdate>,
+    lookup_table_cache: LookupTableCacheHandle,
 }
 
 impl AsyncStateRefresher {
-    pub fn new(
+    pub(crate) fn new(
         config: &AsyncRefreshConfig,
         rpc_http_endpoint: &str,
         wallet_pubkey: &str,
         lookup_table_keys: &[String],
+        account_batcher: GetMultipleAccountsBatcher,
     ) -> Self {
         if !config.enabled
             || rpc_http_endpoint.is_empty()
@@ -82,6 +85,7 @@ impl AsyncStateRefresher {
         }
 
         let (sender, receiver) = mpsc::channel();
+        let lookup_table_cache = LookupTableCacheHandle::default();
 
         if config.blockhash_refresh_millis > 0 {
             spawn_refresher(
@@ -105,12 +109,16 @@ impl AsyncStateRefresher {
 
         if config.alt_refresh_millis > 0 && !lookup_table_keys.is_empty() {
             let lookup_table_keys = lookup_table_keys.to_vec();
+            let account_batcher = account_batcher.clone();
+            let lookup_table_cache = lookup_table_cache.clone();
             spawn_refresher(
                 sender.clone(),
                 Duration::from_millis(config.alt_refresh_millis),
                 "lookup_tables",
                 RpcRefreshClient::new(rpc_http_endpoint),
-                move |client| client.lookup_tables_update(&lookup_table_keys),
+                move |_client| {
+                    lookup_tables_update(&account_batcher, &lookup_table_cache, &lookup_table_keys)
+                },
             );
         }
 
@@ -125,15 +133,21 @@ impl AsyncStateRefresher {
             );
         }
 
-        Self { receiver }
+        Self {
+            receiver,
+            lookup_table_cache,
+        }
     }
 
-    pub fn disabled() -> Self {
+    pub(crate) fn disabled() -> Self {
         let (_sender, receiver) = mpsc::channel();
-        Self { receiver }
+        Self {
+            receiver,
+            lookup_table_cache: LookupTableCacheHandle::default(),
+        }
     }
 
-    pub fn drain_snapshot(&self) -> AsyncRefreshSnapshot {
+    pub(crate) fn drain_snapshot(&self) -> AsyncRefreshSnapshot {
         let mut snapshot = AsyncRefreshSnapshot::default();
         while let Ok(update) = self.receiver.try_recv() {
             match update {
@@ -147,6 +161,10 @@ impl AsyncStateRefresher {
             }
         }
         snapshot
+    }
+
+    pub(crate) fn lookup_table_cache_handle(&self) -> LookupTableCacheHandle {
+        self.lookup_table_cache.clone()
     }
 }
 
@@ -169,53 +187,30 @@ impl RpcRefreshClient {
     }
 
     fn latest_blockhash_update(&self) -> Result<RefreshUpdate, String> {
-        let body = self.rpc::<LatestBlockhashEnvelope>(
+        let body = self.rpc::<LatestBlockhashResult>(
             "getLatestBlockhash",
             json!([{
                 "commitment": "processed"
             }]),
         )?;
         Ok(RefreshUpdate::Blockhash(BlockhashRefresh {
-            blockhash: body.result.value.blockhash,
-            slot: body.result.context.slot,
+            blockhash: body.value.blockhash,
+            slot: body.context.slot,
         }))
     }
 
     fn latest_slot_update(&self) -> Result<RefreshUpdate, String> {
-        let body = self.rpc::<SlotEnvelope>(
+        let body = self.rpc::<u64>(
             "getSlot",
             json!([{
                 "commitment": "processed"
             }]),
         )?;
-        Ok(RefreshUpdate::Slot(SlotRefresh { slot: body.result }))
-    }
-
-    fn lookup_tables_update(&self, lookup_table_keys: &[String]) -> Result<RefreshUpdate, String> {
-        let body = self.rpc::<MultipleAccountsEnvelope>(
-            "getMultipleAccounts",
-            json!([
-                lookup_table_keys,
-                {
-                    "commitment": "processed",
-                    "encoding": "base64"
-                }
-            ]),
-        )?;
-        let slot = body.result.context.slot;
-        let tables = lookup_table_keys
-            .iter()
-            .zip(body.result.value)
-            .filter_map(|(account_key, account)| decode_lookup_table(account_key, account, slot))
-            .collect();
-        Ok(RefreshUpdate::LookupTables(LookupTablesRefresh {
-            tables,
-            slot,
-        }))
+        Ok(RefreshUpdate::Slot(SlotRefresh { slot: body }))
     }
 
     fn wallet_balance_update(&self, wallet_pubkey: &str) -> Result<RefreshUpdate, String> {
-        let body = self.rpc::<BalanceEnvelope>(
+        let body = self.rpc::<BalanceResult>(
             "getBalance",
             json!([
                 wallet_pubkey,
@@ -223,9 +218,9 @@ impl RpcRefreshClient {
             ]),
         )?;
         Ok(RefreshUpdate::Wallet(WalletRefresh {
-            balance_lamports: body.result.value,
+            balance_lamports: body.value,
             ready: true,
-            slot: body.result.context.slot,
+            slot: body.context.slot,
         }))
     }
 
@@ -234,21 +229,29 @@ impl RpcRefreshClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, String> {
-        let response = self
-            .http
-            .post(&self.endpoint)
-            .json(&json!({
-                "jsonrpc": JSON_RPC_VERSION,
-                "id": 1,
-                "method": method,
-                "params": params,
-            }))
-            .send()
-            .map_err(|error| format!("{method} request failed: {error}"))?;
-        response
-            .json::<T>()
-            .map_err(|error| format!("{method} response decode failed: {error}"))
+        rpc_call(&self.http, &self.endpoint, method, params).map_err(|error| error.to_string())
     }
+}
+
+fn lookup_tables_update(
+    account_batcher: &GetMultipleAccountsBatcher,
+    lookup_table_cache: &LookupTableCacheHandle,
+    lookup_table_keys: &[String],
+) -> Result<RefreshUpdate, String> {
+    let fetched = account_batcher
+        .fetch(lookup_table_keys)
+        .map_err(|error| error.to_string())?;
+    let slot = fetched.slot;
+    let tables = lookup_table_keys
+        .iter()
+        .zip(fetched.ordered_values(lookup_table_keys))
+        .filter_map(|(account_key, account)| decode_lookup_table(account_key, account, slot))
+        .collect::<Vec<_>>();
+    lookup_table_cache.replace(slot, tables.clone());
+    Ok(RefreshUpdate::LookupTables(LookupTablesRefresh {
+        tables,
+        slot,
+    }))
 }
 
 fn spawn_refresher<F>(
@@ -261,31 +264,39 @@ fn spawn_refresher<F>(
     F: FnMut(&RpcRefreshClient) -> Result<RefreshUpdate, String> + Send + 'static,
 {
     thread::spawn(move || {
+        let mut backoff = RpcRateLimitBackoff::default();
         loop {
             match fetch(&client) {
                 Ok(update) => {
+                    backoff.on_success();
                     if sender.send(update).is_err() {
                         break;
                     }
                 }
                 Err(detail) => {
                     eprintln!("async refresh {worker} failed: {detail}");
+                    let backoff_delay = if detail.contains("rate limited") {
+                        backoff.on_error(&RpcError::RateLimited {
+                            method: worker.into(),
+                            detail: detail.clone(),
+                        })
+                    } else {
+                        Duration::ZERO
+                    };
                     if sender
                         .send(RefreshUpdate::Failure(RefreshFailure { worker, detail }))
                         .is_err()
                     {
                         break;
                     }
+                    if !backoff_delay.is_zero() {
+                        thread::sleep(backoff_delay);
+                    }
                 }
             }
             thread::sleep(interval);
         }
     });
-}
-
-#[derive(Debug, Deserialize)]
-struct LatestBlockhashEnvelope {
-    result: LatestBlockhashResult,
 }
 
 #[derive(Debug, Deserialize)]
@@ -300,64 +311,9 @@ struct LatestBlockhashValue {
 }
 
 #[derive(Debug, Deserialize)]
-struct SlotEnvelope {
-    result: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct MultipleAccountsEnvelope {
-    result: MultipleAccountsResult,
-}
-
-#[derive(Debug, Deserialize)]
-struct MultipleAccountsResult {
-    context: RpcContext,
-    value: Vec<Option<RpcAccountValue>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcAccountValue {
-    data: (String, String),
-    owner: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BalanceEnvelope {
-    result: BalanceResult,
-}
-
-#[derive(Debug, Deserialize)]
 struct BalanceResult {
     context: RpcContext,
     value: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcContext {
-    slot: u64,
-}
-
-fn decode_lookup_table(
-    account_key: &str,
-    account: Option<RpcAccountValue>,
-    fetched_slot: u64,
-) -> Option<LookupTableSnapshot> {
-    let account = account?;
-    if account.owner != alt_program::id().to_string() {
-        return None;
-    }
-    if account.data.1 != "base64" {
-        return None;
-    }
-
-    let raw = BASE64_STANDARD.decode(account.data.0).ok()?;
-    let table = AddressLookupTable::deserialize(&raw).ok()?;
-    Some(LookupTableSnapshot {
-        account_key: account_key.to_string(),
-        addresses: table.addresses.iter().map(ToString::to_string).collect(),
-        last_extended_slot: table.meta.last_extended_slot,
-        fetched_slot,
-    })
 }
 
 #[cfg(test)]
@@ -365,13 +321,17 @@ mod tests {
     use std::sync::mpsc;
 
     use super::{
-        AsyncRefreshSnapshot, AsyncStateRefresher, RefreshFailure, RefreshUpdate, SlotRefresh,
+        AsyncRefreshSnapshot, AsyncStateRefresher, LookupTableCacheHandle, RefreshFailure,
+        RefreshUpdate, SlotRefresh,
     };
 
     #[test]
     fn drain_snapshot_keeps_latest_slot_refresh() {
         let (sender, receiver) = mpsc::channel();
-        let refresher = AsyncStateRefresher { receiver };
+        let refresher = AsyncStateRefresher {
+            receiver,
+            lookup_table_cache: LookupTableCacheHandle::default(),
+        };
 
         sender
             .send(RefreshUpdate::Slot(SlotRefresh { slot: 41 }))
@@ -395,7 +355,10 @@ mod tests {
     #[test]
     fn drain_snapshot_collects_refresh_failures() {
         let (sender, receiver) = mpsc::channel();
-        let refresher = AsyncStateRefresher { receiver };
+        let refresher = AsyncStateRefresher {
+            receiver,
+            lookup_table_cache: LookupTableCacheHandle::default(),
+        };
 
         sender
             .send(RefreshUpdate::Failure(RefreshFailure {

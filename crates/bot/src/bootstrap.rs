@@ -942,6 +942,7 @@ mod tests {
         OpportunityCandidate {
             route_id: RouteId(route.route_id.clone()),
             quoted_slot: 42,
+            leg_snapshot_slots: [42, 42],
             trade_size: route.default_trade_size,
             active_execution_buffer_bps: None,
             expected_net_output: second_output,

@@ -13,23 +13,25 @@ use std::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use detection::events::SnapshotConfidence;
 use detection::{
-    EventSourceKind, IngestError, MarketEventSource, NormalizedEvent, PoolInvalidation,
-    PoolSnapshotUpdate,
+    DirectionalPoolQuoteModelUpdate, EventSourceKind, IngestError, InitializedTickUpdate,
+    MarketEventSource, NormalizedEvent, PoolInvalidation, PoolQuoteModelUpdate, PoolSnapshotUpdate,
+    TickArrayWindowUpdate,
 };
 use prost_types::Timestamp as ProstTimestamp;
-use reqwest::blocking::Client;
-use serde::Deserialize;
-use serde_json::json;
 use solana_entry_legacy::entry::Entry as LegacyEntry;
 use solana_message_legacy::{
     AccountKeys, VersionedMessage as LegacyVersionedMessage,
     compiled_instruction::CompiledInstruction, v0,
 };
 use solana_pubkey_legacy::Pubkey as LegacyPubkey;
-use solana_sdk::hash::hashv;
+use solana_sdk::{hash::hashv, pubkey::Pubkey};
 use solana_transaction_legacy::versioned::VersionedTransaction as LegacyVersionedTransaction;
 use state::{
     executable_pool_state::ExecutablePoolStateStore,
+    quote_models::{
+        ORCA_WHIRLPOOL_TICK_ARRAY_SIZE, RAYDIUM_CLMM_TICK_ARRAY_SIZE, derive_orca_tick_arrays,
+        derive_raydium_tick_arrays, tick_array_end_index,
+    },
     types::{
         ConcentratedLiquidityPoolState, ConstantProductPoolState, ExecutablePoolState,
         LookupTableSnapshot, PoolConfidence, PoolId, PoolVenue,
@@ -37,11 +39,13 @@ use state::{
 };
 use tonic::transport::Endpoint;
 
+use crate::account_batcher::{GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcAccountValue};
 use crate::config::{
     BotConfig, ReducerRolloutMode, RouteClassConfig, RouteLegExecutionConfig, RuntimeProfileConfig,
 };
 use crate::observer::{ObserverHandle, RepairEvent, RepairEventKind};
 use crate::route_health::{PoolHealthTransition, SharedRouteHealth};
+use crate::rpc::RpcError;
 
 #[allow(dead_code)]
 pub mod shared {
@@ -53,8 +57,6 @@ pub mod proto {
     tonic::include_proto!("shredstream");
 }
 
-const JSON_RPC_VERSION: &str = "2.0";
-const MOCK_SCHEME: &str = "mock://";
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
 const RAYDIUM_SWAP_BASE_OUT_TAG: u8 = 11;
@@ -67,8 +69,12 @@ const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNs
 const CLMM_REFRESH_GRACE_SLOTS: u64 = 8;
 const ORCA_WHIRLPOOL_ACCOUNT_NAME: &str = "Whirlpool";
 const RAYDIUM_CLMM_ACCOUNT_NAME: &str = "PoolState";
+const ORCA_TICK_ARRAY_ACCOUNT_NAME: &str = "TickArray";
+const RAYDIUM_TICK_ARRAY_ACCOUNT_NAME: &str = "TickArrayState";
 const ORCA_WHIRLPOOL_ACCOUNT_MIN_LEN: usize = 245;
 const RAYDIUM_CLMM_ACCOUNT_MIN_LEN: usize = 273;
+const ORCA_TICK_ARRAY_ACCOUNT_MIN_LEN: usize = 8 + 4 + 113 * 88 + 32;
+const RAYDIUM_TICK_ARRAY_ACCOUNT_MIN_LEN: usize = 8 + 32 + 4 + 168 * 60 + 1 + 8 + 107;
 
 #[derive(Debug)]
 pub struct GrpcEntriesEventSource {
@@ -80,6 +86,8 @@ impl GrpcEntriesEventSource {
         config: &BotConfig,
         observer: ObserverHandle,
         route_health: SharedRouteHealth,
+        account_batcher: GetMultipleAccountsBatcher,
+        lookup_table_cache: LookupTableCacheHandle,
     ) -> Result<Self, String> {
         Endpoint::from_shared(config.shredstream.grpc_endpoint.clone())
             .map_err(|error| error.to_string())?;
@@ -90,13 +98,6 @@ impl GrpcEntriesEventSource {
         let (event_tx, event_rx) = mpsc::sync_channel(config.shredstream.buffer_capacity.max(64));
         let sequence = Arc::new(AtomicU64::new(1));
 
-        let lookup_cache = Arc::new(RwLock::new(HashMap::<String, LookupTableSnapshot>::new()));
-        spawn_lookup_table_refresher(
-            config,
-            Arc::clone(&lookup_cache),
-            registry.lookup_table_keys(),
-        );
-
         let repair_tx = spawn_repair_worker(
             config,
             Arc::clone(&registry),
@@ -106,6 +107,7 @@ impl GrpcEntriesEventSource {
             Arc::clone(&sequence),
             observer.clone(),
             route_health.clone(),
+            account_batcher.clone(),
         );
 
         seed_initial_repairs(registry.pool_ids(), &sync_tracker, &repair_tx);
@@ -115,7 +117,7 @@ impl GrpcEntriesEventSource {
             registry,
             executable_states,
             sync_tracker,
-            lookup_cache,
+            lookup_table_cache,
             event_tx,
             repair_tx,
             sequence,
@@ -192,6 +194,8 @@ struct OrcaWhirlpoolTrackedConfig {
     token_vault_b: String,
     tick_spacing: u16,
     fee_bps: u16,
+    require_a_to_b: bool,
+    require_b_to_a: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +208,8 @@ struct RaydiumClmmTrackedConfig {
     token_vault_b: String,
     tick_spacing: u16,
     fee_bps: u16,
+    require_zero_for_one: bool,
+    require_one_for_zero: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,10 +293,6 @@ impl TrackedPoolRegistry {
                 .unwrap_or_else(|| route.output_mint.clone());
 
             for leg in &route.legs {
-                if registry.pools_by_id.contains_key(&leg.pool_id) {
-                    continue;
-                }
-
                 let tracked = match &leg.execution {
                     RouteLegExecutionConfig::OrcaSimplePool(exec) => TrackedPool {
                         pool_id: leg.pool_id.clone(),
@@ -353,6 +355,8 @@ impl TrackedPoolRegistry {
                             token_vault_b: exec.token_vault_b.clone(),
                             tick_spacing: exec.tick_spacing,
                             fee_bps: leg.fee_bps.unwrap_or_default(),
+                            require_a_to_b: exec.a_to_b,
+                            require_b_to_a: !exec.a_to_b,
                         }),
                     },
                     RouteLegExecutionConfig::RaydiumClmm(exec) => TrackedPool {
@@ -373,11 +377,13 @@ impl TrackedPoolRegistry {
                             token_vault_b: exec.token_vault_1.clone(),
                             tick_spacing: exec.tick_spacing,
                             fee_bps: leg.fee_bps.unwrap_or_default(),
+                            require_zero_for_one: exec.zero_for_one,
+                            require_one_for_zero: !exec.zero_for_one,
                         }),
                     },
                 };
 
-                registry.register_pool(tracked);
+                registry.register_or_merge_pool(tracked);
             }
         }
 
@@ -385,7 +391,27 @@ impl TrackedPoolRegistry {
         registry
     }
 
-    fn register_pool(&mut self, tracked: TrackedPool) {
+    fn register_or_merge_pool(&mut self, tracked: TrackedPool) {
+        if let Some(existing) = self.pools_by_id.get_mut(&tracked.pool_id) {
+            match (&mut existing.kind, &tracked.kind) {
+                (
+                    TrackedPoolKind::OrcaWhirlpool(existing_config),
+                    TrackedPoolKind::OrcaWhirlpool(new_config),
+                ) => {
+                    existing_config.require_a_to_b |= new_config.require_a_to_b;
+                    existing_config.require_b_to_a |= new_config.require_b_to_a;
+                }
+                (
+                    TrackedPoolKind::RaydiumClmm(existing_config),
+                    TrackedPoolKind::RaydiumClmm(new_config),
+                ) => {
+                    existing_config.require_zero_for_one |= new_config.require_zero_for_one;
+                    existing_config.require_one_for_zero |= new_config.require_one_for_zero;
+                }
+                _ => {}
+            }
+            return;
+        }
         match &tracked.kind {
             TrackedPoolKind::OrcaSimple(config) => {
                 self.orca_simple_by_account
@@ -413,11 +439,6 @@ impl TrackedPoolRegistry {
         }
         self.pools_by_id.insert(tracked.pool_id.clone(), tracked);
     }
-
-    fn lookup_table_keys(&self) -> Vec<String> {
-        self.lookup_table_keys.clone()
-    }
-
     fn pool_ids(&self) -> Vec<String> {
         self.pools_by_id.keys().cloned().collect()
     }
@@ -620,6 +641,7 @@ enum RepairJobResult {
         mode: SyncRequestMode,
         slot: u64,
         next_state: ExecutablePoolState,
+        quote_model_update: Option<PoolQuoteModelUpdate>,
         attempt: u32,
         latency: Duration,
     },
@@ -634,6 +656,12 @@ enum RepairJobResult {
         mode: SyncRequestMode,
         observed_slot: u64,
     },
+}
+
+#[derive(Debug)]
+struct RepairBuildResult {
+    next_state: ExecutablePoolState,
+    quote_model_update: Option<PoolQuoteModelUpdate>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -859,12 +887,19 @@ enum ReductionStatus {
     Invalid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExactMutationOutcome {
+    Applied(ExecutablePoolState),
+    RefreshRequired,
+    Invalid,
+}
+
 fn spawn_stream_worker(
     config: &BotConfig,
     registry: Arc<TrackedPoolRegistry>,
     executable_states: Arc<RwLock<ExecutablePoolStateStore>>,
     sync_tracker: Arc<Mutex<PoolSyncTracker>>,
-    lookup_cache: Arc<RwLock<HashMap<String, LookupTableSnapshot>>>,
+    lookup_table_cache: LookupTableCacheHandle,
     event_tx: SyncSender<NormalizedEvent>,
     repair_tx: mpsc::Sender<RepairRequest>,
     sequence: Arc<AtomicU64>,
@@ -937,7 +972,7 @@ fn spawn_stream_worker(
                         &registry,
                         &executable_states,
                         &sync_tracker,
-                        &lookup_cache,
+                        &lookup_table_cache,
                         &event_tx,
                         &repair_tx,
                         &sequence,
@@ -961,7 +996,7 @@ fn handle_entry_batch(
     registry: &TrackedPoolRegistry,
     executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
-    lookup_cache: &Arc<RwLock<HashMap<String, LookupTableSnapshot>>>,
+    lookup_table_cache: &LookupTableCacheHandle,
     event_tx: &SyncSender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
@@ -972,11 +1007,7 @@ fn handle_entry_batch(
         return;
     };
 
-    let lookup_tables = lookup_cache
-        .read()
-        .ok()
-        .map(|guard| guard.clone())
-        .unwrap_or_default();
+    let lookup_tables = lookup_table_cache.snapshot();
     let mut invalidated_pools = HashSet::new();
     expire_exact_refreshes(
         slot,
@@ -995,7 +1026,8 @@ fn handle_entry_batch(
 
     for entry in entries {
         for transaction in entry.transactions {
-            let Some(resolved) = resolve_transaction(&transaction, &lookup_tables) else {
+            let Some(resolved) = resolve_transaction(&transaction, &lookup_tables.tables_by_key)
+            else {
                 continue;
             };
             let mut handled_pools = HashSet::new();
@@ -1016,7 +1048,7 @@ fn handle_entry_batch(
                         &mutation,
                         executable_states,
                     ) {
-                        Some(next_state) => {
+                        ExactMutationOutcome::Applied(next_state) => {
                             publish_pool_snapshot_update(
                                 event_tx,
                                 sequence,
@@ -1026,7 +1058,7 @@ fn handle_entry_batch(
                                 &next_state,
                             );
                         }
-                        None if tracked_pool.uses_hybrid_refresh() => schedule_exact_refresh(
+                        ExactMutationOutcome::RefreshRequired => schedule_exact_refresh(
                             &tracked_pool,
                             slot,
                             sync_tracker,
@@ -1034,7 +1066,17 @@ fn handle_entry_batch(
                             observer,
                             route_health,
                         ),
-                        None => invalidate_and_repair(
+                        ExactMutationOutcome::Invalid if tracked_pool.uses_hybrid_refresh() => {
+                            schedule_exact_refresh(
+                                &tracked_pool,
+                                slot,
+                                sync_tracker,
+                                repair_tx,
+                                observer,
+                                route_health,
+                            )
+                        }
+                        ExactMutationOutcome::Invalid => invalidate_and_repair(
                             &tracked_pool,
                             slot,
                             source_received_at,
@@ -1196,14 +1238,24 @@ fn apply_mutation_exact(
     tracked_pool: &TrackedPool,
     mutation: &PoolMutation,
     executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
-) -> Option<ExecutablePoolState> {
-    let mut store = executable_states.write().ok()?;
+) -> ExactMutationOutcome {
+    let Ok(mut store) = executable_states.write() else {
+        return ExactMutationOutcome::Invalid;
+    };
     let pool_id = PoolId(tracked_pool.pool_id.clone());
-    let next_state = reduce_mutation_exact(store.get(&pool_id)?, tracked_pool, mutation, slot)?;
-    if !store.upsert(next_state.clone()) {
-        return None;
+    let Some(current_state) = store.get(&pool_id).cloned() else {
+        return ExactMutationOutcome::Invalid;
+    };
+
+    match reduce_mutation_exact(&current_state, tracked_pool, mutation, slot) {
+        ExactMutationOutcome::Applied(next_state) => {
+            if !store.upsert(next_state.clone()) {
+                return ExactMutationOutcome::Invalid;
+            }
+            ExactMutationOutcome::Applied(next_state)
+        }
+        other => other,
     }
-    Some(next_state)
 }
 
 fn apply_mutation_shadow(
@@ -1237,7 +1289,7 @@ fn reduce_mutation_exact(
     tracked_pool: &TrackedPool,
     mutation: &PoolMutation,
     slot: u64,
-) -> Option<ExecutablePoolState> {
+) -> ExactMutationOutcome {
     match (&tracked_pool.kind, mutation, current_state) {
         (
             TrackedPoolKind::OrcaSimple(_),
@@ -1248,7 +1300,9 @@ fn reduce_mutation_exact(
                 ..
             },
             ExecutablePoolState::OrcaSimplePool(state),
-        ) => reduce_orca_simple_swap(state, source_vault, destination_vault, *amount_in, slot),
+        ) => reduce_orca_simple_swap(state, source_vault, destination_vault, *amount_in, slot)
+            .map(ExactMutationOutcome::Applied)
+            .unwrap_or(ExactMutationOutcome::Invalid),
         (
             TrackedPoolKind::RaydiumSimple(config),
             PoolMutation::RaydiumSimpleSwap {
@@ -1270,7 +1324,7 @@ fn reduce_mutation_exact(
             *amount_specified,
             slot,
         ),
-        _ => None,
+        _ => ExactMutationOutcome::Invalid,
     }
 }
 
@@ -1324,11 +1378,19 @@ fn reduce_raydium_simple_swap(
     user_destination_token_account: &str,
     amount_specified: u64,
     slot: u64,
-) -> Option<ExecutablePoolState> {
-    let token_program = parse_legacy_pubkey(&config.token_program_id)?;
-    let owner = parse_legacy_pubkey(user_owner)?;
-    let mint_a = parse_legacy_pubkey(&state.token_mint_a)?;
-    let mint_b = parse_legacy_pubkey(&state.token_mint_b)?;
+) -> ExactMutationOutcome {
+    let Some(token_program) = parse_legacy_pubkey(&config.token_program_id) else {
+        return ExactMutationOutcome::Invalid;
+    };
+    let Some(owner) = parse_legacy_pubkey(user_owner) else {
+        return ExactMutationOutcome::Invalid;
+    };
+    let Some(mint_a) = parse_legacy_pubkey(&state.token_mint_a) else {
+        return ExactMutationOutcome::Invalid;
+    };
+    let Some(mint_b) = parse_legacy_pubkey(&state.token_mint_b) else {
+        return ExactMutationOutcome::Invalid;
+    };
     let ata_a = associated_token_address(owner, mint_a, token_program).to_string();
     let ata_b = associated_token_address(owner, mint_b, token_program).to_string();
 
@@ -1342,7 +1404,10 @@ fn reduce_raydium_simple_swap(
     let (source_vault, destination_vault) = match (a_to_b, b_to_a) {
         (true, false) => (&state.token_vault_a, &state.token_vault_b),
         (false, true) => (&state.token_vault_b, &state.token_vault_a),
-        _ => return None,
+        // Raydium simple swaps can legitimately use non-ATA SPL accounts.
+        // When the instruction accounts do not reveal a unique direction, refresh
+        // the pool exactly instead of invalidating it on the hot path.
+        _ => return ExactMutationOutcome::RefreshRequired,
     };
 
     if exact_out {
@@ -1354,6 +1419,8 @@ fn reduce_raydium_simple_swap(
             slot,
             PoolVenue::RaydiumSimplePool,
         )
+        .map(ExactMutationOutcome::Applied)
+        .unwrap_or(ExactMutationOutcome::Invalid)
     } else {
         reduce_constant_product_swap(
             state,
@@ -1363,6 +1430,8 @@ fn reduce_raydium_simple_swap(
             slot,
             PoolVenue::RaydiumSimplePool,
         )
+        .map(ExactMutationOutcome::Applied)
+        .unwrap_or(ExactMutationOutcome::Invalid)
     }
 }
 
@@ -1752,6 +1821,24 @@ fn publish_pool_snapshot_update(
     let _ = try_send_event(event_tx, event);
 }
 
+fn publish_pool_quote_model_update(
+    event_tx: &SyncSender<NormalizedEvent>,
+    sequence: &Arc<AtomicU64>,
+    slot: u64,
+    source_received_at: SystemTime,
+    source_latency: Option<Duration>,
+    update: PoolQuoteModelUpdate,
+) {
+    let event = event_with_timing(
+        next_sequence(sequence),
+        slot,
+        source_received_at,
+        source_latency,
+        detection::MarketEvent::PoolQuoteModelUpdate(update),
+    );
+    let _ = try_send_event(event_tx, event);
+}
+
 fn resolve_loaded_addresses(
     lookups: &[v0::MessageAddressTableLookup],
     lookup_tables: &HashMap<String, LookupTableSnapshot>,
@@ -1777,37 +1864,6 @@ fn resolve_loaded_addresses(
     Some(v0::LoadedAddresses { writable, readonly })
 }
 
-fn spawn_lookup_table_refresher(
-    config: &BotConfig,
-    lookup_cache: Arc<RwLock<HashMap<String, LookupTableSnapshot>>>,
-    lookup_table_keys: Vec<String>,
-) {
-    if !config.runtime.refresh.enabled
-        || config.runtime.refresh.alt_refresh_millis == 0
-        || lookup_table_keys.is_empty()
-        || is_mock_endpoint(&config.reconciliation.rpc_http_endpoint)
-    {
-        return;
-    }
-
-    let endpoint = config.reconciliation.rpc_http_endpoint.clone();
-    let interval = Duration::from_millis(config.runtime.refresh.alt_refresh_millis);
-    thread::spawn(move || {
-        loop {
-            if let Some(tables) = fetch_lookup_tables(&endpoint, &lookup_table_keys) {
-                let next = tables
-                    .into_iter()
-                    .map(|table| (table.account_key.clone(), table))
-                    .collect::<HashMap<_, _>>();
-                if let Ok(mut guard) = lookup_cache.write() {
-                    *guard = next;
-                }
-            }
-            thread::sleep(interval);
-        }
-    });
-}
-
 fn spawn_repair_worker(
     config: &BotConfig,
     registry: Arc<TrackedPoolRegistry>,
@@ -1817,27 +1873,26 @@ fn spawn_repair_worker(
     sequence: Arc<AtomicU64>,
     observer: ObserverHandle,
     route_health: SharedRouteHealth,
+    account_batcher: GetMultipleAccountsBatcher,
 ) -> mpsc::Sender<RepairRequest> {
     let (repair_tx, repair_rx) = mpsc::channel::<RepairRequest>();
-    let rpc_endpoint = config.reconciliation.rpc_http_endpoint.clone();
     let retry_tx = repair_tx.clone();
     let (job_tx, job_rx) = mpsc::channel::<RepairJob>();
     let (result_tx, result_rx) = mpsc::channel::<RepairJobResult>();
     let job_rx = Arc::new(Mutex::new(job_rx));
+    let max_in_flight = if config.runtime.profile == RuntimeProfileConfig::UltraFast {
+        1
+    } else {
+        2
+    };
 
-    for _ in 0..2 {
+    for _ in 0..max_in_flight {
         let registry = Arc::clone(&registry);
         let executable_states = Arc::clone(&executable_states);
-        let rpc_endpoint = rpc_endpoint.clone();
+        let account_batcher = account_batcher.clone();
         let job_rx = Arc::clone(&job_rx);
         let result_tx = result_tx.clone();
         thread::spawn(move || {
-            let http = Client::builder()
-                .connect_timeout(Duration::from_millis(300))
-                .timeout(Duration::from_millis(1_000))
-                .build()
-                .expect("build live repair HTTP client");
-
             loop {
                 let job = {
                     let receiver = job_rx.lock().expect("repair job receiver");
@@ -1857,25 +1912,9 @@ fn spawn_repair_worker(
                 };
 
                 let started_at = Instant::now();
-                let account_keys = tracked_pool.repair_account_keys();
-                let Some((slot, accounts)) =
-                    fetch_accounts_by_key(&http, &rpc_endpoint, &account_keys)
+                let Some(build_result) =
+                    build_repair_result(&account_batcher, &tracked_pool, &executable_states)
                 else {
-                    let _ = result_tx.send(RepairJobResult::Retry {
-                        pool_id: job.pool_id,
-                        mode: job.mode,
-                        attempt: job.attempt,
-                        observed_slot: job.observed_slot,
-                    });
-                    continue;
-                };
-
-                let Some(next_state) = build_executable_state_from_accounts(
-                    &tracked_pool,
-                    &accounts,
-                    slot,
-                    &executable_states,
-                ) else {
                     let _ = result_tx.send(RepairJobResult::Retry {
                         pool_id: job.pool_id,
                         mode: job.mode,
@@ -1888,8 +1927,9 @@ fn spawn_repair_worker(
                 let _ = result_tx.send(RepairJobResult::Success {
                     pool_id: job.pool_id,
                     mode: job.mode,
-                    slot,
-                    next_state,
+                    slot: build_result.next_state.last_update_slot(),
+                    next_state: build_result.next_state,
+                    quote_model_update: build_result.quote_model_update,
                     attempt: job.attempt,
                     latency: started_at.elapsed(),
                 });
@@ -1927,6 +1967,7 @@ fn spawn_repair_worker(
                 &mut pending_modes,
                 &mut in_flight,
                 &mut attempts,
+                max_in_flight,
             );
 
             match repair_rx.recv_timeout(Duration::from_millis(25)) {
@@ -2036,8 +2077,9 @@ fn dispatch_repair_jobs(
     pending_modes: &mut HashMap<String, RepairRequest>,
     in_flight: &mut HashMap<String, SyncRequestMode>,
     attempts: &mut HashMap<(String, SyncRequestMode), u32>,
+    max_in_flight: usize,
 ) {
-    while in_flight.len() < 2 {
+    while in_flight.len() < max_in_flight {
         let Some(pool_id) = pending.pop_front() else {
             break;
         };
@@ -2120,6 +2162,7 @@ fn drain_repair_results(
                 mode,
                 slot,
                 next_state,
+                quote_model_update,
                 attempt: _attempt,
                 latency,
             } => {
@@ -2137,6 +2180,16 @@ fn drain_repair_results(
                         None,
                         &next_state,
                     );
+                    if let Some(quote_model_update) = quote_model_update {
+                        publish_pool_quote_model_update(
+                            event_tx,
+                            sequence,
+                            slot,
+                            SystemTime::now(),
+                            None,
+                            quote_model_update,
+                        );
+                    }
                 }
                 if mode == SyncRequestMode::RefreshExact {
                     clear_exact_refresh(sync_tracker, &pool_id);
@@ -2169,6 +2222,14 @@ fn drain_repair_results(
                         },
                         slot,
                     );
+                }
+                if !next_state.confidence().is_executable() {
+                    let _ = retry_tx.send(RepairRequest {
+                        pool_id: next_state.pool_id().0.clone(),
+                        mode: SyncRequestMode::RefreshExact,
+                        priority: RepairPriority::Retry,
+                        observed_slot: slot,
+                    });
                 }
             }
             RepairJobResult::Retry {
@@ -2280,11 +2341,11 @@ fn request_still_needed(
 
 fn repair_backoff(attempt: u32) -> Duration {
     match attempt {
-        0 | 1 => Duration::from_millis(100),
-        2 => Duration::from_millis(250),
-        3 => Duration::from_millis(500),
-        4 => Duration::from_millis(1_000),
-        _ => Duration::from_millis(2_000),
+        0 | 1 => Duration::from_millis(250),
+        2 => Duration::from_millis(500),
+        3 => Duration::from_secs(1),
+        4 => Duration::from_secs(2),
+        _ => Duration::from_secs(5),
     }
 }
 
@@ -2310,12 +2371,364 @@ fn pool_requires_repair(
     }
 }
 
+fn build_repair_result(
+    account_batcher: &GetMultipleAccountsBatcher,
+    tracked_pool: &TrackedPool,
+    executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
+) -> Option<RepairBuildResult> {
+    let (slot, mut accounts) =
+        match fetch_accounts_by_key(account_batcher, &tracked_pool.repair_account_keys()) {
+            Ok(result) => result,
+            Err(error) => {
+                eprintln!("repair fetch {} failed: {error}", tracked_pool.pool_id);
+                return None;
+            }
+        };
+    if extend_with_required_quote_model_accounts(account_batcher, tracked_pool, &mut accounts)
+        .is_err()
+    {
+        return None;
+    }
+    build_executable_state_from_accounts(tracked_pool, &accounts, slot, executable_states)
+}
+
+fn extend_with_required_quote_model_accounts(
+    account_batcher: &GetMultipleAccountsBatcher,
+    tracked_pool: &TrackedPool,
+    accounts: &mut HashMap<String, RpcAccountValue>,
+) -> Result<(), RpcError> {
+    let extra_keys = match &tracked_pool.kind {
+        TrackedPoolKind::OrcaWhirlpool(config) => {
+            let account =
+                accounts
+                    .get(&config.whirlpool)
+                    .ok_or_else(|| RpcError::DecodeFailed {
+                        method: "getMultipleAccounts".into(),
+                        detail: "missing whirlpool account".into(),
+                    })?;
+            let raw = decode_base64_account(account).ok_or_else(|| RpcError::DecodeFailed {
+                method: "getMultipleAccounts".into(),
+                detail: "invalid whirlpool account encoding".into(),
+            })?;
+            let current_tick_index = read_i32(&raw, 81).ok_or_else(|| RpcError::DecodeFailed {
+                method: "getMultipleAccounts".into(),
+                detail: "missing whirlpool current_tick_index".into(),
+            })?;
+            required_orca_tick_array_keys(config, current_tick_index)?
+        }
+        TrackedPoolKind::RaydiumClmm(config) => {
+            let account =
+                accounts
+                    .get(&config.pool_state)
+                    .ok_or_else(|| RpcError::DecodeFailed {
+                        method: "getMultipleAccounts".into(),
+                        detail: "missing clmm pool state".into(),
+                    })?;
+            let raw = decode_base64_account(account).ok_or_else(|| RpcError::DecodeFailed {
+                method: "getMultipleAccounts".into(),
+                detail: "invalid clmm pool encoding".into(),
+            })?;
+            let current_tick_index = read_i32(&raw, 269).ok_or_else(|| RpcError::DecodeFailed {
+                method: "getMultipleAccounts".into(),
+                detail: "missing clmm current_tick_index".into(),
+            })?;
+            required_raydium_tick_array_keys(config, current_tick_index)?
+        }
+        _ => Vec::new(),
+    };
+    if extra_keys.is_empty() {
+        return Ok(());
+    }
+
+    let missing = extra_keys
+        .into_iter()
+        .filter(|key| !accounts.contains_key(key))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let (_, extra_accounts) = fetch_accounts_by_key(account_batcher, &missing)?;
+    accounts.extend(extra_accounts);
+    Ok(())
+}
+
+fn required_orca_tick_array_keys(
+    config: &OrcaWhirlpoolTrackedConfig,
+    current_tick_index: i32,
+) -> Result<Vec<String>, RpcError> {
+    let program_id =
+        Pubkey::from_str(&config.program_id).map_err(|error| RpcError::DecodeFailed {
+            method: "getMultipleAccounts".into(),
+            detail: error.to_string(),
+        })?;
+    let whirlpool =
+        Pubkey::from_str(&config.whirlpool).map_err(|error| RpcError::DecodeFailed {
+            method: "getMultipleAccounts".into(),
+            detail: error.to_string(),
+        })?;
+    let mut keys = BTreeSet::new();
+    if config.require_a_to_b {
+        for key in derive_orca_tick_arrays(
+            program_id,
+            whirlpool,
+            config.tick_spacing,
+            current_tick_index,
+            true,
+        ) {
+            keys.insert(key.to_string());
+        }
+    }
+    if config.require_b_to_a {
+        for key in derive_orca_tick_arrays(
+            program_id,
+            whirlpool,
+            config.tick_spacing,
+            current_tick_index,
+            false,
+        ) {
+            keys.insert(key.to_string());
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
+fn required_raydium_tick_array_keys(
+    config: &RaydiumClmmTrackedConfig,
+    current_tick_index: i32,
+) -> Result<Vec<String>, RpcError> {
+    let program_id =
+        Pubkey::from_str(&config.program_id).map_err(|error| RpcError::DecodeFailed {
+            method: "getMultipleAccounts".into(),
+            detail: error.to_string(),
+        })?;
+    let pool_state =
+        Pubkey::from_str(&config.pool_state).map_err(|error| RpcError::DecodeFailed {
+            method: "getMultipleAccounts".into(),
+            detail: error.to_string(),
+        })?;
+    let mut keys = BTreeSet::new();
+    if config.require_zero_for_one {
+        for key in derive_raydium_tick_arrays(
+            program_id,
+            pool_state,
+            config.tick_spacing,
+            current_tick_index,
+            true,
+        ) {
+            keys.insert(key.to_string());
+        }
+    }
+    if config.require_one_for_zero {
+        for key in derive_raydium_tick_arrays(
+            program_id,
+            pool_state,
+            config.tick_spacing,
+            current_tick_index,
+            false,
+        ) {
+            keys.insert(key.to_string());
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
+fn decode_orca_tick_array(
+    config: &OrcaWhirlpoolTrackedConfig,
+    account_key: &str,
+    account: &RpcAccountValue,
+) -> Option<(TickArrayWindowUpdate, Vec<InitializedTickUpdate>)> {
+    let raw = decode_base64_account(account)?;
+    if !is_anchor_account_value(
+        account,
+        &raw,
+        &config.program_id,
+        ORCA_TICK_ARRAY_ACCOUNT_NAME,
+        ORCA_TICK_ARRAY_ACCOUNT_MIN_LEN,
+    ) {
+        return None;
+    }
+    let start_tick_index = read_i32(&raw, 8)?;
+    let mut initialized_ticks = Vec::new();
+    let mut cursor = 12usize;
+    for index in 0..ORCA_WHIRLPOOL_TICK_ARRAY_SIZE as usize {
+        let initialized = raw.get(cursor).copied().unwrap_or_default() != 0;
+        let liquidity_net = read_i128(&raw, cursor + 1)?;
+        let liquidity_gross = read_u128(&raw, cursor + 17)?;
+        if initialized && liquidity_gross > 0 {
+            initialized_ticks.push(InitializedTickUpdate {
+                tick_index: start_tick_index
+                    .saturating_add((index as i32).saturating_mul(i32::from(config.tick_spacing))),
+                liquidity_net,
+                liquidity_gross,
+            });
+        }
+        cursor = cursor.saturating_add(113);
+    }
+    let _ = account_key;
+    Some((
+        TickArrayWindowUpdate {
+            start_tick_index,
+            end_tick_index: tick_array_end_index(
+                start_tick_index,
+                config.tick_spacing,
+                ORCA_WHIRLPOOL_TICK_ARRAY_SIZE,
+            ),
+            initialized_tick_count: initialized_ticks.len(),
+        },
+        initialized_ticks,
+    ))
+}
+
+fn decode_raydium_tick_array(
+    config: &RaydiumClmmTrackedConfig,
+    account_key: &str,
+    account: &RpcAccountValue,
+) -> Option<(TickArrayWindowUpdate, Vec<InitializedTickUpdate>)> {
+    let raw = decode_base64_account(account)?;
+    if !is_anchor_account_value(
+        account,
+        &raw,
+        &config.program_id,
+        RAYDIUM_TICK_ARRAY_ACCOUNT_NAME,
+        RAYDIUM_TICK_ARRAY_ACCOUNT_MIN_LEN,
+    ) {
+        return None;
+    }
+    let start_tick_index = read_i32(&raw, 40)?;
+    let mut initialized_ticks = Vec::new();
+    let mut cursor = 44usize;
+    for _ in 0..RAYDIUM_CLMM_TICK_ARRAY_SIZE as usize {
+        let tick_index = read_i32(&raw, cursor)?;
+        let liquidity_net = read_i128(&raw, cursor + 4)?;
+        let liquidity_gross = read_u128(&raw, cursor + 20)?;
+        if liquidity_gross > 0 {
+            initialized_ticks.push(InitializedTickUpdate {
+                tick_index,
+                liquidity_net,
+                liquidity_gross,
+            });
+        }
+        cursor = cursor.saturating_add(168);
+    }
+    let _ = account_key;
+    Some((
+        TickArrayWindowUpdate {
+            start_tick_index,
+            end_tick_index: tick_array_end_index(
+                start_tick_index,
+                config.tick_spacing,
+                RAYDIUM_CLMM_TICK_ARRAY_SIZE,
+            ),
+            initialized_tick_count: initialized_ticks.len(),
+        },
+        initialized_ticks,
+    ))
+}
+
+fn build_orca_directional_quote_model(
+    config: &OrcaWhirlpoolTrackedConfig,
+    accounts: &HashMap<String, RpcAccountValue>,
+    current_tick_index: i32,
+    a_to_b: bool,
+) -> Option<DirectionalPoolQuoteModelUpdate> {
+    let program_id = Pubkey::from_str(&config.program_id).ok()?;
+    let whirlpool = Pubkey::from_str(&config.whirlpool).ok()?;
+    let keys = derive_orca_tick_arrays(
+        program_id,
+        whirlpool,
+        config.tick_spacing,
+        current_tick_index,
+        a_to_b,
+    );
+    let mut windows = Vec::new();
+    let mut initialized_ticks = Vec::new();
+    for key in keys {
+        let key = key.to_string();
+        let Some(account) = accounts.get(&key) else {
+            continue;
+        };
+        let Some((window, mut ticks)) = decode_orca_tick_array(config, &key, account) else {
+            continue;
+        };
+        windows.push(window);
+        initialized_ticks.append(&mut ticks);
+    }
+    windows.sort_by_key(|window| window.start_tick_index);
+    initialized_ticks.sort_by_key(|tick| tick.tick_index);
+    Some(DirectionalPoolQuoteModelUpdate {
+        loaded_tick_arrays: windows.len(),
+        expected_tick_arrays: 3,
+        complete: windows.len() == 3,
+        windows,
+        initialized_ticks,
+    })
+}
+
+fn build_raydium_directional_quote_model(
+    config: &RaydiumClmmTrackedConfig,
+    accounts: &HashMap<String, RpcAccountValue>,
+    current_tick_index: i32,
+    zero_for_one: bool,
+) -> Option<DirectionalPoolQuoteModelUpdate> {
+    let program_id = Pubkey::from_str(&config.program_id).ok()?;
+    let pool_state = Pubkey::from_str(&config.pool_state).ok()?;
+    let keys = derive_raydium_tick_arrays(
+        program_id,
+        pool_state,
+        config.tick_spacing,
+        current_tick_index,
+        zero_for_one,
+    );
+    let mut windows = Vec::new();
+    let mut initialized_ticks = Vec::new();
+    for key in keys {
+        let key = key.to_string();
+        let Some(account) = accounts.get(&key) else {
+            continue;
+        };
+        let Some((window, mut ticks)) = decode_raydium_tick_array(config, &key, account) else {
+            continue;
+        };
+        windows.push(window);
+        initialized_ticks.append(&mut ticks);
+    }
+    windows.sort_by_key(|window| window.start_tick_index);
+    initialized_ticks.sort_by_key(|tick| tick.tick_index);
+    Some(DirectionalPoolQuoteModelUpdate {
+        loaded_tick_arrays: windows.len(),
+        expected_tick_arrays: 3,
+        complete: windows.len() == 3,
+        windows,
+        initialized_ticks,
+    })
+}
+
+fn quote_model_union(
+    direction_a: Option<&DirectionalPoolQuoteModelUpdate>,
+    direction_b: Option<&DirectionalPoolQuoteModelUpdate>,
+) -> (usize, usize) {
+    let mut windows = BTreeSet::new();
+    let mut expected = 0usize;
+    for direction in [direction_a, direction_b].into_iter().flatten() {
+        expected = expected.max(direction.expected_tick_arrays);
+        for window in &direction.windows {
+            windows.insert(window.start_tick_index);
+        }
+    }
+    let required_directions =
+        usize::from(direction_a.is_some()) + usize::from(direction_b.is_some());
+    (
+        windows.len(),
+        expected.saturating_mul(required_directions.max(1)),
+    )
+}
+
 fn build_executable_state_from_accounts(
     tracked_pool: &TrackedPool,
     accounts: &HashMap<String, RpcAccountValue>,
     slot: u64,
     executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
-) -> Option<ExecutablePoolState> {
+) -> Option<RepairBuildResult> {
     let next_write_version = executable_states
         .read()
         .ok()
@@ -2330,8 +2743,8 @@ fn build_executable_state_from_accounts(
         TrackedPoolKind::OrcaSimple(config) => {
             let reserve_a = token_account_amount(accounts.get(&config.token_vault_a)?)?;
             let reserve_b = token_account_amount(accounts.get(&config.token_vault_b)?)?;
-            Some(ExecutablePoolState::OrcaSimplePool(
-                ConstantProductPoolState {
+            Some(RepairBuildResult {
+                next_state: ExecutablePoolState::OrcaSimplePool(ConstantProductPoolState {
                     pool_id: PoolId(tracked_pool.pool_id.clone()),
                     venue: PoolVenue::OrcaSimplePool,
                     token_mint_a: config.token_mint_a.clone(),
@@ -2346,14 +2759,15 @@ fn build_executable_state_from_accounts(
                     last_verified_slot: slot,
                     confidence: PoolConfidence::Executable,
                     repair_pending: false,
-                },
-            ))
+                }),
+                quote_model_update: None,
+            })
         }
         TrackedPoolKind::RaydiumSimple(config) => {
             let reserve_a = token_account_amount(accounts.get(&config.token_vault_a)?)?;
             let reserve_b = token_account_amount(accounts.get(&config.token_vault_b)?)?;
-            Some(ExecutablePoolState::RaydiumSimplePool(
-                ConstantProductPoolState {
+            Some(RepairBuildResult {
+                next_state: ExecutablePoolState::RaydiumSimplePool(ConstantProductPoolState {
                     pool_id: PoolId(tracked_pool.pool_id.clone()),
                     venue: PoolVenue::RaydiumSimplePool,
                     token_mint_a: config.token_mint_a.clone(),
@@ -2368,8 +2782,9 @@ fn build_executable_state_from_accounts(
                     last_verified_slot: slot,
                     confidence: PoolConfidence::Executable,
                     repair_pending: false,
-                },
-            ))
+                }),
+                quote_model_update: None,
+            })
         }
         TrackedPoolKind::OrcaWhirlpool(config) => {
             let account = accounts.get(&config.whirlpool)?;
@@ -2389,8 +2804,45 @@ fn build_executable_state_from_accounts(
             let fee_bps = read_u16(&raw, 45)
                 .map(|value| value / 100)
                 .unwrap_or(config.fee_bps);
-            Some(ExecutablePoolState::OrcaWhirlpool(
-                ConcentratedLiquidityPoolState {
+            let a_to_b = config
+                .require_a_to_b
+                .then(|| {
+                    build_orca_directional_quote_model(config, accounts, current_tick_index, true)
+                })
+                .flatten();
+            let b_to_a = config
+                .require_b_to_a
+                .then(|| {
+                    build_orca_directional_quote_model(config, accounts, current_tick_index, false)
+                })
+                .flatten();
+            let quote_model_update = PoolQuoteModelUpdate {
+                pool_id: tracked_pool.pool_id.clone(),
+                liquidity,
+                sqrt_price_x64,
+                current_tick_index,
+                tick_spacing: config.tick_spacing,
+                required_a_to_b: config.require_a_to_b,
+                required_b_to_a: config.require_b_to_a,
+                a_to_b: a_to_b.clone(),
+                b_to_a: b_to_a.clone(),
+                slot,
+                write_version: next_write_version,
+            };
+            let executable = (!config.require_a_to_b
+                || a_to_b
+                    .as_ref()
+                    .map(|direction| direction.complete)
+                    .unwrap_or(false))
+                && (!config.require_b_to_a
+                    || b_to_a
+                        .as_ref()
+                        .map(|direction| direction.complete)
+                        .unwrap_or(false));
+            let (loaded_tick_arrays, expected_tick_arrays) =
+                quote_model_union(a_to_b.as_ref(), b_to_a.as_ref());
+            Some(RepairBuildResult {
+                next_state: ExecutablePoolState::OrcaWhirlpool(ConcentratedLiquidityPoolState {
                     pool_id: PoolId(tracked_pool.pool_id.clone()),
                     venue: PoolVenue::OrcaWhirlpool,
                     token_mint_a: config.token_mint_a.clone(),
@@ -2403,15 +2855,20 @@ fn build_executable_state_from_accounts(
                     sqrt_price_x64,
                     current_tick_index,
                     tick_spacing: config.tick_spacing,
-                    loaded_tick_arrays: 0,
-                    expected_tick_arrays: 3,
+                    loaded_tick_arrays,
+                    expected_tick_arrays,
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Verified,
+                    confidence: if executable {
+                        PoolConfidence::Executable
+                    } else {
+                        PoolConfidence::Verified
+                    },
                     repair_pending: false,
-                },
-            ))
+                }),
+                quote_model_update: Some(quote_model_update),
+            })
         }
         TrackedPoolKind::RaydiumClmm(config) => {
             let account = accounts.get(&config.pool_state)?;
@@ -2428,8 +2885,55 @@ fn build_executable_state_from_accounts(
             let liquidity = read_u128(&raw, 237)?;
             let sqrt_price_x64 = read_u128(&raw, 253)?;
             let current_tick_index = read_i32(&raw, 269)?;
-            Some(ExecutablePoolState::RaydiumClmm(
-                ConcentratedLiquidityPoolState {
+            let zero_for_one = config
+                .require_zero_for_one
+                .then(|| {
+                    build_raydium_directional_quote_model(
+                        config,
+                        accounts,
+                        current_tick_index,
+                        true,
+                    )
+                })
+                .flatten();
+            let one_for_zero = config
+                .require_one_for_zero
+                .then(|| {
+                    build_raydium_directional_quote_model(
+                        config,
+                        accounts,
+                        current_tick_index,
+                        false,
+                    )
+                })
+                .flatten();
+            let quote_model_update = PoolQuoteModelUpdate {
+                pool_id: tracked_pool.pool_id.clone(),
+                liquidity,
+                sqrt_price_x64,
+                current_tick_index,
+                tick_spacing: config.tick_spacing,
+                required_a_to_b: config.require_zero_for_one,
+                required_b_to_a: config.require_one_for_zero,
+                a_to_b: zero_for_one.clone(),
+                b_to_a: one_for_zero.clone(),
+                slot,
+                write_version: next_write_version,
+            };
+            let executable = (!config.require_zero_for_one
+                || zero_for_one
+                    .as_ref()
+                    .map(|direction| direction.complete)
+                    .unwrap_or(false))
+                && (!config.require_one_for_zero
+                    || one_for_zero
+                        .as_ref()
+                        .map(|direction| direction.complete)
+                        .unwrap_or(false));
+            let (loaded_tick_arrays, expected_tick_arrays) =
+                quote_model_union(zero_for_one.as_ref(), one_for_zero.as_ref());
+            Some(RepairBuildResult {
+                next_state: ExecutablePoolState::RaydiumClmm(ConcentratedLiquidityPoolState {
                     pool_id: PoolId(tracked_pool.pool_id.clone()),
                     venue: PoolVenue::RaydiumClmm,
                     token_mint_a: config.token_mint_a.clone(),
@@ -2442,114 +2946,30 @@ fn build_executable_state_from_accounts(
                     sqrt_price_x64,
                     current_tick_index,
                     tick_spacing: config.tick_spacing,
-                    loaded_tick_arrays: 0,
-                    expected_tick_arrays: 3,
+                    loaded_tick_arrays,
+                    expected_tick_arrays,
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Verified,
+                    confidence: if executable {
+                        PoolConfidence::Executable
+                    } else {
+                        PoolConfidence::Verified
+                    },
                     repair_pending: false,
-                },
-            ))
+                }),
+                quote_model_update: Some(quote_model_update),
+            })
         }
     }
 }
 
-fn fetch_lookup_tables(
-    endpoint: &str,
-    lookup_table_keys: &[String],
-) -> Option<Vec<LookupTableSnapshot>> {
-    let http = Client::builder()
-        .connect_timeout(Duration::from_millis(300))
-        .timeout(Duration::from_millis(1_000))
-        .build()
-        .ok()?;
-
-    let response = http
-        .post(endpoint)
-        .json(&json!({
-            "jsonrpc": JSON_RPC_VERSION,
-            "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [
-                lookup_table_keys,
-                {
-                    "commitment": "processed",
-                    "encoding": "base64"
-                }
-            ]
-        }))
-        .send()
-        .ok()?
-        .json::<MultipleAccountsEnvelope>()
-        .ok()?;
-
-    let slot = response.result.context.slot;
-    let tables = lookup_table_keys
-        .iter()
-        .zip(response.result.value)
-        .filter_map(|(account_key, account)| decode_lookup_table(account_key, account, slot))
-        .collect::<Vec<_>>();
-    Some(tables)
-}
-
 fn fetch_accounts_by_key(
-    http: &Client,
-    endpoint: &str,
+    account_batcher: &GetMultipleAccountsBatcher,
     account_keys: &[String],
-) -> Option<(u64, HashMap<String, RpcAccountValue>)> {
-    if is_mock_endpoint(endpoint) || account_keys.is_empty() {
-        return None;
-    }
-
-    let response = http
-        .post(endpoint)
-        .json(&json!({
-            "jsonrpc": JSON_RPC_VERSION,
-            "id": 1,
-            "method": "getMultipleAccounts",
-            "params": [
-                account_keys,
-                {
-                    "commitment": "processed",
-                    "encoding": "base64"
-                }
-            ]
-        }))
-        .send()
-        .ok()?
-        .json::<MultipleAccountsEnvelope>()
-        .ok()?;
-
-    let slot = response.result.context.slot;
-    let accounts = account_keys
-        .iter()
-        .cloned()
-        .zip(response.result.value)
-        .filter_map(|(key, account)| account.map(|account| (key, account)))
-        .collect::<HashMap<_, _>>();
-    Some((slot, accounts))
-}
-
-fn decode_lookup_table(
-    account_key: &str,
-    account: Option<RpcAccountValue>,
-    fetched_slot: u64,
-) -> Option<LookupTableSnapshot> {
-    let account = account?;
-    if account.data.1 != "base64" {
-        return None;
-    }
-
-    let raw = BASE64_STANDARD.decode(account.data.0.as_bytes()).ok()?;
-    let table =
-        solana_address_lookup_table_interface::state::AddressLookupTable::deserialize(&raw).ok()?;
-    Some(LookupTableSnapshot {
-        account_key: account_key.to_string(),
-        addresses: table.addresses.iter().map(ToString::to_string).collect(),
-        last_extended_slot: table.meta.last_extended_slot,
-        fetched_slot,
-    })
+) -> Result<(u64, HashMap<String, RpcAccountValue>), RpcError> {
+    let fetched = account_batcher.fetch(account_keys)?;
+    Ok((fetched.slot, fetched.present_accounts()))
 }
 
 fn decode_base64_account(account: &RpcAccountValue) -> Option<Vec<u8>> {
@@ -2662,6 +3082,13 @@ fn read_u128(data: &[u8], offset: usize) -> Option<u128> {
     Some(u128::from_le_bytes(buf))
 }
 
+fn read_i128(data: &[u8], offset: usize) -> Option<i128> {
+    let bytes = data.get(offset..offset + 16)?;
+    let mut buf = [0u8; 16];
+    buf.copy_from_slice(bytes);
+    Some(i128::from_le_bytes(buf))
+}
+
 fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
     let bytes = data.get(offset..offset + 4)?;
     let mut buf = [0u8; 4];
@@ -2678,34 +3105,6 @@ fn try_send_event(
 
 fn next_sequence(sequence: &AtomicU64) -> u64 {
     sequence.fetch_add(1, Ordering::Relaxed)
-}
-
-fn is_mock_endpoint(endpoint: &str) -> bool {
-    endpoint.is_empty() || endpoint.starts_with(MOCK_SCHEME)
-}
-
-#[derive(Debug, Deserialize)]
-struct MultipleAccountsEnvelope {
-    result: MultipleAccountsResult,
-}
-
-#[derive(Debug, Deserialize)]
-struct MultipleAccountsResult {
-    context: RpcContext,
-    value: Vec<Option<RpcAccountValue>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RpcContext {
-    slot: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
-struct RpcAccountValue {
-    data: (String, String),
-    owner: String,
-    lamports: u64,
 }
 
 #[cfg(test)]
@@ -2725,8 +3124,8 @@ mod tests {
     };
 
     use super::{
-        CompiledInstruction, LegacyVersionedMessage, LegacyVersionedTransaction,
-        ORCA_SWAP_INSTRUCTION_TAG, ORCA_SWAP_V2_DISCRIMINATOR_NAME,
+        CompiledInstruction, ExactMutationOutcome, LegacyVersionedMessage,
+        LegacyVersionedTransaction, ORCA_SWAP_INSTRUCTION_TAG, ORCA_SWAP_V2_DISCRIMINATOR_NAME,
         ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME, ORCA_WHIRLPOOL_ACCOUNT_NAME,
         OrcaSimpleTrackedConfig, OrcaWhirlpoolTrackedConfig, PoolMutation, PoolSyncTracker,
         RAYDIUM_CLMM_ACCOUNT_NAME, RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME, RAYDIUM_SWAP_BASE_OUT_TAG,
@@ -2960,9 +3359,11 @@ mod tests {
             &usdc_ata,
             100_000_000,
             11,
-        )
-        .unwrap();
+        );
 
+        let ExactMutationOutcome::Applied(next) = next else {
+            panic!("expected applied raydium simple state");
+        };
         let state::types::ExecutablePoolState::RaydiumSimplePool(next) = next else {
             panic!("expected raydium simple state");
         };
@@ -3013,15 +3414,60 @@ mod tests {
             &usdc_ata,
             9_000_000,
             11,
-        )
-        .unwrap();
+        );
 
+        let ExactMutationOutcome::Applied(next) = next else {
+            panic!("expected applied raydium simple state");
+        };
         let state::types::ExecutablePoolState::RaydiumSimplePool(next) = next else {
             panic!("expected raydium simple state");
         };
         assert_eq!(next.reserve_b, 91_000_000);
         assert!(next.reserve_a > 1_000_000_000);
         assert_eq!(next.write_version, 3);
+    }
+
+    #[test]
+    fn raydium_simple_reducer_requests_refresh_for_non_ata_accounts() {
+        let state = ConstantProductPoolState {
+            pool_id: PoolId("pool-ray".into()),
+            venue: PoolVenue::RaydiumSimplePool,
+            token_mint_a: "So11111111111111111111111111111111111111112".into(),
+            token_mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            token_vault_a: "vault-a".into(),
+            token_vault_b: "vault-b".into(),
+            reserve_a: 1_000_000_000,
+            reserve_b: 100_000_000,
+            fee_bps: 25,
+            last_update_slot: 10,
+            write_version: 2,
+            last_verified_slot: 10,
+            confidence: PoolConfidence::Executable,
+            repair_pending: false,
+        };
+        let owner = parse_legacy_pubkey("11111111111111111111111111111112").unwrap();
+
+        let outcome = reduce_raydium_simple_swap(
+            &state,
+            &RaydiumSimpleTrackedConfig {
+                program_id: "raydium-program".into(),
+                token_program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".into(),
+                amm_pool: "amm".into(),
+                token_vault_a: "vault-a".into(),
+                token_vault_b: "vault-b".into(),
+                token_mint_a: state.token_mint_a.clone(),
+                token_mint_b: state.token_mint_b.clone(),
+                fee_bps: 25,
+            },
+            false,
+            &owner.to_string(),
+            "non-ata-source",
+            "non-ata-destination",
+            100_000_000,
+            11,
+        );
+
+        assert_eq!(outcome, ExactMutationOutcome::RefreshRequired);
     }
 
     #[test]
@@ -3061,7 +3507,7 @@ mod tests {
             }),
         };
         let mut registry = TrackedPoolRegistry::default();
-        registry.register_pool(tracked_pool);
+        registry.register_or_merge_pool(tracked_pool);
 
         let mut data = Vec::new();
         data.push(RAYDIUM_SWAP_BASE_OUT_TAG);
@@ -3123,7 +3569,7 @@ mod tests {
             }),
         };
         let mut registry = TrackedPoolRegistry::default();
-        registry.register_pool(tracked_pool);
+        registry.register_or_merge_pool(tracked_pool);
 
         let mut data = Vec::new();
         data.push(ORCA_SWAP_INSTRUCTION_TAG);
@@ -3174,10 +3620,12 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 64,
                 fee_bps: 30,
+                require_a_to_b: true,
+                require_b_to_a: false,
             }),
         };
         let mut registry = TrackedPoolRegistry::default();
-        registry.register_pool(tracked_pool);
+        registry.register_or_merge_pool(tracked_pool);
 
         let mut data = vec![0u8; 43];
         data[..8].copy_from_slice(&anchor_instruction_discriminator(
@@ -3297,10 +3745,12 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 60,
                 fee_bps: 25,
+                require_zero_for_one: true,
+                require_one_for_zero: false,
             }),
         };
         let mut registry = TrackedPoolRegistry::default();
-        registry.register_pool(tracked_pool);
+        registry.register_or_merge_pool(tracked_pool);
 
         let mut data = vec![0u8; 41];
         data[..8].copy_from_slice(&anchor_instruction_discriminator(
@@ -3411,6 +3861,8 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 4,
                 fee_bps: 4,
+                require_a_to_b: true,
+                require_b_to_a: false,
             }),
         };
         let raydium = TrackedPool {
@@ -3426,6 +3878,8 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 1,
                 fee_bps: 4,
+                require_zero_for_one: true,
+                require_one_for_zero: false,
             }),
         };
 
@@ -3454,6 +3908,8 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 4,
                 fee_bps: 4,
+                require_a_to_b: true,
+                require_b_to_a: false,
             }),
         };
         let mut raw = vec![0u8; 245];
@@ -3471,7 +3927,7 @@ mod tests {
         let next = build_executable_state_from_accounts(&tracked_pool, &accounts, 77, &states)
             .expect("repair should rebuild the pool state");
 
-        let state::types::ExecutablePoolState::OrcaWhirlpool(state) = next else {
+        let state::types::ExecutablePoolState::OrcaWhirlpool(state) = next.next_state else {
             panic!("expected whirlpool state");
         };
         assert_eq!(state.confidence, PoolConfidence::Verified);
@@ -3494,6 +3950,8 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 1,
                 fee_bps: 4,
+                require_zero_for_one: true,
+                require_one_for_zero: false,
             }),
         };
         let mut raw = vec![0u8; 273];
@@ -3510,7 +3968,7 @@ mod tests {
         let next = build_executable_state_from_accounts(&tracked_pool, &accounts, 88, &states)
             .expect("repair should rebuild the pool state");
 
-        let state::types::ExecutablePoolState::RaydiumClmm(state) = next else {
+        let state::types::ExecutablePoolState::RaydiumClmm(state) = next.next_state else {
             panic!("expected raydium clmm state");
         };
         assert_eq!(state.confidence, PoolConfidence::Verified);
@@ -3587,6 +4045,8 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 4,
                 fee_bps: 4,
+                require_a_to_b: true,
+                require_b_to_a: false,
             }),
         };
         let shadow_clmm = TrackedPool {
@@ -3602,6 +4062,8 @@ mod tests {
                 token_vault_b: "vault-b".into(),
                 tick_spacing: 1,
                 fee_bps: 1,
+                require_zero_for_one: true,
+                require_one_for_zero: false,
             }),
         };
 
