@@ -21,8 +21,8 @@ mod tests {
     };
 
     use crate::tracker::InclusionStatus;
+    use domain::RouteId;
     use serde_json::{Value, json};
-    use state::types::RouteId;
     use submit::{SubmissionId, SubmitMode, SubmitRejectionReason, SubmitResult, SubmitStatus};
 
     use super::{

@@ -470,8 +470,8 @@ mod tests {
     };
 
     use builder::{AtomicLegPlan, MessageFormat, SwapAmountMode};
+    use domain::{PoolId, RouteId};
     use solana_sdk::{hash::hashv, signer::keypair::Keypair};
-    use state::types::{PoolId, RouteId};
     use strategy::route_registry::SwapSide;
 
     use super::*;

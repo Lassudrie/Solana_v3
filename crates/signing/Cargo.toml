@@ -8,10 +8,10 @@ license.workspace = true
 base64 = "0.22"
 builder = { path = "../builder" }
 bs58.workspace = true
+domain = { path = "../domain" }
 serde.workspace = true
 serde_json.workspace = true
 solana-sdk.workspace = true
-state = { path = "../state" }
 thiserror.workspace = true
 
 [dev-dependencies]

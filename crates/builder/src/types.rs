@@ -1,4 +1,4 @@
-use state::types::RouteId;
+use domain::{LookupTableSnapshot, PoolId, RouteId};
 use strategy::opportunity::OpportunityCandidate;
 use strategy::route_registry::SwapSide;
 
@@ -11,7 +11,7 @@ pub struct DynamicBuildParameters {
     pub compute_unit_limit: u32,
     pub compute_unit_price_micro_lamports: u64,
     pub jito_tip_lamports: u64,
-    pub resolved_lookup_tables: Vec<state::types::LookupTableSnapshot>,
+    pub resolved_lookup_tables: Vec<LookupTableSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +23,7 @@ pub enum SwapAmountMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtomicLegPlan {
     pub venue: String,
-    pub pool_id: state::types::PoolId,
+    pub pool_id: PoolId,
     pub side: SwapSide,
     pub amount_mode: SwapAmountMode,
     pub specified_amount: u64,

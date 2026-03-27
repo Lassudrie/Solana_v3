@@ -7,12 +7,13 @@ pub mod selector;
 
 use std::collections::HashMap;
 
+use domain::{ExecutionSnapshot, RouteId};
 use guards::{GuardrailConfig, GuardrailSet};
 use opportunity::SelectionOutcome;
 use quote::LocalTwoLegQuoteEngine;
 use route_registry::{RouteDefinition, RouteRegistry};
 use selector::OpportunitySelector;
-use state::{StatePlane, types::RouteId};
+use state::StatePlane;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct RouteExecutionProtectionState {
@@ -55,6 +56,7 @@ impl StrategyPlane {
     pub fn evaluate(
         &mut self,
         state: &StatePlane,
+        execution: &ExecutionSnapshot,
         impacted_routes: &[RouteId],
         inflight_submissions: usize,
     ) -> SelectionOutcome {
@@ -66,6 +68,7 @@ impl StrategyPlane {
         self.selector.evaluate(
             &self.registry,
             state,
+            execution,
             impacted_routes,
             inflight_submissions,
             &route_execution_buffers,
@@ -120,8 +123,10 @@ impl StrategyPlane {
 
 #[cfg(test)]
 mod tests {
-    use detection::events::SnapshotConfidence;
-    use detection::{EventSourceKind, NormalizedEvent};
+    use domain::{
+        EventSourceKind, ExecutionSnapshot, NormalizedEvent, PoolId, PoolSnapshotUpdate, RouteId,
+        SnapshotConfidence,
+    };
 
     use super::{
         StrategyPlane,
@@ -130,10 +135,7 @@ mod tests {
         reasons::RejectionReason,
         route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
     };
-    use state::{
-        StatePlane,
-        types::{PoolId, RouteId},
-    };
+    use state::StatePlane;
 
     const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
@@ -180,6 +182,20 @@ mod tests {
         route
     }
 
+    fn ready_execution_snapshot(head_slot: u64) -> ExecutionSnapshot {
+        ExecutionSnapshot {
+            head_slot,
+            rpc_slot: Some(head_slot),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(head_slot),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        }
+    }
+
     fn apply_executable_snapshot(
         state: &mut StatePlane,
         sequence: u64,
@@ -193,7 +209,7 @@ mod tests {
                 EventSourceKind::Synthetic,
                 sequence,
                 slot,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: pool_id.into(),
                     price_bps: ((u128::from(reserve_b) * 10_000u128) / u128::from(reserve_a))
                         as u64,
@@ -227,7 +243,9 @@ mod tests {
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         assert!(matches!(
             outcome.decisions.first(),
             Some(OpportunityDecision::Rejected {
@@ -254,16 +272,13 @@ mod tests {
             route.route_id.clone(),
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         apply_executable_snapshot(&mut state, 1, "pool-a", 10, 1_000_000, 700_000);
         apply_executable_snapshot(&mut state, 2, "pool-b", 11, 1_000_000, 1_300_000);
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         let candidate = outcome.best_candidate.expect("candidate");
         assert_eq!(candidate.route_id, route.route_id);
         assert!(candidate.expected_net_profit_quote_atoms > 0);
@@ -288,16 +303,13 @@ mod tests {
             route.route_id.clone(),
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         apply_executable_snapshot(&mut state, 1, "pool-a", 10, 1_000_000, 700_000);
         apply_executable_snapshot(&mut state, 2, "pool-b", 11, 1_000_000, 1_300_000);
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         let candidate = outcome.best_candidate.expect("candidate");
         assert_eq!(candidate.trade_size, route.max_trade_size);
         assert!(
@@ -325,16 +337,13 @@ mod tests {
             route.route_id.clone(),
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         apply_executable_snapshot(&mut state, 1, "pool-a", 10, 1_000_000, 700_000);
         apply_executable_snapshot(&mut state, 2, "pool-b", 11, 1_000_000, 1_300_000);
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         assert!(matches!(
             outcome.decisions.first(),
             Some(OpportunityDecision::Rejected {
@@ -356,18 +365,13 @@ mod tests {
             route.route_id.clone(),
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         state
             .apply_event(&NormalizedEvent::pool_snapshot_update(
                 EventSourceKind::ShredStream,
                 1,
                 10,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: "pool-a".into(),
                     price_bps: 10_000,
                     fee_bps: 4,
@@ -392,7 +396,7 @@ mod tests {
                 EventSourceKind::ShredStream,
                 2,
                 10,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: "pool-b".into(),
                     price_bps: 10_000,
                     fee_bps: 4,
@@ -413,7 +417,9 @@ mod tests {
             ))
             .unwrap();
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         assert!(matches!(
             outcome.decisions.first(),
             Some(OpportunityDecision::Rejected {
@@ -435,18 +441,13 @@ mod tests {
             route.route_id.clone(),
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         state
             .apply_event(&NormalizedEvent::pool_snapshot_update(
                 EventSourceKind::ShredStream,
                 1,
                 10,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: "pool-a".into(),
                     price_bps: 10_000,
                     fee_bps: 4,
@@ -471,7 +472,7 @@ mod tests {
                 EventSourceKind::ShredStream,
                 2,
                 10,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: "pool-b".into(),
                     price_bps: 10_000,
                     fee_bps: 4,
@@ -492,7 +493,9 @@ mod tests {
             ))
             .unwrap();
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         assert!(matches!(
             outcome.decisions.first(),
             Some(OpportunityDecision::Rejected {
@@ -514,18 +517,13 @@ mod tests {
             route.route_id.clone(),
             vec![PoolId("pool-a".into()), PoolId("pool-b".into())],
         );
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         state
             .apply_event(&NormalizedEvent::pool_snapshot_update(
                 EventSourceKind::ShredStream,
                 1,
                 10,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: "pool-a".into(),
                     price_bps: 10_000,
                     fee_bps: 4,
@@ -550,7 +548,7 @@ mod tests {
                 EventSourceKind::ShredStream,
                 2,
                 10,
-                detection::PoolSnapshotUpdate {
+                PoolSnapshotUpdate {
                     pool_id: "pool-b".into(),
                     price_bps: 10_000,
                     fee_bps: 4,
@@ -571,7 +569,9 @@ mod tests {
             ))
             .unwrap();
 
-        let outcome = strategy.evaluate(&state, std::slice::from_ref(&route.route_id), 0);
+        let execution = ready_execution_snapshot(state.latest_slot());
+        let outcome =
+            strategy.evaluate(&state, &execution, std::slice::from_ref(&route.route_id), 0);
         assert!(matches!(
             outcome.decisions.first(),
             Some(OpportunityDecision::Rejected {

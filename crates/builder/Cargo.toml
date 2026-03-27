@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 bincode.workspace = true
+domain = { path = "../domain" }
 solana-system-interface = { version = "3.1.0", features = ["bincode"] }
 solana-sdk.workspace = true
-state = { path = "../state" }
 strategy = { path = "../strategy" }
 thiserror.workspace = true

@@ -1,4 +1,4 @@
-use state::types::{PoolId, RouteId, WarmupStatus};
+use domain::{PoolId, RouteId, WarmupStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RejectionReason {

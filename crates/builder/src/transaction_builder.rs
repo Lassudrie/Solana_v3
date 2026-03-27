@@ -1,6 +1,7 @@
 use std::{collections::HashMap, str::FromStr};
 
 use bincode::serialize;
+use domain::quote_models::{derive_orca_tick_arrays, derive_raydium_tick_arrays};
 use solana_sdk::{
     hash::{Hash, hashv},
     instruction::{AccountMeta, Instruction},
@@ -8,7 +9,6 @@ use solana_sdk::{
     pubkey::Pubkey,
 };
 use solana_system_interface::instruction;
-use state::quote_models::{derive_orca_tick_arrays, derive_raydium_tick_arrays};
 
 use crate::{
     execution::{
@@ -628,7 +628,7 @@ mod tests {
             fee_payer,
             &AtomicLegPlan {
                 venue: "orca_whirlpool".into(),
-                pool_id: state::types::PoolId("pool-a".into()),
+                pool_id: domain::PoolId("pool-a".into()),
                 side: strategy::route_registry::SwapSide::BuyBase,
                 amount_mode: SwapAmountMode::ExactOut,
                 specified_amount: 123,
@@ -668,7 +668,7 @@ mod tests {
             fee_payer,
             &AtomicLegPlan {
                 venue: "raydium_clmm".into(),
-                pool_id: state::types::PoolId("pool-b".into()),
+                pool_id: domain::PoolId("pool-b".into()),
                 side: strategy::route_registry::SwapSide::BuyBase,
                 amount_mode: SwapAmountMode::ExactOut,
                 specified_amount: 321,
@@ -710,7 +710,7 @@ mod tests {
             fee_payer,
             &AtomicLegPlan {
                 venue: "raydium".into(),
-                pool_id: state::types::PoolId("pool-c".into()),
+                pool_id: domain::PoolId("pool-c".into()),
                 side: strategy::route_registry::SwapSide::BuyBase,
                 amount_mode: SwapAmountMode::ExactOut,
                 specified_amount: 777,

@@ -1,7 +1,7 @@
-use crate::types::{ExecutionStateSnapshot, LookupTableSnapshot};
+use domain::{ExecutionSnapshot, LookupTableSnapshot};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionState {
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecutionContext {
     rpc_slot: Option<u64>,
     latest_blockhash: Option<String>,
     blockhash_slot: Option<u64>,
@@ -12,24 +12,9 @@ pub struct ExecutionState {
     kill_switch_enabled: bool,
 }
 
-impl Default for ExecutionState {
-    fn default() -> Self {
-        Self {
-            rpc_slot: None,
-            latest_blockhash: None,
-            blockhash_slot: None,
-            alt_revision: 0,
-            lookup_tables: Vec::new(),
-            wallet_balance_lamports: 0,
-            wallet_ready: false,
-            kill_switch_enabled: false,
-        }
-    }
-}
-
-impl ExecutionState {
-    pub fn snapshot(&self, head_slot: u64) -> ExecutionStateSnapshot {
-        ExecutionStateSnapshot {
+impl ExecutionContext {
+    pub fn snapshot(&self, head_slot: u64) -> ExecutionSnapshot {
+        ExecutionSnapshot {
             head_slot,
             rpc_slot: self.rpc_slot,
             latest_blockhash: self.latest_blockhash.clone(),

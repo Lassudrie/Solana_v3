@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use state::types::{PoolId, RouteId};
+use domain::{PoolId, RouteId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SwapSide {

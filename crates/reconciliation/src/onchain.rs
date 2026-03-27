@@ -807,8 +807,8 @@ mod tests {
         classifier::FailureClass,
         tracker::{ExecutionTracker, InclusionStatus},
     };
+    use domain::RouteId;
     use serde_json::json;
-    use state::types::RouteId;
     use std::time::Duration;
     use submit::{SubmissionId, SubmitMode, SubmitResult, SubmitStatus};
     use tungstenite::Message;

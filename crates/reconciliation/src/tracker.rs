@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use state::types::RouteId;
+use domain::RouteId;
 use submit::{SubmissionId, SubmitMode, SubmitResult, SubmitStatus};
 
 use crate::{classifier::FailureClass, history::ExecutionHistory};

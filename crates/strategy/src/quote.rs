@@ -1,19 +1,19 @@
 use crate::route_registry::SwapSide;
+use domain::{
+    LiquidityModel, PoolId, PoolSnapshot, PoolVenue,
+    quote_models::{ConcentratedQuoteModel, DirectionalConcentratedQuoteModel},
+};
 use primitive_types::U256;
 use thiserror::Error;
 
 use crate::route_registry::RouteDefinition;
-use state::{
-    quote_models::{ConcentratedQuoteModel, DirectionalConcentratedQuoteModel},
-    types::{LiquidityModel, PoolSnapshot, PoolVenue},
-};
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegQuote {
     pub venue: String,
-    pub pool_id: state::types::PoolId,
+    pub pool_id: PoolId,
     pub side: SwapSide,
     pub input_amount: u64,
     pub output_amount: u64,

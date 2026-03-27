@@ -6,10 +6,10 @@ license.workspace = true
 
 [dependencies]
 base64 = "0.22"
+domain = { path = "../domain" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
 signing = { path = "../signing" }
-state = { path = "../state" }
 thiserror.workspace = true
 tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }

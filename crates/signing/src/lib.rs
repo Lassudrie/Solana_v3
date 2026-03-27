@@ -5,7 +5,7 @@ pub mod wallet;
 use std::time::SystemTime;
 
 use builder::UnsignedTransactionEnvelope;
-use state::types::RouteId;
+use domain::RouteId;
 
 pub use signer::{LocalWalletSigner, SecureUnixWalletSigner, Signer, SigningError};
 pub use wallet::{HotWallet, WalletPrecondition, WalletStatus};

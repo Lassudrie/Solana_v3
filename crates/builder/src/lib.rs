@@ -19,9 +19,9 @@ pub use types::{
 #[cfg(test)]
 mod tests {
     use bincode::deserialize;
+    use domain::{LookupTableSnapshot, PoolId, RouteId};
     use solana_sdk::signer::{SeedDerivable, Signer as SolanaSigner, keypair::Keypair};
     use solana_sdk::{hash::hashv, message::VersionedMessage, pubkey::Pubkey};
-    use state::types::{LookupTableSnapshot, RouteId};
     use strategy::{opportunity::OpportunityCandidate, quote::LegQuote, route_registry::SwapSide};
 
     use crate::{
@@ -64,7 +64,7 @@ mod tests {
             leg_quotes: [
                 LegQuote {
                     venue: "orca".into(),
-                    pool_id: state::types::PoolId("pool-a".into()),
+                    pool_id: PoolId("pool-a".into()),
                     side: SwapSide::BuyBase,
                     input_amount: 10_000,
                     output_amount: 10_120,
@@ -73,7 +73,7 @@ mod tests {
                 },
                 LegQuote {
                     venue: "raydium".into(),
-                    pool_id: state::types::PoolId("pool-b".into()),
+                    pool_id: PoolId("pool-b".into()),
                     side: SwapSide::SellBase,
                     input_amount: 10_120,
                     output_amount: 10_250,

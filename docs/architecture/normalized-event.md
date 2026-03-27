@@ -1,10 +1,20 @@
-# Contrat NormalizedEvent
+# Contrat `NormalizedEvent`
 
-Ce document décrit précisément la structure `NormalizedEvent` produite dans le crate `detection` et consommée par le pipeline `bot` (`runtime` / `state`).
+Le contrat normalisé du flux marché n’est plus porté par `detection` seul.  
+La source de vérité est maintenant `crates/domain/src/events.rs`, et `detection` ne fait que le ré-exporter.
 
-Fichier source unique : [crates/detection/src/events.rs](/root/bot/Solana_v3/crates/detection/src/events.rs).
+## Propriété du contrat
 
-## Définitions de base
+- Contrat partagé: `crates/domain/src/events.rs`
+- Producteurs principaux:
+  - `crates/detection/src/shredstream.rs`
+  - `crates/detection/src/sources.rs`
+  - `crates/bot/src/live.rs` pour le pipeline gRPC live restant encore en migration
+- Consommateurs principaux:
+  - `crates/state/src/lib.rs`
+  - `crates/bot/src/runtime.rs`
+
+## Structure
 
 ```rust
 pub struct NormalizedEvent {
@@ -17,34 +27,15 @@ pub struct NormalizedEvent {
 ```rust
 pub enum MarketEvent {
     AccountUpdate(AccountUpdate),
+    PoolSnapshotUpdate(PoolSnapshotUpdate),
+    PoolQuoteModelUpdate(PoolQuoteModelUpdate),
+    PoolInvalidation(PoolInvalidation),
     SlotBoundary(SlotBoundary),
     Heartbeat(Heartbeat),
 }
 ```
 
-## Champs de `NormalizedEvent` (définition précise)
-
-### `payload: MarketEvent`
-
-`payload` contient le type d’événement marché normalisé.  
-
-- `MarketEvent::AccountUpdate(AccountUpdate)`
-  - `pubkey: String` — clé publique du compte mis à jour.
-  - `owner: String` — propriétaire (program ID) du compte.
-  - `lamports: u64` — solde lamports lu dans le compte.
-  - `data: Vec<u8>` — payload brut du compte, bytes décodés depuis le hex wire (`data_hex`).
-  - `slot: u64` — slot d’écriture du compte.
-  - `write_version: u64` — version d’écriture du compte.
-
-- `MarketEvent::SlotBoundary(SlotBoundary)`
-  - `slot: u64` — slot de frontière.
-  - `leader: Option<String>` — leader du slot (`None` si non fourni par la source).
-
-- `MarketEvent::Heartbeat(Heartbeat)`
-  - `slot: u64` — slot associé au heartbeat.
-  - `note: &'static str` — note fixe, actuellement `"wire"`.
-
-### `source: SourceMetadata`
+## Métadonnées source
 
 ```rust
 pub struct SourceMetadata {
@@ -54,96 +45,85 @@ pub struct SourceMetadata {
 }
 ```
 
-- `source: EventSourceKind`
-  - `ShredStream`
-  - `Replay`
-  - `Synthetic`
+- `source`: `ShredStream | Replay | Synthetic`
+- `sequence`: séquence logique de la source; auto-incrémentée si absente à l’entrée wire
+- `observed_slot`: slot observé par la source; peut différer du slot métier embarqué dans le payload
 
-- `sequence: u64`
-  - numéro d’ordre logique de l’événement dans la source.
-  - si absent à l’entrée wire, la source assigne une séquence auto-incrémentée (commence à `1`).
-
-- `observed_slot: u64`
-  - slot observé coté source d’entrée.
-  - si absent à l’entrée wire, il est dérivé du `slot` de l’événement (dépendant du variant).
-
-### `latency: LatencyMetadata`
+## Métadonnées de latence
 
 ```rust
 pub struct LatencyMetadata {
     pub source_received_at: SystemTime,
     pub normalized_at: SystemTime,
-    pub source_latency: Duration,
+    pub source_latency: Option<Duration>,
 }
 ```
 
-- `source_received_at: SystemTime`
-  - horodatage de la réception/normalisation côté source de parsing.
+- `source_latency` est optionnel
+- les sources wire JSONL/UDP initialisent aujourd’hui `source_latency` à `None`
+- les producteurs peuvent enrichir cette mesure plus tard sans casser le contrat
 
-- `normalized_at: SystemTime`
-  - horodatage quand la forme `NormalizedEvent` est produite.
+## Payloads
 
-- `source_latency: Duration`
-  - durée de latence calculée pour la source.
-  - dans l’implémentation actuelle de normalisation UDP/JSONL, ce champ est initialisé à `Duration::ZERO`.
+### `AccountUpdate`
 
-## Producteurs de `NormalizedEvent`
+- `pubkey: String`
+- `owner: String`
+- `lamports: u64`
+- `data: Vec<u8>`
+- `slot: u64`
+- `write_version: u64`
 
-- `detection::ShredStreamSource` (`crates/detection/src/shredstream.rs`)
-- `bot` sources alternatives (`crates/bot/src/sources.rs`) :
-  - JSONL
-  - UDP JSON
-- Les deux implémentations appellent un helper `normalized_event(...)` qui construit systématiquement `payload`, `source`, `latency`.
+### `PoolSnapshotUpdate`
 
-## Méthodes de construction
+- `pool_id: String`
+- `price_bps: u64`
+- `fee_bps: u16`
+- `reserve_depth: u64`
+- `reserve_a: Option<u64>`
+- `reserve_b: Option<u64>`
+- `active_liquidity: Option<u64>`
+- `sqrt_price_x64: Option<u128>`
+- `confidence: SnapshotConfidence`
+- `repair_pending: Option<bool>`
+- `token_mint_a: String`
+- `token_mint_b: String`
+- `tick_spacing: u16`
+- `current_tick_index: Option<i32>`
+- `slot: u64`
+- `write_version: u64`
 
-### `NormalizedEvent::account_update(...)`
+### `PoolQuoteModelUpdate`
 
-```rust
-NormalizedEvent::account_update(source, sequence, observed_slot, update)
-```
+- `pool_id: String`
+- `liquidity: u128`
+- `sqrt_price_x64: u128`
+- `current_tick_index: i32`
+- `tick_spacing: u16`
+- `required_a_to_b: bool`
+- `required_b_to_a: bool`
+- `a_to_b: Option<DirectionalPoolQuoteModelUpdate>`
+- `b_to_a: Option<DirectionalPoolQuoteModelUpdate>`
+- `slot: u64`
+- `write_version: u64`
 
-Construit un événement de type `MarketEvent::AccountUpdate` avec :
+### `PoolInvalidation`
 
-- `source` forcé à `SourceMetadata { source, sequence, observed_slot }`
-- `latency` rempli avec `source_received_at == normalized_at == SystemTime::now()` et `source_latency == Duration::ZERO`
+- `pool_id: String`
 
-## Exemple de mapping wire -> normalized
+### `SlotBoundary`
 
-Entrée wire (ShredStream/UDP/JSONL) :
+- `slot: u64`
+- `leader: Option<String>`
 
-```json
-{
-  "type": "account_update",
-  "source": "replay",
-  "sequence": 7,
-  "observed_slot": 11,
-  "pubkey": "acct-a",
-  "owner": "owner",
-  "lamports": 0,
-  "data_hex": "010203",
-  "slot": 11,
-  "write_version": 3
-}
-```
+### `Heartbeat`
 
-Sortie normalisée (conceptuelle) :
+- `slot: u64`
+- `note: &'static str`
 
-- `payload = MarketEvent::AccountUpdate(AccountUpdate { pubkey: "acct-a", owner: "owner", lamports: 0, data: vec![1,2,3], slot: 11, write_version: 3 })`
-- `source = SourceMetadata { source: EventSourceKind::Replay, sequence: 7, observed_slot: 11 }`
-- `latency = LatencyMetadata { source_received_at: <t>, normalized_at: <t>, source_latency: 0 }`
+## Contrats d’architecture
 
-## Consommation par le pipeline
-
-- `state::StatePlane::apply_event` lit principalement `payload` :
-  - `AccountUpdate` déclenche l’upsert compte + rafraîchissement snapshots/routes.
-  - `SlotBoundary` met à jour `latest_slot`.
-  - `Heartbeat` met à jour `latest_slot` si nécessaire.
-- `source` et `latency` sont utiles pour la traçabilité, la déduplication et les métriques futures ; ils ne sont pas utilisés pour la décision de quote dans le hot path actuellement.
-
-## Contrats implicites importants
-
-- Les timestamps de latence sont cohérents en création aujourd’hui, mais peuvent être enrichis si une métrique source réelle est ajoutée.
-- `observed_slot` est un champ de cohérence/freshness et peut différer du `slot` métier suivant la source.
-- Le contrat actuel assume une normalisation fidèle au contrat d’entrée wire et un typage strict via `serde`.
-
+- `domain` porte le contrat et les types transverses
+- `detection` produit des `NormalizedEvent` mais ne possède plus le schéma
+- `state` applique les événements sans dépendre de `detection`
+- `bot` orchestre le hot path, mais ne doit pas redéfinir les contrats du flux

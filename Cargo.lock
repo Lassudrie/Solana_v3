@@ -543,10 +543,7 @@ dependencies = [
  "clap",
  "crossterm 0.29.0",
  "detection",
- "openssl",
- "prost",
- "prost-types",
- "protobuf-src",
+ "domain",
  "ratatui",
  "reconciliation",
  "reqwest 0.12.28",
@@ -555,11 +552,7 @@ dependencies = [
  "signerd",
  "signing",
  "solana-address-lookup-table-interface",
- "solana-entry",
- "solana-message 2.2.1",
- "solana-pubkey 2.2.1",
  "solana-sdk",
- "solana-transaction 2.2.1",
  "state",
  "strategy",
  "submit",
@@ -567,8 +560,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml 0.9.12+spec-1.1.0",
- "tonic",
- "tonic-build",
 ]
 
 [[package]]
@@ -606,9 +597,9 @@ name = "builder"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "domain",
  "solana-sdk",
  "solana-system-interface 3.1.0",
- "state",
  "strategy",
  "thiserror 2.0.18",
 ]
@@ -1189,9 +1180,26 @@ dependencies = [
 name = "detection"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "domain",
+ "openssl",
+ "prost",
+ "prost-types",
+ "protobuf-src",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "solana-address-lookup-table-interface",
+ "solana-entry",
+ "solana-message 2.2.1",
+ "solana-pubkey 2.2.1",
+ "solana-sdk",
+ "solana-transaction 2.2.1",
  "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tonic-build",
 ]
 
 [[package]]
@@ -1256,6 +1264,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4b8a88685455ed29a21542a33abd9cb6510b6b129abadabdcef0f4c55bc8f61"
 dependencies = [
  "litrs",
+]
+
+[[package]]
+name = "domain"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "solana-sdk",
 ]
 
 [[package]]
@@ -3197,10 +3213,10 @@ dependencies = [
 name = "reconciliation"
 version = "0.1.0"
 dependencies = [
+ "domain",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "state",
  "submit",
  "thiserror 2.0.18",
  "tungstenite",
@@ -3746,10 +3762,10 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "builder",
+ "domain",
  "serde",
  "serde_json",
  "solana-sdk",
- "state",
  "strategy",
  "thiserror 2.0.18",
 ]
@@ -6225,7 +6241,7 @@ name = "state"
 version = "0.1.0"
 dependencies = [
  "bs58",
- "detection",
+ "domain",
  "solana-sdk",
  "thiserror 2.0.18",
 ]
@@ -6240,7 +6256,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "strategy"
 version = "0.1.0"
 dependencies = [
- "detection",
+ "domain",
  "primitive-types",
  "state",
  "thiserror 2.0.18",
@@ -6279,11 +6295,11 @@ name = "submit"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "domain",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "signing",
- "state",
  "thiserror 2.0.18",
  "tungstenite",
 ]

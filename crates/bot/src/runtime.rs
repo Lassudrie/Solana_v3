@@ -1,28 +1,29 @@
 use std::time::{Duration, Instant, SystemTime};
 
 use builder::{BuildRequest, BuildResult, BuildStatus, DynamicBuildParameters, TransactionBuilder};
-use detection::{EventSourceKind, NormalizedEvent};
+use domain::{
+    AccountUpdateStatus, EventSourceKind, ExecutionSnapshot, LookupTableSnapshot, NormalizedEvent,
+    PoolSnapshot, StateApplyOutcome,
+};
 use reconciliation::{
     ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, FailureClass,
     OnChainReconciler,
 };
 use signing::{HotWallet, SignedTransactionEnvelope, Signer, SigningError, SigningRequest};
-use state::{
-    StateError, StatePlane,
-    types::{AccountUpdateStatus, StateApplyOutcome},
-};
+use state::{StateError, StatePlane};
 use strategy::{StrategyPlane, opportunity::SelectionOutcome};
 use submit::{SubmitError, SubmitMode, SubmitRequest, SubmitResult, Submitter};
 use telemetry::{LogLevel, PipelineStage, TelemetryStack};
 use thiserror::Error;
 
+use crate::execution_context::ExecutionContext;
 use crate::refresh::AsyncRefreshSnapshot;
 use crate::route_health::{RouteHealthSummary, SharedRouteHealth};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathReport {
     pub state_outcome: Option<StateApplyOutcome>,
-    pub pool_snapshots: Vec<state::types::PoolSnapshot>,
+    pub pool_snapshots: Vec<PoolSnapshot>,
     pub selection: SelectionOutcome,
     pub build_result: Option<BuildResult>,
     pub signed_envelope: Option<SignedTransactionEnvelope>,
@@ -105,6 +106,7 @@ pub enum RuntimeError {
 
 pub struct HotPathPipeline {
     state: StatePlane,
+    execution: ExecutionContext,
     strategy: StrategyPlane,
     builder: builder::AtomicArbTransactionBuilder,
     wallet: HotWallet,
@@ -123,6 +125,7 @@ impl HotPathPipeline {
     ) -> Self {
         Self {
             state,
+            execution: ExecutionContext::default(),
             strategy,
             builder,
             wallet,
@@ -146,7 +149,7 @@ pub struct BlockhashService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AltCacheService {
     pub revision: u64,
-    pub lookup_tables: Vec<state::types::LookupTableSnapshot>,
+    pub lookup_tables: Vec<LookupTableSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,23 +169,16 @@ pub struct ColdPathServices {
 
 impl ColdPathServices {
     pub fn seed_hot_path(&self, hot_path: &mut HotPathPipeline) {
-        hot_path.state.execution_state_mut().set_blockhash(
+        hot_path.execution.set_blockhash(
             self.blockhash.current_blockhash.clone(),
             self.blockhash.slot,
         );
+        hot_path.execution.set_rpc_slot(self.blockhash.slot);
+        hot_path.execution.set_alt_revision(self.alt_cache.revision);
         hot_path
-            .state
-            .execution_state_mut()
-            .set_rpc_slot(self.blockhash.slot);
-        hot_path
-            .state
-            .execution_state_mut()
-            .set_alt_revision(self.alt_cache.revision);
-        hot_path
-            .state
-            .execution_state_mut()
+            .execution
             .set_lookup_tables(self.alt_cache.lookup_tables.clone());
-        hot_path.state.execution_state_mut().set_wallet_state(
+        hot_path.execution.set_wallet_state(
             self.wallet_refresh.balance_lamports,
             self.wallet_refresh.ready && self.wallet_refresh.signer_available,
         );
@@ -255,32 +251,21 @@ impl BotRuntime {
     pub fn apply_async_refresh(&mut self, snapshot: AsyncRefreshSnapshot) {
         if let Some(blockhash) = snapshot.blockhash {
             self.hot_path
-                .state
-                .execution_state_mut()
+                .execution
                 .set_blockhash(blockhash.blockhash, blockhash.slot);
-            self.hot_path
-                .state
-                .execution_state_mut()
-                .set_rpc_slot(blockhash.slot);
+            self.hot_path.execution.set_rpc_slot(blockhash.slot);
             self.hot_path.state.set_latest_slot(blockhash.slot);
         }
 
         if let Some(slot) = snapshot.slot {
-            self.hot_path
-                .state
-                .execution_state_mut()
-                .set_rpc_slot(slot.slot);
+            self.hot_path.execution.set_rpc_slot(slot.slot);
             self.hot_path.state.set_latest_slot(slot.slot);
         }
 
         if let Some(lookup_tables) = snapshot.lookup_tables {
+            self.hot_path.execution.set_alt_revision(lookup_tables.slot);
             self.hot_path
-                .state
-                .execution_state_mut()
-                .set_alt_revision(lookup_tables.slot);
-            self.hot_path
-                .state
-                .execution_state_mut()
+                .execution
                 .set_lookup_tables(lookup_tables.tables);
             self.hot_path.state.set_latest_slot(lookup_tables.slot);
         }
@@ -288,8 +273,7 @@ impl BotRuntime {
         if let Some(wallet) = snapshot.wallet {
             let signer_available = self.hot_path.signer.is_available();
             self.hot_path
-                .state
-                .execution_state_mut()
+                .execution
                 .set_wallet_state(wallet.balance_lamports, wallet.ready && signer_available);
             self.hot_path.state.set_latest_slot(wallet.slot);
             self.hot_path.wallet.balance_lamports = wallet.balance_lamports;
@@ -301,8 +285,10 @@ impl BotRuntime {
         &self.telemetry
     }
 
-    pub fn execution_state(&self) -> state::types::ExecutionStateSnapshot {
-        self.hot_path.state.execution_state()
+    pub fn execution_state(&self) -> ExecutionSnapshot {
+        self.hot_path
+            .execution
+            .snapshot(self.hot_path.state.latest_slot())
     }
 
     pub fn latest_slot(&self) -> u64 {
@@ -390,10 +376,7 @@ impl BotRuntime {
     }
 
     pub fn apply_kill_switch(&mut self, enabled: bool) {
-        self.hot_path
-            .state
-            .execution_state_mut()
-            .set_kill_switch(enabled);
+        self.hot_path.execution.set_kill_switch(enabled);
     }
 
     pub fn prepare_event(
@@ -487,8 +470,13 @@ impl BotRuntime {
         }
 
         let strategy_started = Instant::now();
+        let execution_state = self
+            .hot_path
+            .execution
+            .snapshot(self.hot_path.state.latest_slot());
         let selection = self.hot_path.strategy.evaluate(
             &self.hot_path.state,
+            &execution_state,
             &impacted_routes,
             self.tracker
                 .pending_count()
@@ -516,7 +504,6 @@ impl BotRuntime {
             .best_candidate
             .clone()
             .expect("candidate available");
-        let execution_state = self.hot_path.state.execution_state();
         let build_started = Instant::now();
         let build_result = self.hot_path.builder.build(BuildRequest {
             candidate,

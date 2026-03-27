@@ -5,6 +5,25 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+base64 = "0.22"
+bincode.workspace = true
+domain = { path = "../domain" }
+openssl = { version = "0.10", features = ["vendored"] }
+prost = "0.13"
+prost-types = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json.workspace = true
+solana-address-lookup-table-interface = { version = "2.2.2", features = ["bincode", "bytemuck"] }
+solana-entry-legacy = { package = "solana-entry", version = "=2.2.1" }
+solana-message-legacy = { package = "solana-message", version = "=2.2.1" }
+solana-pubkey-legacy = { package = "solana-pubkey", version = "=2.2.1" }
+solana-sdk.workspace = true
+solana-transaction-legacy = { package = "solana-transaction", version = "=2.2.1" }
 thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tonic = { version = "0.13", features = ["tls-webpki-roots"] }
+
+[build-dependencies]
+protobuf-src = "1"
+tonic-build = "0.13"

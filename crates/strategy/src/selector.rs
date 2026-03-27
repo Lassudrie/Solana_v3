@@ -5,7 +5,8 @@ use crate::{
     reasons::RejectionReason,
     route_registry::{RouteDefinition, RouteRegistry, SwapSide},
 };
-use state::{StatePlane, types::RouteId};
+use domain::{ExecutionSnapshot, PoolSnapshot, RouteId};
+use state::StatePlane;
 use std::collections::{BTreeSet, HashMap};
 
 const DEFAULT_SIZE_LADDER: [u64; 6] =
@@ -33,6 +34,7 @@ where
         &self,
         registry: &RouteRegistry,
         state: &StatePlane,
+        execution_state: &ExecutionSnapshot,
         impacted_routes: &[RouteId],
         inflight_submissions: usize,
         route_execution_buffers: &HashMap<RouteId, u16>,
@@ -47,7 +49,6 @@ where
             };
         }
 
-        let execution_state = state.execution_state();
         let mut decisions = Vec::with_capacity(impacted_routes.len());
         let mut accepted = Vec::new();
 
@@ -63,7 +64,7 @@ where
             match self.evaluate_route(
                 route,
                 state,
-                &execution_state,
+                execution_state,
                 inflight_submissions,
                 route_execution_buffers.get(route_id).copied(),
             ) {
@@ -92,7 +93,7 @@ where
         &self,
         route: &RouteDefinition,
         state: &StatePlane,
-        execution_state: &state::types::ExecutionStateSnapshot,
+        execution_state: &ExecutionSnapshot,
         inflight_submissions: usize,
         active_execution_buffer_bps: Option<u16>,
     ) -> Result<OpportunityCandidate, RejectionReason> {
@@ -297,7 +298,7 @@ fn prioritize_trade_sizes(mut sizes: Vec<u64>, default_trade_size: u64) -> Vec<u
 
 fn reserve_usage_rejection(
     route: &RouteDefinition,
-    snapshots: [&state::types::PoolSnapshot; 2],
+    snapshots: [&PoolSnapshot; 2],
     quote: &crate::quote::RouteQuote,
 ) -> Option<RejectionReason> {
     let base_mint = route.base_mint.as_deref()?;
@@ -336,12 +337,11 @@ mod tests {
         },
         route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
     };
-    use detection::events::SnapshotConfidence;
-    use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate};
-    use state::{
-        StatePlane,
-        types::{ExecutionStateSnapshot, PoolId, RouteId},
+    use domain::{
+        EventSourceKind, ExecutionStateSnapshot, NormalizedEvent, PoolId, PoolSnapshotUpdate,
+        RouteId, SnapshotConfidence,
     };
+    use state::StatePlane;
 
     #[derive(Debug, Default)]
     struct MockQuoteEngine;
@@ -486,11 +486,6 @@ mod tests {
             }),
         );
         let mut state = StatePlane::new(2);
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(10);
-        state.execution_state_mut().set_blockhash("blockhash-1", 10);
 
         for pool_id in ["pool-a", "pool-b"] {
             state
@@ -559,11 +554,6 @@ mod tests {
             }),
         );
         let mut state = StatePlane::new(2);
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(10);
-        state.execution_state_mut().set_blockhash("blockhash-1", 10);
 
         for pool_id in ["pool-a", "pool-b"] {
             state
@@ -624,11 +614,6 @@ mod tests {
             }),
         );
         let mut state = StatePlane::new(4);
-        state
-            .execution_state_mut()
-            .set_wallet_state(1_000_000, true);
-        state.execution_state_mut().set_rpc_slot(12);
-        state.execution_state_mut().set_blockhash("blockhash-1", 12);
 
         for (pool_id, slot) in [("pool-a", 8), ("pool-b", 11)] {
             state

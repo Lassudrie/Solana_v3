@@ -2,7 +2,6 @@ pub mod account_store;
 pub mod decoder;
 pub mod dependency_graph;
 pub mod executable_pool_state;
-pub mod execution_state;
 pub mod pool_snapshots;
 pub mod quote_models;
 pub mod types;
@@ -11,10 +10,9 @@ pub mod warmup;
 use std::collections::HashSet;
 use std::time::SystemTime;
 
-use detection::events::SnapshotConfidence;
-use detection::{
-    AccountUpdate, MarketEvent, NormalizedEvent, PoolInvalidation, PoolQuoteModelUpdate,
-    PoolSnapshotUpdate,
+use domain::{
+    AccountUpdate, DirectionalPoolQuoteModelUpdate, MarketEvent, NormalizedEvent, PoolInvalidation,
+    PoolQuoteModelUpdate, PoolSnapshotUpdate, SnapshotConfidence,
 };
 use thiserror::Error;
 
@@ -22,12 +20,11 @@ use crate::{
     account_store::AccountStore,
     decoder::DecoderRegistry,
     dependency_graph::DependencyGraph,
-    execution_state::ExecutionState,
     pool_snapshots::PoolSnapshotStore,
     quote_models::ConcentratedQuoteModelStore,
     types::{
-        AccountKey, AccountRecord, AccountUpdateStatus, ExecutionStateSnapshot, LiquidityModel,
-        PoolConfidence, PoolId, StateApplyOutcome, WarmupStatus,
+        AccountKey, AccountRecord, AccountUpdateStatus, LiquidityModel, PoolConfidence, PoolId,
+        StateApplyOutcome, WarmupStatus,
     },
     warmup::WarmupManager,
 };
@@ -45,7 +42,6 @@ pub struct StatePlane {
     dependency_graph: DependencyGraph,
     pool_snapshots: PoolSnapshotStore,
     concentrated_quote_models: ConcentratedQuoteModelStore,
-    execution_state: ExecutionState,
     warmup: WarmupManager,
     latest_slot: u64,
     max_slot_lag: u64,
@@ -59,7 +55,6 @@ impl StatePlane {
             dependency_graph: DependencyGraph::default(),
             pool_snapshots: PoolSnapshotStore::default(),
             concentrated_quote_models: ConcentratedQuoteModelStore::default(),
-            execution_state: ExecutionState::default(),
             warmup: WarmupManager::default(),
             latest_slot: 0,
             max_slot_lag,
@@ -94,14 +89,6 @@ impl StatePlane {
     ) {
         self.dependency_graph
             .register_account_pool(account, pool_id, decoder_key);
-    }
-
-    pub fn execution_state(&self) -> ExecutionStateSnapshot {
-        self.execution_state.snapshot(self.latest_slot)
-    }
-
-    pub fn execution_state_mut(&mut self) -> &mut ExecutionState {
-        &mut self.execution_state
     }
 
     pub fn latest_slot(&self) -> u64 {
@@ -345,7 +332,7 @@ impl StatePlane {
     ) -> Result<Option<StateApplyOutcome>, StateError> {
         self.latest_slot = self.latest_slot.max(update.slot);
         let pool_id = crate::types::PoolId(update.pool_id.clone());
-        let to_directional = |direction: &detection::DirectionalPoolQuoteModelUpdate| {
+        let to_directional = |direction: &DirectionalPoolQuoteModelUpdate| {
             crate::quote_models::DirectionalConcentratedQuoteModel {
                 loaded_tick_arrays: direction.loaded_tick_arrays,
                 expected_tick_arrays: direction.expected_tick_arrays,
@@ -429,9 +416,9 @@ impl StatePlane {
 
 #[cfg(test)]
 mod tests {
-    use detection::events::SnapshotConfidence;
-    use detection::{
+    use domain::{
         AccountUpdate, EventSourceKind, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
+        SnapshotConfidence,
     };
 
     use super::StatePlane;
@@ -670,7 +657,7 @@ mod tests {
                 EventSourceKind::ShredStream,
                 3,
                 13,
-                detection::MarketEvent::SlotBoundary(detection::SlotBoundary {
+                domain::MarketEvent::SlotBoundary(domain::SlotBoundary {
                     slot: 13,
                     leader: None,
                 }),

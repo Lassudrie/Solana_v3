@@ -1,3 +1,4 @@
+use domain::RouteId;
 use strategy::opportunity::OpportunityCandidate;
 
 use crate::{
@@ -65,7 +66,7 @@ impl AtomicTwoLegTemplate {
 
     pub fn materialize_leg_memos(
         &self,
-        route_id: &state::types::RouteId,
+        route_id: &RouteId,
         quoted_slot: u64,
         expected_net_profit: i64,
         leg_plans: &[AtomicLegPlan; 2],
@@ -110,7 +111,7 @@ fn route_minimum_acceptable_output(candidate: &OpportunityCandidate) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use state::types::{PoolId, RouteId};
+    use domain::{PoolId, RouteId};
     use strategy::{opportunity::OpportunityCandidate, quote::LegQuote, route_registry::SwapSide};
 
     use crate::{

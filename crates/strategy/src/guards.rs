@@ -1,8 +1,6 @@
 use crate::{quote::RouteQuote, reasons::RejectionReason, route_registry::RouteDefinition};
-use state::{
-    StatePlane,
-    types::{ExecutionStateSnapshot, PoolSnapshot, RouteId, WarmupStatus},
-};
+use domain::{ExecutionSnapshot, PoolSnapshot, RouteId, WarmupStatus};
+use state::StatePlane;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardrailConfig {
@@ -97,7 +95,7 @@ impl GuardrailSet {
         &self,
         route: &RouteDefinition,
         quote: &RouteQuote,
-        execution_state: &ExecutionStateSnapshot,
+        execution_state: &ExecutionSnapshot,
         inflight_submissions: usize,
     ) -> Result<(), RejectionReason> {
         if execution_state.kill_switch_enabled {
@@ -145,13 +143,11 @@ impl GuardrailSet {
 
 #[cfg(test)]
 mod tests {
-    use detection::events::SnapshotConfidence;
-    use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate};
-    use state::StatePlane;
-    use state::types::{
-        ExecutionStateSnapshot, FreshnessState, LiquidityModel, PoolConfidence, PoolId,
-        PoolSnapshot, RouteId,
+    use domain::{
+        EventSourceKind, ExecutionStateSnapshot, FreshnessState, LiquidityModel, NormalizedEvent,
+        PoolConfidence, PoolId, PoolSnapshot, PoolSnapshotUpdate, RouteId, SnapshotConfidence,
     };
+    use state::StatePlane;
 
     use crate::{
         guards::{GuardrailConfig, GuardrailSet},

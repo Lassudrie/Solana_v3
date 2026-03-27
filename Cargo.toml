@@ -3,6 +3,7 @@ members = [
     "crates/bot",
     "crates/builder",
     "crates/detection",
+    "crates/domain",
     "crates/reconciliation",
     "crates/signerd",
     "crates/signing",

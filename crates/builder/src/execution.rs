@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
-use state::types::RouteId;
+use domain::RouteId;
 use strategy::route_registry::SwapSide;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

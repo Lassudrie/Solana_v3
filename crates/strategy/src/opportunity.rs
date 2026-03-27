@@ -1,6 +1,6 @@
 use crate::quote::LegQuote;
 use crate::reasons::RejectionReason;
-use state::types::RouteId;
+use domain::RouteId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpportunityCandidate {
