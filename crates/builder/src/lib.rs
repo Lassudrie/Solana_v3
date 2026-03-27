@@ -55,6 +55,7 @@ mod tests {
             trade_size: 10_000,
             active_execution_buffer_bps: None,
             expected_net_output: 10_250,
+            minimum_acceptable_output: 10_025,
             expected_gross_profit_quote_atoms: 250,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,

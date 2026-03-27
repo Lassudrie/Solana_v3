@@ -135,7 +135,7 @@ impl PipelineMetrics {
 
     pub fn record_shredstream_event(
         &self,
-        event_source_timestamp: SystemTime,
+        event_source_timestamp: Option<SystemTime>,
         source_received_at: SystemTime,
         previous_event: Option<SystemTime>,
         normalized_latency: Duration,
@@ -147,7 +147,9 @@ impl PipelineMetrics {
         self.shredstream_ingest_latency_count
             .fetch_add(1, Ordering::Relaxed);
 
-        if let Some(previous) = previous_event {
+        if let (Some(event_source_timestamp), Some(previous)) =
+            (event_source_timestamp, previous_event)
+        {
             let interarrival = event_source_timestamp
                 .duration_since(previous)
                 .unwrap_or_else(|_| Duration::ZERO);
@@ -156,35 +158,21 @@ impl PipelineMetrics {
                 .fetch_add(interarrival_ns, Ordering::Relaxed);
             self.shredstream_interarrival_latency_count
                 .fetch_add(1, Ordering::Relaxed);
-            let mut guard = self
-                .shredstream_rate_state
-                .lock()
-                .expect("shredstream rate lock");
-            let _ = source_received_at;
-            let now_second = current_observed_second(source_received_at);
-            if guard.last_observed_second == now_second {
-                guard.events_in_second += 1;
-            } else {
-                guard.last_observed_second = now_second;
-                guard.events_in_second = 1;
-            }
-            self.shredstream_events_per_second
-                .store(guard.events_in_second, Ordering::Relaxed);
-        } else {
-            let now_second = current_observed_second(source_received_at);
-            let mut guard = self
-                .shredstream_rate_state
-                .lock()
-                .expect("shredstream rate lock");
-            if guard.last_observed_second != now_second {
-                guard.last_observed_second = now_second;
-                guard.events_in_second = 1;
-            } else {
-                guard.events_in_second += 1;
-            }
-            self.shredstream_events_per_second
-                .store(guard.events_in_second, Ordering::Relaxed);
         }
+
+        let now_second = current_observed_second(source_received_at);
+        let mut guard = self
+            .shredstream_rate_state
+            .lock()
+            .expect("shredstream rate lock");
+        if guard.last_observed_second != now_second {
+            guard.last_observed_second = now_second;
+            guard.events_in_second = 1;
+        } else {
+            guard.events_in_second += 1;
+        }
+        self.shredstream_events_per_second
+            .store(guard.events_in_second, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> MetricsSnapshot {

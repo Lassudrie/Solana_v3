@@ -234,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn onchain_reconciler_keeps_bundle_pending_when_only_bundle_lands() {
+    fn onchain_reconciler_marks_bundle_landed_when_bundle_status_lands() {
         let base_endpoint = spawn_mock_rpc_server(|body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
             match payload["method"].as_str().expect("method") {
@@ -278,10 +278,13 @@ mod tests {
 
         let transitions = reconciler.tick(&mut tracker, 10);
 
-        assert!(transitions.is_empty());
+        assert_eq!(transitions.len(), 1);
         let updated = tracker.get(&record.submission_id).expect("record kept");
-        assert_eq!(updated.inclusion_status, InclusionStatus::Submitted);
-        assert_eq!(updated.outcome, ExecutionOutcome::Pending);
+        assert_eq!(
+            updated.inclusion_status,
+            InclusionStatus::Landed { slot: 44 }
+        );
+        assert_eq!(updated.outcome, ExecutionOutcome::Included { slot: 44 });
     }
 
     #[test]

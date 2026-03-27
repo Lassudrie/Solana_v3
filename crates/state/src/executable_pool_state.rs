@@ -71,7 +71,7 @@ mod tests {
             last_update_slot: slot,
             write_version,
             last_verified_slot: slot,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
         })
     }

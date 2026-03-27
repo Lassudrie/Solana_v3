@@ -261,6 +261,7 @@ pub struct RouteConfig {
     pub output_mint: String,
     pub base_mint: Option<String>,
     pub quote_mint: Option<String>,
+    pub sol_quote_conversion_pool_id: Option<String>,
     pub default_trade_size: u64,
     pub max_trade_size: u64,
     #[serde(default)]
@@ -526,16 +527,35 @@ impl Default for SigningConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct SubmitConfig {
     pub mode: SubmitModeConfig,
+    pub worker_count: usize,
+    pub queue_capacity: usize,
+    pub congestion_threshold_pct: u8,
 }
 
 impl Default for SubmitConfig {
     fn default() -> Self {
         Self {
             mode: SubmitModeConfig::SingleTransaction,
+            worker_count: default_submit_worker_count(),
+            queue_capacity: default_submit_queue_capacity(),
+            congestion_threshold_pct: default_submit_congestion_threshold_pct(),
         }
     }
+}
+
+fn default_submit_worker_count() -> usize {
+    4
+}
+
+fn default_submit_queue_capacity() -> usize {
+    256
+}
+
+fn default_submit_congestion_threshold_pct() -> u8 {
+    75
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -626,6 +646,8 @@ pub struct RuntimeConfig {
     pub control: RuntimeControlConfig,
     #[serde(default)]
     pub refresh: AsyncRefreshConfig,
+    #[serde(default)]
+    pub live_set_health: LiveSetHealthConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -637,6 +659,35 @@ impl Default for RuntimeConfig {
             monitor_server: MonitorServerConfig::default(),
             control: RuntimeControlConfig::default(),
             refresh: AsyncRefreshConfig::default(),
+            live_set_health: LiveSetHealthConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LiveSetHealthConfig {
+    pub enabled: bool,
+    pub pool_quarantine_after_repair_failures: u32,
+    pub pool_quarantine_slots: u64,
+    pub pool_disable_after_quarantine_count: u32,
+    pub pool_disable_window_slots: u64,
+    pub route_shadow_after_chain_failures: u32,
+    pub route_failure_window_slots: u64,
+    pub route_reentry_cooldown_slots: u64,
+}
+
+impl Default for LiveSetHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pool_quarantine_after_repair_failures: 3,
+            pool_quarantine_slots: 512,
+            pool_disable_after_quarantine_count: 3,
+            pool_disable_window_slots: 4_096,
+            route_shadow_after_chain_failures: 2,
+            route_failure_window_slots: 1_024,
+            route_reentry_cooldown_slots: 1_024,
         }
     }
 }

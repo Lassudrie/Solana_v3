@@ -10,6 +10,7 @@ use state::{
     decoder::{OrcaWhirlpoolAccountDecoder, PoolPriceAccountDecoder, RaydiumClmmPoolDecoder},
     types::{AccountKey, PoolId, RouteId},
 };
+use std::collections::{HashMap, HashSet};
 use strategy::{
     StrategyPlane,
     guards::GuardrailConfig,
@@ -23,6 +24,7 @@ use crate::{
         BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteLegExecutionConfig,
         RuntimeProfileConfig, SigningConfig, SigningProviderKind, SubmitModeConfig, SwapSideConfig,
     },
+    route_health::SharedRouteHealth,
     runtime::{
         AltCacheService, BlockhashService, BotRuntime, ColdPathServices, HotPathPipeline,
         WalletRefreshService, WarmupCoordinator,
@@ -31,11 +33,14 @@ use crate::{
 
 const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
 #[derive(Debug, Error)]
 pub enum BootstrapError {
     #[error(transparent)]
     Signing(#[from] SigningError),
+    #[error("invalid runtime config: {detail}")]
+    InvalidConfig { detail: String },
     #[error("invalid route config for {route_id}: {detail}")]
     InvalidRouteConfig { route_id: String, detail: String },
 }
@@ -47,6 +52,25 @@ struct ResolvedSigner {
 }
 
 pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
+    let route_health = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::route_health::RouteHealthRegistry::new(config.runtime.live_set_health.clone()),
+    ));
+    bootstrap_with_health(config, route_health)
+}
+
+pub fn bootstrap_with_health(
+    config: BotConfig,
+    route_health: SharedRouteHealth,
+) -> Result<BotRuntime, BootstrapError> {
+    if config.strategy.max_snapshot_slot_lag != config.state.max_snapshot_slot_lag {
+        return Err(BootstrapError::InvalidConfig {
+            detail: format!(
+                "state.max_snapshot_slot_lag ({}) must match strategy.max_snapshot_slot_lag ({})",
+                config.state.max_snapshot_slot_lag, config.strategy.max_snapshot_slot_lag
+            ),
+        });
+    }
+
     let mut state = StatePlane::new(config.state.max_snapshot_slot_lag);
     state
         .decoder_registry_mut()
@@ -60,27 +84,42 @@ pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
 
     let mut strategy = StrategyPlane::new(GuardrailConfig {
         min_profit_quote_atoms: config.strategy.min_profit_quote_atoms,
-        max_snapshot_slot_lag: config.strategy.max_snapshot_slot_lag,
         require_route_warm: config.strategy.require_route_warm,
         max_inflight_submissions: config.strategy.max_inflight_submissions,
         min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
         max_blockhash_slot_lag: config.strategy.max_blockhash_slot_lag,
     });
 
-    let mut execution_registry = ExecutionRegistry::default();
-    for route in &config.routes.definitions {
-        if !route_enabled_in_profile(route, config.runtime.profile) {
-            continue;
-        }
+    let active_routes = config
+        .routes
+        .definitions
+        .iter()
+        .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
+        .collect::<Vec<_>>();
+    for route in &active_routes {
         validate_runtime_route_config(route)?;
-        let min_trade_size = resolve_min_trade_size(route)?;
+    }
+    let tracked_pool_pairs = build_tracked_pool_pairs(&active_routes);
 
+    let mut execution_registry = ExecutionRegistry::default();
+    for route in active_routes {
+        let min_trade_size = resolve_min_trade_size(route)?;
+        let sol_quote_conversion_pool_id =
+            resolve_sol_quote_conversion_pool_id(route, &tracked_pool_pairs)?;
         let route_id = RouteId(route.route_id.clone());
-        let pool_ids = route
+        let mut pool_ids = route
             .legs
             .iter()
             .map(|leg| PoolId(leg.pool_id.clone()))
             .collect::<Vec<_>>();
+        if let Some(pool_id) = &sol_quote_conversion_pool_id {
+            pool_ids.push(pool_id.clone());
+        }
+        let mut seen_pool_ids = HashSet::with_capacity(pool_ids.len());
+        pool_ids.retain(|pool_id| seen_pool_ids.insert(pool_id.clone()));
+        if let Ok(mut health) = route_health.lock() {
+            health.register_route(route_id.clone(), &pool_ids);
+        }
         state.register_route(route_id.clone(), pool_ids);
         for dependency in &route.account_dependencies {
             state.register_account_dependency(
@@ -95,6 +134,7 @@ pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
             output_mint: route.output_mint.clone(),
             base_mint: route.base_mint.clone(),
             quote_mint: route.quote_mint.clone(),
+            sol_quote_conversion_pool_id,
             legs: [
                 RouteLeg {
                     venue: route.legs[0].venue.clone(),
@@ -204,6 +244,7 @@ pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
         config.builder.compute_unit_limit,
         config.builder.compute_unit_price_micro_lamports,
         config.builder.jito_tip_lamports,
+        route_health,
     );
     runtime.set_reconciler(OnChainReconciler::new(OnChainReconciliationConfig {
         enabled: config.reconciliation.enabled,
@@ -252,32 +293,51 @@ fn validate_runtime_route_config(route: &crate::config::RouteConfig) -> Result<(
 
     let mut invalid_paths = Vec::new();
     collect_invalid_route_string_paths("", &value, &mut invalid_paths);
-    if invalid_paths.is_empty() {
-        return Ok(());
+    if !invalid_paths.is_empty() {
+        invalid_paths.sort();
+        invalid_paths.dedup();
+
+        let total = invalid_paths.len();
+        let preview = invalid_paths
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if total > 4 {
+            format!(" (+{} more)", total - 4)
+        } else {
+            String::new()
+        };
+
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "enabled route contains placeholder or empty string fields: {preview}{suffix}"
+            ),
+        });
     }
 
-    invalid_paths.sort();
-    invalid_paths.dedup();
+    validate_route_leg_requirements(route)
+}
 
-    let total = invalid_paths.len();
-    let preview = invalid_paths
-        .iter()
-        .take(4)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = if total > 4 {
-        format!(" (+{} more)", total - 4)
-    } else {
-        String::new()
-    };
+fn validate_route_leg_requirements(
+    route: &crate::config::RouteConfig,
+) -> Result<(), BootstrapError> {
+    for (index, leg) in route.legs.iter().enumerate() {
+        if matches!(&leg.execution, RouteLegExecutionConfig::RaydiumClmm(_))
+            && leg.fee_bps.is_none()
+        {
+            return Err(BootstrapError::InvalidRouteConfig {
+                route_id: route.route_id.clone(),
+                detail: format!(
+                    "legs[{index}].fee_bps is required for raydium_clmm legs because PoolState does not expose the trade fee and the decoder otherwise falls back to zero"
+                ),
+            });
+        }
+    }
 
-    Err(BootstrapError::InvalidRouteConfig {
-        route_id: route.route_id.clone(),
-        detail: format!(
-            "enabled route contains placeholder or empty string fields: {preview}{suffix}"
-        ),
-    })
+    Ok(())
 }
 
 fn collect_invalid_route_string_paths(
@@ -318,6 +378,94 @@ fn collect_invalid_route_string_paths(
 fn route_string_is_invalid(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.is_empty() || trimmed.to_ascii_uppercase().contains("REPLACE_")
+}
+
+fn route_requires_explicit_sol_quote_conversion(route: &crate::config::RouteConfig) -> bool {
+    let Some(quote_mint) = route.quote_mint.as_deref() else {
+        return false;
+    };
+    route.base_mint.is_some()
+        && route.input_mint == route.output_mint
+        && route.input_mint == quote_mint
+        && quote_mint != SOL_MINT
+}
+
+fn build_tracked_pool_pairs(
+    routes: &[&crate::config::RouteConfig],
+) -> HashMap<String, (String, String)> {
+    let mut pairs = HashMap::new();
+    for route in routes {
+        for leg in &route.legs {
+            pairs
+                .entry(leg.pool_id.clone())
+                .or_insert_with(|| tracked_pool_pair(route, leg));
+        }
+    }
+    pairs
+}
+
+fn tracked_pool_pair(
+    route: &crate::config::RouteConfig,
+    leg: &crate::config::RouteLegConfig,
+) -> (String, String) {
+    match &leg.execution {
+        RouteLegExecutionConfig::OrcaSimplePool(_)
+        | RouteLegExecutionConfig::RaydiumSimplePool(_) => (
+            route
+                .base_mint
+                .clone()
+                .unwrap_or_else(|| route.input_mint.clone()),
+            route
+                .quote_mint
+                .clone()
+                .unwrap_or_else(|| route.output_mint.clone()),
+        ),
+        RouteLegExecutionConfig::OrcaWhirlpool(config) => {
+            (config.token_mint_a.clone(), config.token_mint_b.clone())
+        }
+        RouteLegExecutionConfig::RaydiumClmm(config) => {
+            (config.token_mint_0.clone(), config.token_mint_1.clone())
+        }
+    }
+}
+
+fn resolve_sol_quote_conversion_pool_id(
+    route: &crate::config::RouteConfig,
+    tracked_pool_pairs: &HashMap<String, (String, String)>,
+) -> Result<Option<PoolId>, BootstrapError> {
+    if !route_requires_explicit_sol_quote_conversion(route) {
+        return Ok(None);
+    }
+
+    let Some(quote_mint) = route.quote_mint.as_deref() else {
+        return Ok(None);
+    };
+    let Some(pool_id) = route.sol_quote_conversion_pool_id.as_deref() else {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: "sol_quote_conversion_pool_id is required when quote_mint != SOL".into(),
+        });
+    };
+    let Some((token_mint_a, token_mint_b)) = tracked_pool_pairs.get(pool_id) else {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "sol_quote_conversion_pool_id must reference a pool_id from an enabled route leg: {pool_id}"
+            ),
+        });
+    };
+    let pair_matches = (token_mint_a == SOL_MINT && token_mint_b == quote_mint)
+        || (token_mint_a == quote_mint && token_mint_b == SOL_MINT);
+    if !pair_matches {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "sol_quote_conversion_pool_id must reference a tracked SOL/{quote_mint} pool: {pool_id}"
+            ),
+        });
+    }
+
+    Ok(Some(PoolId(pool_id.into())))
 }
 
 fn resolve_min_trade_size(route: &crate::config::RouteConfig) -> Result<u64, BootstrapError> {
@@ -567,8 +715,9 @@ mod tests {
     };
     use crate::config::{
         BotConfig, MessageModeConfig, OrcaSimplePoolLegExecutionConfig,
-        RaydiumSimplePoolLegExecutionConfig, RouteClassConfig, RouteConfig, RouteExecutionConfig,
-        RouteLegConfig, RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
+        RaydiumClmmLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteClassConfig,
+        RouteConfig, RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
+        SwapSideConfig,
     };
 
     fn test_pubkey(label: &str) -> String {
@@ -601,6 +750,7 @@ mod tests {
             output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             base_mint: Some("So11111111111111111111111111111111111111112".into()),
             quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+            sol_quote_conversion_pool_id: Some("pool-a".into()),
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             min_trade_size: None,
@@ -795,6 +945,7 @@ mod tests {
             trade_size: route.default_trade_size,
             active_execution_buffer_bps: None,
             expected_net_output: second_output,
+            minimum_acceptable_output: route.default_trade_size.saturating_add(1),
             expected_gross_profit_quote_atoms: 1,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
@@ -855,6 +1006,86 @@ mod tests {
         route.legs[0].pool_id = "REPLACE_WITH_ORCA_SIMPLE_POOL".into();
 
         bootstrap(test_config(route)).expect("disabled placeholder route should be skipped");
+    }
+
+    #[test]
+    fn bootstrap_rejects_mismatched_snapshot_slot_lag_config() {
+        let mut config = test_config(valid_route_config());
+        config.state.max_snapshot_slot_lag = 2;
+        config.strategy.max_snapshot_slot_lag = 3;
+
+        assert!(matches!(
+            bootstrap(config),
+            Err(BootstrapError::InvalidConfig { detail })
+                if detail.contains("state.max_snapshot_slot_lag")
+        ));
+    }
+
+    #[test]
+    fn bootstrap_rejects_route_missing_sol_quote_conversion_pool() {
+        let mut route = valid_route_config();
+        route.sol_quote_conversion_pool_id = None;
+
+        let error = match bootstrap(test_config(route)) {
+            Ok(_) => panic!("route should require SOL/quote pool"),
+            Err(error) => error,
+        };
+        let BootstrapError::InvalidRouteConfig { route_id, detail } = error else {
+            panic!("expected invalid route config error");
+        };
+        assert_eq!(route_id, "route-a");
+        assert!(detail.contains("sol_quote_conversion_pool_id is required"));
+    }
+
+    #[test]
+    fn bootstrap_rejects_raydium_clmm_leg_without_explicit_fee_bps() {
+        let mut route = valid_route_config();
+        route.legs[1].execution =
+            RouteLegExecutionConfig::RaydiumClmm(RaydiumClmmLegExecutionConfig {
+                program_id: test_pubkey("raydium-clmm-program"),
+                token_program_id: test_pubkey("spl-token-program"),
+                token_program_2022_id: test_pubkey("spl-token-2022-program"),
+                memo_program_id: test_pubkey("memo-program"),
+                pool_state: test_pubkey("raydium-clmm-pool-state"),
+                amm_config: test_pubkey("raydium-clmm-amm-config"),
+                observation_state: test_pubkey("raydium-clmm-observation-state"),
+                ex_bitmap_account: Some(test_pubkey("raydium-clmm-ex-bitmap")),
+                token_mint_0: test_pubkey("raydium-clmm-token-mint-0"),
+                token_vault_0: test_pubkey("raydium-clmm-token-vault-0"),
+                token_mint_1: test_pubkey("raydium-clmm-token-mint-1"),
+                token_vault_1: test_pubkey("raydium-clmm-token-vault-1"),
+                tick_spacing: 8,
+                zero_for_one: true,
+            });
+        route.legs[1].fee_bps = None;
+
+        let error = match bootstrap(test_config(route)) {
+            Ok(_) => panic!("raydium clmm leg without fee should fail"),
+            Err(error) => error,
+        };
+        let BootstrapError::InvalidRouteConfig { route_id, detail } = error else {
+            panic!("expected invalid route config error");
+        };
+        assert_eq!(route_id, "route-a");
+        assert!(detail.contains("legs[1].fee_bps"));
+        assert!(detail.contains("raydium_clmm"));
+    }
+
+    #[test]
+    fn bootstrap_rejects_route_with_non_sol_quote_conversion_pool() {
+        let mut route = valid_route_config();
+        route.base_mint = Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".into());
+        route.sol_quote_conversion_pool_id = Some("pool-a".into());
+
+        let error = match bootstrap(test_config(route)) {
+            Ok(_) => panic!("non SOL/quote pool should be rejected"),
+            Err(error) => error,
+        };
+        let BootstrapError::InvalidRouteConfig { route_id, detail } = error else {
+            panic!("expected invalid route config error");
+        };
+        assert_eq!(route_id, "route-a");
+        assert!(detail.contains("tracked SOL/"));
     }
 
     #[test]

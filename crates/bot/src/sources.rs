@@ -6,6 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use detection::events::SnapshotConfidence;
 use detection::{
     AccountUpdate, EventSourceKind, Heartbeat, IngestError, LatencyMetadata, MarketEvent,
     MarketEventSource, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate, SlotBoundary,
@@ -18,6 +19,7 @@ use crate::{
     config::{BotConfig, EventSourceMode},
     live::GrpcEntriesEventSource,
     observer::ObserverHandle,
+    route_health::SharedRouteHealth,
 };
 
 #[derive(Debug, Error)]
@@ -47,6 +49,7 @@ pub enum EventSourceConfigError {
 pub fn build_event_source(
     config: &BotConfig,
     observer: ObserverHandle,
+    route_health: SharedRouteHealth,
 ) -> Result<Box<dyn MarketEventSource>, EventSourceConfigError> {
     match config.runtime.event_source.mode {
         EventSourceMode::Disabled => Err(EventSourceConfigError::Disabled),
@@ -59,9 +62,11 @@ pub fn build_event_source(
                 .ok_or(EventSourceConfigError::MissingPath)?;
             Ok(Box::new(JsonlFileEventSource::open(path)?))
         }
-        EventSourceMode::Shredstream => GrpcEntriesEventSource::spawn(config, observer)
-            .map(|source| Box::new(source) as Box<dyn MarketEventSource>)
-            .map_err(|detail| EventSourceConfigError::LiveShredstream { detail }),
+        EventSourceMode::Shredstream => {
+            GrpcEntriesEventSource::spawn(config, observer, route_health)
+                .map(|source| Box::new(source) as Box<dyn MarketEventSource>)
+                .map_err(|detail| EventSourceConfigError::LiveShredstream { detail })
+        }
         EventSourceMode::UdpJson => {
             let bind_address = config
                 .runtime
@@ -256,6 +261,8 @@ enum WireEvent {
         reserve_b: Option<u64>,
         active_liquidity: Option<u64>,
         sqrt_price_x64: Option<u128>,
+        confidence: Option<SnapshotConfidence>,
+        #[serde(default)]
         exact: Option<bool>,
         repair_pending: Option<bool>,
         token_mint_a: String,
@@ -350,6 +357,7 @@ fn parse_wire_event(
             reserve_b,
             active_liquidity,
             sqrt_price_x64,
+            confidence,
             exact,
             repair_pending,
             token_mint_a,
@@ -372,7 +380,19 @@ fn parse_wire_event(
                 reserve_b,
                 active_liquidity,
                 sqrt_price_x64,
-                exact,
+                confidence: confidence
+                    .or_else(|| {
+                        exact.map(|value| {
+                            if value {
+                                SnapshotConfidence::Executable
+                            } else {
+                                SnapshotConfidence::Decoded
+                            }
+                        })
+                    })
+                    .ok_or_else(|| {
+                        "pool_snapshot_update requires confidence or legacy exact".to_string()
+                    })?,
                 repair_pending,
                 token_mint_a,
                 token_mint_b,
@@ -451,7 +471,7 @@ fn normalized_event(
         latency: LatencyMetadata {
             source_received_at: now,
             normalized_at: now,
-            source_latency: Duration::ZERO,
+            source_latency: None,
         },
     }
 }
@@ -509,7 +529,7 @@ mod tests {
         let path = temp_file_path("bot-jsonl-live-source");
         fs::write(
             &path,
-            "{\"type\":\"pool_snapshot_update\",\"source\":\"shredstream\",\"sequence\":9,\"observed_slot\":33,\"pool_id\":\"pool-a\",\"price_bps\":10001,\"fee_bps\":4,\"reserve_depth\":5000,\"token_mint_a\":\"a\",\"token_mint_b\":\"b\",\"tick_spacing\":4,\"current_tick_index\":12,\"slot\":33,\"write_version\":2}\n",
+            "{\"type\":\"pool_snapshot_update\",\"source\":\"shredstream\",\"sequence\":9,\"observed_slot\":33,\"pool_id\":\"pool-a\",\"price_bps\":10001,\"fee_bps\":4,\"reserve_depth\":5000,\"confidence\":\"decoded\",\"token_mint_a\":\"a\",\"token_mint_b\":\"b\",\"tick_spacing\":4,\"current_tick_index\":12,\"slot\":33,\"write_version\":2}\n",
         )
         .unwrap();
 

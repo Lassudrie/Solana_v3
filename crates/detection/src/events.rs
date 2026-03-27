@@ -1,4 +1,6 @@
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSourceKind {
@@ -18,7 +20,14 @@ pub struct SourceMetadata {
 pub struct LatencyMetadata {
     pub source_received_at: SystemTime,
     pub normalized_at: SystemTime,
-    pub source_latency: Duration,
+    pub source_latency: Option<std::time::Duration>,
+}
+
+impl LatencyMetadata {
+    pub fn source_event_at(&self) -> Option<SystemTime> {
+        self.source_latency
+            .and_then(|latency| self.source_received_at.checked_sub(latency))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +40,14 @@ pub struct AccountUpdate {
     pub write_version: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotConfidence {
+    Decoded,
+    Verified,
+    Executable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolSnapshotUpdate {
     pub pool_id: String,
@@ -41,7 +58,7 @@ pub struct PoolSnapshotUpdate {
     pub reserve_b: Option<u64>,
     pub active_liquidity: Option<u64>,
     pub sqrt_price_x64: Option<u128>,
-    pub exact: Option<bool>,
+    pub confidence: SnapshotConfidence,
     pub repair_pending: Option<bool>,
     pub token_mint_a: String,
     pub token_mint_b: String,
@@ -144,7 +161,7 @@ impl NormalizedEvent {
             latency: LatencyMetadata {
                 source_received_at: now,
                 normalized_at: now,
-                source_latency: Duration::ZERO,
+                source_latency: None,
             },
         }
     }

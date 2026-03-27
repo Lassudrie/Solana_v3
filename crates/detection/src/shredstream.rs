@@ -466,7 +466,7 @@ fn normalized_event(
         latency: LatencyMetadata {
             source_received_at: now,
             normalized_at: now,
-            source_latency: Duration::ZERO,
+            source_latency: None,
         },
     }
 }
@@ -574,7 +574,7 @@ mod tests {
             latency: LatencyMetadata {
                 source_received_at: SystemTime::now(),
                 normalized_at: SystemTime::now(),
-                source_latency: Duration::ZERO,
+                source_latency: None,
             },
         });
         assert!(source.poll_next().unwrap().is_some());
@@ -625,7 +625,7 @@ mod tests {
             "shredstream udp normalized latency {:?}",
             normalized_latency
         );
-        assert_eq!(event.latency.source_latency, Duration::ZERO);
+        assert_eq!(event.latency.source_latency, None);
     }
 
     #[test]

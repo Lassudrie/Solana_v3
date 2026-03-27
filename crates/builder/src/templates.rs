@@ -26,7 +26,8 @@ impl AtomicTwoLegTemplate {
     ) -> [AtomicLegPlan; 2] {
         let first = &candidate.leg_quotes[0];
         let second = &candidate.leg_quotes[1];
-        let second_leg_min_output = route_break_even_output(candidate).min(second.output_amount);
+        let second_leg_min_output =
+            route_minimum_acceptable_output(candidate).min(second.output_amount);
         let first_leg_amount_mode = if route_execution.legs[0].supports_exact_out_leg1(first.side) {
             SwapAmountMode::ExactOut
         } else {
@@ -103,10 +104,8 @@ fn leg_mode_label(mode: &SwapAmountMode) -> &'static str {
     }
 }
 
-fn route_break_even_output(candidate: &OpportunityCandidate) -> u64 {
-    candidate
-        .trade_size
-        .saturating_add(candidate.estimated_execution_cost_quote_atoms)
+fn route_minimum_acceptable_output(candidate: &OpportunityCandidate) -> u64 {
+    candidate.minimum_acceptable_output
 }
 
 #[cfg(test)]
@@ -131,6 +130,7 @@ mod tests {
             trade_size: 10_000,
             active_execution_buffer_bps: None,
             expected_net_output: 10_250,
+            minimum_acceptable_output: 10_175,
             expected_gross_profit_quote_atoms: 350,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 100,
@@ -226,7 +226,7 @@ mod tests {
         assert_eq!(first.other_amount_threshold, 10_000);
         assert_eq!(second.amount_mode, SwapAmountMode::ExactIn);
         assert_eq!(second.specified_amount, 10_120);
-        assert_eq!(second.other_amount_threshold, 10_100);
+        assert_eq!(second.other_amount_threshold, 10_175);
     }
 
     #[test]
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn materialized_leg_plans_never_exceed_quoted_outputs() {
         let mut candidate = candidate();
-        candidate.estimated_execution_cost_quote_atoms = 10_000;
+        candidate.minimum_acceptable_output = 20_000;
 
         let template = AtomicTwoLegTemplate::default();
         let [first, second] = template.materialize_leg_plans(&candidate, &route_execution(true));

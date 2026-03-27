@@ -30,6 +30,7 @@ pub enum SubmitRejectionReason {
     RateLimited,
     DuplicateSubmission,
     TipTooLow,
+    PathCongested,
     ChannelUnavailable,
     RemoteRejected,
 }

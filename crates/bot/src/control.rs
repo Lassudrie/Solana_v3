@@ -31,7 +31,8 @@ pub enum RuntimeIssue {
         total_routes: usize,
     },
     NoTradableRoutes {
-        warm_routes: usize,
+        tradable_routes: usize,
+        eligible_live_routes: usize,
         total_routes: usize,
     },
     WalletNotReady,
@@ -43,6 +44,14 @@ pub enum RuntimeIssue {
     BlockhashTooStale {
         slot_lag: u64,
         maximum: u64,
+    },
+    SubmitPathCongested {
+        pending: usize,
+        capacity: usize,
+        workers: usize,
+    },
+    AsyncRefreshFailed {
+        worker: String,
     },
     EventSourceExhausted,
     EventSourceFailure {
@@ -120,6 +129,10 @@ pub struct RuntimeStatus {
     pub total_routes: usize,
     pub warm_routes: usize,
     pub tradable_routes: usize,
+    pub eligible_live_routes: usize,
+    pub shadow_routes: usize,
+    pub quarantined_pools: usize,
+    pub disabled_pools: usize,
     pub inflight_submissions: usize,
     pub wallet_ready: bool,
     pub wallet_balance_lamports: u64,
@@ -143,6 +156,10 @@ impl Default for RuntimeStatus {
             total_routes: 0,
             warm_routes: 0,
             tradable_routes: 0,
+            eligible_live_routes: 0,
+            shadow_routes: 0,
+            quarantined_pools: 0,
+            disabled_pools: 0,
             inflight_submissions: 0,
             wallet_ready: false,
             wallet_balance_lamports: 0,
@@ -202,6 +219,26 @@ impl RuntimeStatus {
         output.push_str(&format!(
             "bot_runtime_routes_tradable {}\n",
             self.tradable_routes
+        ));
+        output.push_str("# TYPE bot_runtime_routes_eligible gauge\n");
+        output.push_str(&format!(
+            "bot_runtime_routes_eligible {}\n",
+            self.eligible_live_routes
+        ));
+        output.push_str("# TYPE bot_runtime_routes_shadow gauge\n");
+        output.push_str(&format!(
+            "bot_runtime_routes_shadow {}\n",
+            self.shadow_routes
+        ));
+        output.push_str("# TYPE bot_runtime_pools_quarantined gauge\n");
+        output.push_str(&format!(
+            "bot_runtime_pools_quarantined {}\n",
+            self.quarantined_pools
+        ));
+        output.push_str("# TYPE bot_runtime_pools_disabled gauge\n");
+        output.push_str(&format!(
+            "bot_runtime_pools_disabled {}\n",
+            self.disabled_pools
         ));
         output.push_str("# TYPE bot_runtime_inflight_submissions gauge\n");
         output.push_str(&format!(
@@ -471,6 +508,10 @@ mod tests {
             total_routes: 1,
             warm_routes: 1,
             tradable_routes: 1,
+            eligible_live_routes: 1,
+            shadow_routes: 0,
+            quarantined_pools: 0,
+            disabled_pools: 0,
             inflight_submissions: 0,
             wallet_ready: true,
             wallet_balance_lamports: 5,

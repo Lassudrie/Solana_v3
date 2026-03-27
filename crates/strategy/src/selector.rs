@@ -109,8 +109,23 @@ where
                 pool_id: route.legs[1].pool_id.clone(),
             }
         })?;
+        let sol_quote_conversion_snapshot = route
+            .sol_quote_conversion_pool_id
+            .as_ref()
+            .map(|pool_id| {
+                state
+                    .pool_snapshot(pool_id)
+                    .ok_or_else(|| RejectionReason::MissingSnapshot {
+                        pool_id: pool_id.clone(),
+                    })
+            })
+            .transpose()?;
 
-        self.guards.evaluate_snapshots([first, second])?;
+        let mut snapshots = vec![first, second];
+        if let Some(snapshot) = sol_quote_conversion_snapshot {
+            snapshots.push(snapshot);
+        }
+        self.guards.evaluate_snapshots(&snapshots)?;
 
         let mut best_candidate: Option<OpportunityCandidate> = None;
         let mut last_rejection = None;
@@ -131,7 +146,7 @@ where
             let quote = quote
                 .with_estimated_execution_cost(
                     route,
-                    [first, second],
+                    sol_quote_conversion_snapshot,
                     route.estimated_execution_cost_lamports,
                 )
                 .map_err(|error| RejectionReason::ExecutionCostNotConvertible {
@@ -157,6 +172,10 @@ where
                             .as_ref()
                             .map(|_| active_execution_buffer_bps.unwrap_or(0)),
                         expected_net_output: quote.net_output_amount,
+                        minimum_acceptable_output: self.guards.minimum_acceptable_output(
+                            quote.input_amount,
+                            quote.estimated_execution_cost_quote_atoms,
+                        ),
                         expected_gross_profit_quote_atoms: quote.expected_gross_profit_quote_atoms,
                         estimated_execution_cost_lamports: quote.estimated_execution_cost_lamports,
                         estimated_execution_cost_quote_atoms: quote
@@ -304,6 +323,7 @@ mod tests {
         quote::{LegQuote, QuoteEngine, QuoteError, QuoteExecutionAdjustments, RouteQuote},
         route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
     };
+    use detection::events::SnapshotConfidence;
     use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate};
     use state::{
         StatePlane,
@@ -385,6 +405,7 @@ mod tests {
             output_mint: "USDC".into(),
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
+            sol_quote_conversion_pool_id: Some(PoolId("pool-a".into())),
             legs: [
                 RouteLeg {
                     venue: "venue-a".into(),
@@ -473,7 +494,7 @@ mod tests {
                         reserve_b: Some(10_000_000),
                         active_liquidity: Some(10_000_000),
                         sqrt_price_x64: None,
-                        exact: Some(true),
+                        confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "SOL".into(),
                         token_mint_b: "USDC".into(),
@@ -545,7 +566,7 @@ mod tests {
                         reserve_b: Some(10_000_000),
                         active_liquidity: Some(10_000_000),
                         sqrt_price_x64: None,
-                        exact: Some(true),
+                        confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "SOL".into(),
                         token_mint_b: "USDC".into(),

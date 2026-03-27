@@ -1,27 +1,30 @@
 use std::{
     error::Error,
+    fs,
     io::{self, Stdout},
+    path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
 use bot::observer::{
     MonitorOverview, MonitorSignalsResponse, MonitorSnapshot, MonitorTradeEvent,
-    MonitorTradesResponse, PoolsResponse, RejectionEvent, RejectionsResponse,
+    MonitorTradesResponse, PoolsResponse, RejectionEvent, RejectionsResponse, RouteMonitorView,
+    RoutesResponse,
 };
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
-    Frame, Terminal,
 };
 use reqwest::blocking::Client;
 use serde::de::DeserializeOwned;
@@ -74,6 +77,16 @@ enum Command {
         #[arg(long)]
         watch: bool,
     },
+    Routes {
+        #[arg(long, default_value = "all")]
+        status: String,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        watch: bool,
+    },
     Export {
         #[command(subcommand)]
         command: ExportCommand,
@@ -85,6 +98,12 @@ enum ExportCommand {
     Snapshot {
         #[arg(long, default_value = "json")]
         format: String,
+    },
+    LiveManifest {
+        #[arg(long)]
+        source_config: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -135,6 +154,20 @@ impl ApiClient {
 
     fn snapshot(&self) -> Result<MonitorSnapshot, Box<dyn Error>> {
         self.get_json("/monitor/snapshot")
+    }
+
+    fn routes(
+        &self,
+        status: &str,
+        filter: Option<&str>,
+        limit: usize,
+    ) -> Result<RoutesResponse, Box<dyn Error>> {
+        let mut path = format!("/monitor/routes?status={status}&limit={limit}");
+        if let Some(filter) = filter {
+            path.push_str("&filter=");
+            path.push_str(filter);
+        }
+        self.get_json(&path)
     }
 
     fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Box<dyn Error>> {
@@ -387,8 +420,20 @@ fn run() -> Result<(), Box<dyn Error>> {
             limit,
             watch,
         } => watch_or_once(watch, || print_trades(&api, &status, limit)),
+        Command::Routes {
+            status,
+            filter,
+            limit,
+            watch,
+        } => watch_or_once(watch, || {
+            print_routes(&api, &status, filter.as_deref(), limit)
+        }),
         Command::Export { command } => match command {
             ExportCommand::Snapshot { format } => export_snapshot(&api, &format),
+            ExportCommand::LiveManifest {
+                source_config,
+                output,
+            } => export_live_manifest(&api, &source_config, &output),
         },
     }
 }
@@ -413,6 +458,10 @@ fn print_status(api: &ApiClient) -> Result<(), Box<dyn Error>> {
     println!("ready: {}", overview.ready);
     println!("live: {}", overview.live);
     println!("issue: {}", overview.issue.unwrap_or_else(|| "none".into()));
+    println!(
+        "last_error: {}",
+        overview.last_error.unwrap_or_else(|| "none".into())
+    );
     println!("slot: {}", overview.latest_slot);
     println!(
         "rpc_slot: {}",
@@ -436,8 +485,15 @@ fn print_status(api: &ApiClient) -> Result<(), Box<dyn Error>> {
             .unwrap_or_else(|| "none".into())
     );
     println!(
-        "routes: warm={}/{} tradable={}",
-        overview.warm_routes, overview.total_routes, overview.tradable_routes
+        "routes: tradable={}/{} warm={}",
+        overview.tradable_routes, overview.total_routes, overview.warm_routes
+    );
+    println!(
+        "live_set: eligible={} shadow={} quarantined_pools={} disabled_pools={}",
+        overview.eligible_live_routes,
+        overview.shadow_routes,
+        overview.quarantined_pools,
+        overview.disabled_pools
     );
     println!("inflight: {}", overview.inflight_submissions);
     println!("wallet_ready: {}", overview.wallet_ready);
@@ -566,6 +622,40 @@ fn print_trades(api: &ApiClient, status: &str, limit: usize) -> Result<(), Box<d
     Ok(())
 }
 
+fn print_routes(
+    api: &ApiClient,
+    status: &str,
+    filter: Option<&str>,
+    limit: usize,
+) -> Result<(), Box<dyn Error>> {
+    let response = api.routes(status, filter, limit)?;
+    print_table(
+        [
+            "route",
+            "state",
+            "eligible",
+            "block_pool",
+            "reason",
+            "failures",
+            "last_success",
+        ],
+        response.items.into_iter().map(|item| {
+            [
+                item.route_id,
+                route_health_label(item.health_state).into(),
+                item.eligible_live.to_string(),
+                item.blocking_pool_id.unwrap_or_else(|| "-".into()),
+                item.blocking_reason.unwrap_or_else(|| "-".into()),
+                item.recent_chain_failure_count.to_string(),
+                item.last_success_slot
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ]
+        }),
+    );
+    Ok(())
+}
+
 fn export_snapshot(api: &ApiClient, format: &str) -> Result<(), Box<dyn Error>> {
     let snapshot = api.snapshot()?;
     match format {
@@ -573,6 +663,101 @@ fn export_snapshot(api: &ApiClient, format: &str) -> Result<(), Box<dyn Error>> 
         other => return Err(format!("unsupported format: {other}").into()),
     }
     Ok(())
+}
+
+fn export_live_manifest(
+    api: &ApiClient,
+    source_config: &Path,
+    output: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let routes = api.routes("all", None, 10_000)?;
+    let eligible = routes
+        .items
+        .iter()
+        .filter(|item| item.eligible_live)
+        .map(|item| item.route_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let excluded = routes
+        .items
+        .iter()
+        .filter(|item| !item.eligible_live)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let source_text = fs::read_to_string(source_config)?;
+    let extension = source_config
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("toml");
+    let rendered = match extension {
+        "json" => render_filtered_json(&source_text, &eligible)?,
+        _ => render_filtered_toml(&source_text, &eligible)?,
+    };
+    fs::write(output, rendered)?;
+
+    let report_path = PathBuf::from(format!("{}.report.json", output.display()));
+    let report = serde_json::json!({
+        "included_routes": eligible,
+        "excluded_routes": excluded.iter().map(route_report_entry).collect::<Vec<_>>(),
+    });
+    fs::write(report_path, serde_json::to_string_pretty(&report)?)?;
+    println!("wrote {}", output.display());
+    Ok(())
+}
+
+fn render_filtered_toml(
+    source_text: &str,
+    eligible: &std::collections::BTreeSet<String>,
+) -> Result<String, Box<dyn Error>> {
+    let mut value = source_text.parse::<toml::Value>()?;
+    let Some(route_tables) = value
+        .get_mut("routes")
+        .and_then(|routes| routes.get_mut("definitions"))
+        .and_then(toml::Value::as_array_mut)
+    else {
+        return Err("missing routes.definitions in source config".into());
+    };
+    route_tables.retain(|route| {
+        route
+            .get("route_id")
+            .and_then(toml::Value::as_str)
+            .map(|route_id| eligible.contains(route_id))
+            .unwrap_or(false)
+    });
+    Ok(toml::to_string_pretty(&value)?)
+}
+
+fn render_filtered_json(
+    source_text: &str,
+    eligible: &std::collections::BTreeSet<String>,
+) -> Result<String, Box<dyn Error>> {
+    let mut value = serde_json::from_str::<serde_json::Value>(source_text)?;
+    let Some(route_tables) = value
+        .get_mut("routes")
+        .and_then(|routes| routes.get_mut("definitions"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Err("missing routes.definitions in source config".into());
+    };
+    route_tables.retain(|route| {
+        route
+            .get("route_id")
+            .and_then(serde_json::Value::as_str)
+            .map(|route_id| eligible.contains(route_id))
+            .unwrap_or(false)
+    });
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn route_report_entry(item: &RouteMonitorView) -> serde_json::Value {
+    serde_json::json!({
+        "route_id": item.route_id,
+        "health_state": route_health_label(item.health_state),
+        "blocking_pool_id": item.blocking_pool_id,
+        "blocking_reason": item.blocking_reason,
+        "recent_chain_failure_count": item.recent_chain_failure_count,
+        "last_success_slot": item.last_success_slot,
+    })
 }
 
 fn print_trade_table(items: Vec<MonitorTradeEvent>) {
@@ -666,6 +851,18 @@ fn display_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".into())
+}
+
+fn route_health_label(state: bot::RouteHealthState) -> &'static str {
+    match state {
+        bot::RouteHealthState::Eligible => "eligible",
+        bot::RouteHealthState::BlockedPoolStale => "blocked_pool_stale",
+        bot::RouteHealthState::BlockedPoolNotExecutable => "blocked_pool_not_executable",
+        bot::RouteHealthState::BlockedPoolRepair => "blocked_pool_repair",
+        bot::RouteHealthState::BlockedPoolQuarantined => "blocked_pool_quarantined",
+        bot::RouteHealthState::BlockedPoolDisabled => "blocked_pool_disabled",
+        bot::RouteHealthState::ShadowOnly => "shadow_only",
+    }
 }
 
 fn run_ui(api: ApiClient) -> Result<(), Box<dyn Error>> {
@@ -781,8 +978,8 @@ fn render_header(frame: &mut Frame, area: Rect, overview: &MonitorOverview) {
             Span::raw("  "),
             Span::styled("routes ", Style::default().fg(Color::Gray)),
             Span::raw(format!(
-                "warm={}/{} tradable={}",
-                overview.warm_routes, overview.total_routes, overview.tradable_routes
+                "tradable={}/{} warm={}",
+                overview.tradable_routes, overview.total_routes, overview.warm_routes
             )),
             Span::raw("  "),
             Span::styled("inflight ", Style::default().fg(Color::Gray)),
@@ -876,12 +1073,12 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
         .iter()
         .filter(|item| item.reason_code == "pool_repair_pending")
         .count();
-    let not_exact_rejects = app
+    let not_executable_rejects = app
         .snapshot
         .rejections
         .items
         .iter()
-        .filter(|item| item.reason_code == "pool_state_not_exact")
+        .filter(|item| item.reason_code == "pool_state_not_executable")
         .count();
     vec![
         Line::from(format!(
@@ -910,8 +1107,8 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
                 .unwrap_or_else(|| "none".into()),
         )),
         Line::from(format!(
-            "routes warm={}/{} tradable={}",
-            overview.warm_routes, overview.total_routes, overview.tradable_routes
+            "routes tradable={}/{} warm={}",
+            overview.tradable_routes, overview.total_routes, overview.warm_routes
         )),
         Line::from(format!(
             "detect={} rejections={} submits={} included={}",
@@ -925,8 +1122,8 @@ fn overview_lines(app: &App) -> Vec<Line<'static>> {
             overview.submit_rejected_count, overview.poll_interval_millis
         )),
         Line::from(format!(
-            "rejects repair_pending={} not_exact={}",
-            repair_pending_rejects, not_exact_rejects
+            "rejects repair_pending={} not_executable={}",
+            repair_pending_rejects, not_executable_rejects
         )),
     ]
 }
@@ -1378,12 +1575,17 @@ mod tests {
                 live: false,
                 ready: true,
                 issue: None,
+                last_error: None,
                 kill_switch_active: false,
                 latest_slot: 10,
                 rpc_slot: Some(10),
                 warm_routes: 1,
                 tradable_routes: 1,
+                eligible_live_routes: 1,
+                shadow_routes: 0,
                 total_routes: 1,
+                quarantined_pools: 0,
+                disabled_pools: 0,
                 inflight_submissions: 0,
                 wallet_ready: true,
                 wallet_balance_lamports: 1,
@@ -1408,6 +1610,7 @@ mod tests {
                     pool_id: "pool-1".into(),
                     venues: vec!["raydium".into()],
                     route_ids: vec!["route-1".into()],
+                    health_state: bot::PoolHealthState::Healthy,
                     price_bps: 100,
                     fee_bps: 3,
                     reserve_depth: 1000,
@@ -1420,15 +1623,33 @@ mod tests {
                     refresh_attempt_count: 0,
                     refresh_failure_count: 0,
                     refresh_success_count: 0,
+                    consecutive_refresh_failures: 0,
                     last_refresh_latency_ms: None,
                     refresh_deadline_slot_lag: None,
                     repair_pending: false,
                     repair_attempt_count: 0,
                     repair_failure_count: 0,
                     repair_success_count: 0,
+                    consecutive_repair_failures: 0,
+                    quarantined_until_slot: None,
+                    disable_reason: None,
+                    last_executable_slot: Some(10),
                     last_repair_latency_ms: None,
                     last_repair_invalidation_ms: None,
                     last_seen_unix_millis: 0,
+                }],
+            },
+            routes: RoutesResponse {
+                items: vec![RouteMonitorView {
+                    route_id: "route-1".into(),
+                    health_state: bot::RouteHealthState::Eligible,
+                    eligible_live: true,
+                    pool_ids: vec!["pool-1".into(), "pool-2".into()],
+                    blocking_pool_id: None,
+                    blocking_reason: None,
+                    recent_chain_failure_count: 0,
+                    last_success_slot: Some(10),
+                    shadow_until_slot: None,
                 }],
             },
             signals: MonitorSignalsResponse {

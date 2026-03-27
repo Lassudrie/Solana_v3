@@ -627,6 +627,7 @@ fn rejection_code(reason: &SubmitRejectionReason) -> &'static str {
         SubmitRejectionReason::RateLimited => "rate-limited",
         SubmitRejectionReason::DuplicateSubmission => "duplicate",
         SubmitRejectionReason::TipTooLow => "tip-too-low",
+        SubmitRejectionReason::PathCongested => "path-congested",
         SubmitRejectionReason::ChannelUnavailable => "channel-unavailable",
         SubmitRejectionReason::RemoteRejected => "remote-rejected",
     }

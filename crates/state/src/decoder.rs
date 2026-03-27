@@ -2,9 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use solana_sdk::hash::hashv;
+
 use crate::types::{
     AccountRecord, DecodedAccount, FreshnessState, LiquidityModel, PoolId, PoolSnapshot,
+    sqrt_price_x64_to_price_bps,
 };
+
+const ORCA_WHIRLPOOL_OWNER: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+const RAYDIUM_CLMM_OWNER: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+const ORCA_WHIRLPOOL_MIN_LEN: usize = 245;
+const RAYDIUM_CLMM_MIN_LEN: usize = 273;
 
 pub trait AccountDecoder: Send + Sync {
     fn decoder_key(&self) -> &'static str;
@@ -60,7 +68,7 @@ impl AccountDecoder for PoolPriceAccountDecoder {
             active_liquidity: reserve_depth,
             sqrt_price_x64: None,
             venue: None,
-            confidence: crate::types::PoolConfidence::Exact,
+            confidence: crate::types::PoolConfidence::Decoded,
             repair_pending: false,
             liquidity_model: LiquidityModel::ConstantProduct,
             slippage_factor_bps: PoolSnapshot::default_slippage_factor_bps(
@@ -87,7 +95,12 @@ impl AccountDecoder for OrcaWhirlpoolAccountDecoder {
     }
 
     fn decode(&self, pool_id: &PoolId, record: &AccountRecord, head_slot: u64) -> DecodedAccount {
-        if record.data.len() < 245 {
+        if !is_anchor_account(
+            record,
+            ORCA_WHIRLPOOL_OWNER,
+            "Whirlpool",
+            ORCA_WHIRLPOOL_MIN_LEN,
+        ) {
             return DecodedAccount::Ignored;
         }
         let tick_spacing = read_u16(&record.data, 41).unwrap_or_default();
@@ -112,7 +125,7 @@ impl AccountDecoder for OrcaWhirlpoolAccountDecoder {
             active_liquidity,
             sqrt_price_x64: Some(sqrt_price),
             venue: Some(crate::types::PoolVenue::OrcaWhirlpool),
-            confidence: crate::types::PoolConfidence::Exact,
+            confidence: crate::types::PoolConfidence::Verified,
             repair_pending: false,
             liquidity_model,
             slippage_factor_bps: PoolSnapshot::default_slippage_factor_bps(
@@ -139,7 +152,12 @@ impl AccountDecoder for RaydiumClmmPoolDecoder {
     }
 
     fn decode(&self, pool_id: &PoolId, record: &AccountRecord, head_slot: u64) -> DecodedAccount {
-        if record.data.len() < 273 {
+        if !is_anchor_account(
+            record,
+            RAYDIUM_CLMM_OWNER,
+            "PoolState",
+            RAYDIUM_CLMM_MIN_LEN,
+        ) {
             return DecodedAccount::Ignored;
         }
         let tick_spacing = read_u16(&record.data, 235).unwrap_or_default();
@@ -154,6 +172,8 @@ impl AccountDecoder for RaydiumClmmPoolDecoder {
         DecodedAccount::PoolState(PoolSnapshot {
             pool_id: pool_id.clone(),
             price_bps: sqrt_price_x64_to_price_bps(sqrt_price),
+            // Raydium CLMM stores the trade fee in AmmConfig, not PoolState. Bootstrap must
+            // require an explicit per-leg fee to avoid silently trading with a zero fallback.
             fee_bps: 0,
             reserve_depth: active_liquidity,
             reserve_a: None,
@@ -161,7 +181,7 @@ impl AccountDecoder for RaydiumClmmPoolDecoder {
             active_liquidity,
             sqrt_price_x64: Some(sqrt_price),
             venue: Some(crate::types::PoolVenue::RaydiumClmm),
-            confidence: crate::types::PoolConfidence::Exact,
+            confidence: crate::types::PoolConfidence::Verified,
             repair_pending: false,
             liquidity_model,
             slippage_factor_bps: PoolSnapshot::default_slippage_factor_bps(
@@ -212,26 +232,42 @@ fn read_pubkey(data: &[u8], offset: usize) -> Option<String> {
     Some(bs58::encode(bytes).into_string())
 }
 
-fn sqrt_price_x64_to_price_bps(sqrt_price_x64: u128) -> u64 {
-    let sqrt_ratio = (sqrt_price_x64 as f64) / 18_446_744_073_709_551_616.0;
-    let price = sqrt_ratio * sqrt_ratio;
-    let scaled = (price * 10_000.0).round();
-    if !scaled.is_finite() || scaled <= 0.0 {
-        return 0;
-    }
-    scaled.min(u64::MAX as f64) as u64
+fn is_anchor_account(
+    record: &AccountRecord,
+    expected_owner: &str,
+    account_name: &str,
+    min_len: usize,
+) -> bool {
+    record.owner == expected_owner
+        && record.data.len() >= min_len
+        && record
+            .data
+            .starts_with(&anchor_account_discriminator(account_name))
+}
+
+fn anchor_account_discriminator(name: &str) -> [u8; 8] {
+    let preimage = format!("account:{name}");
+    let hash = hashv(&[preimage.as_bytes()]);
+    hash.to_bytes()[..8]
+        .try_into()
+        .expect("anchor discriminator should be 8 bytes")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AccountDecoder, OrcaWhirlpoolAccountDecoder, RaydiumClmmPoolDecoder};
-    use crate::types::{AccountKey, AccountRecord, DecodedAccount, LiquidityModel, PoolId};
+    use super::{
+        AccountDecoder, ORCA_WHIRLPOOL_OWNER, OrcaWhirlpoolAccountDecoder, RAYDIUM_CLMM_OWNER,
+        RaydiumClmmPoolDecoder, anchor_account_discriminator,
+    };
+    use crate::types::{
+        AccountKey, AccountRecord, DecodedAccount, LiquidityModel, PoolConfidence, PoolId,
+    };
     use std::time::SystemTime;
 
-    fn account_record(data: Vec<u8>) -> AccountRecord {
+    fn account_record(owner: &str, data: Vec<u8>) -> AccountRecord {
         AccountRecord {
             key: AccountKey("acct".into()),
-            owner: "owner".into(),
+            owner: owner.into(),
             lamports: 0,
             data,
             slot: 42,
@@ -255,6 +291,7 @@ mod tests {
     #[test]
     fn orca_whirlpool_decoder_populates_liquidity_hints() {
         let mut data = vec![0u8; 245];
+        data[..8].copy_from_slice(&anchor_account_discriminator("Whirlpool"));
         write_u16(&mut data, 41, 4);
         write_u16(&mut data, 45, 400);
         write_u128(&mut data, 49, 500_000);
@@ -264,13 +301,18 @@ mod tests {
         data[181..213].fill(2);
 
         let decoder = OrcaWhirlpoolAccountDecoder;
-        let decoded = decoder.decode(&PoolId("pool-a".into()), &account_record(data), 42);
+        let decoded = decoder.decode(
+            &PoolId("pool-a".into()),
+            &account_record(ORCA_WHIRLPOOL_OWNER, data),
+            42,
+        );
         let DecodedAccount::PoolState(snapshot) = decoded else {
             panic!("expected pool snapshot");
         };
 
         assert_eq!(snapshot.active_liquidity, 500_000);
         assert_eq!(snapshot.sqrt_price_x64, Some(1u128 << 64));
+        assert_eq!(snapshot.confidence, PoolConfidence::Verified);
         assert_eq!(
             snapshot.liquidity_model,
             LiquidityModel::ConcentratedLiquidity
@@ -281,6 +323,7 @@ mod tests {
     #[test]
     fn raydium_clmm_decoder_populates_liquidity_hints() {
         let mut data = vec![0u8; 273];
+        data[..8].copy_from_slice(&anchor_account_discriminator("PoolState"));
         write_u16(&mut data, 235, 1);
         write_u128(&mut data, 237, 750_000);
         write_u128(&mut data, 253, 1u128 << 64);
@@ -289,17 +332,47 @@ mod tests {
         data[105..137].fill(4);
 
         let decoder = RaydiumClmmPoolDecoder;
-        let decoded = decoder.decode(&PoolId("pool-b".into()), &account_record(data), 42);
+        let decoded = decoder.decode(
+            &PoolId("pool-b".into()),
+            &account_record(RAYDIUM_CLMM_OWNER, data),
+            42,
+        );
         let DecodedAccount::PoolState(snapshot) = decoded else {
             panic!("expected pool snapshot");
         };
 
         assert_eq!(snapshot.active_liquidity, 750_000);
         assert_eq!(snapshot.sqrt_price_x64, Some(1u128 << 64));
+        assert_eq!(snapshot.confidence, PoolConfidence::Verified);
         assert_eq!(
             snapshot.liquidity_model,
             LiquidityModel::ConcentratedLiquidity
         );
         assert!(snapshot.slippage_factor_bps > 10_000);
+    }
+
+    #[test]
+    fn orca_whirlpool_decoder_rejects_wrong_owner() {
+        let mut data = vec![0u8; 245];
+        data[..8].copy_from_slice(&anchor_account_discriminator("Whirlpool"));
+
+        let decoder = OrcaWhirlpoolAccountDecoder;
+        let decoded = decoder.decode(&PoolId("pool-a".into()), &account_record("wrong", data), 42);
+
+        assert_eq!(decoded, DecodedAccount::Ignored);
+    }
+
+    #[test]
+    fn raydium_clmm_decoder_rejects_wrong_discriminator() {
+        let data = vec![0u8; 273];
+
+        let decoder = RaydiumClmmPoolDecoder;
+        let decoded = decoder.decode(
+            &PoolId("pool-b".into()),
+            &account_record(RAYDIUM_CLMM_OWNER, data),
+            42,
+        );
+
+        assert_eq!(decoded, DecodedAccount::Ignored);
     }
 }

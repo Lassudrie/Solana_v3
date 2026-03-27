@@ -32,6 +32,7 @@ pub struct RouteDefinition {
     pub output_mint: String,
     pub base_mint: Option<String>,
     pub quote_mint: Option<String>,
+    pub sol_quote_conversion_pool_id: Option<PoolId>,
     pub legs: [RouteLeg; 2],
     pub min_trade_size: u64,
     pub default_trade_size: u64,

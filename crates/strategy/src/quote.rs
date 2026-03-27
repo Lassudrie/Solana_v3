@@ -4,6 +4,8 @@ use thiserror::Error;
 use crate::route_registry::RouteDefinition;
 use state::types::PoolSnapshot;
 
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegQuote {
     pub venue: String,
@@ -37,11 +39,14 @@ impl RouteQuote {
     pub fn with_estimated_execution_cost(
         mut self,
         route: &RouteDefinition,
-        snapshots: [&PoolSnapshot; 2],
+        sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
         estimated_execution_cost_lamports: u64,
     ) -> Result<Self, QuoteError> {
-        let estimated_execution_cost_quote_atoms =
-            execution_cost_quote_atoms(route, snapshots, estimated_execution_cost_lamports)?;
+        let estimated_execution_cost_quote_atoms = execution_cost_quote_atoms(
+            route,
+            sol_quote_conversion_snapshot,
+            estimated_execution_cost_lamports,
+        )?;
         self.estimated_execution_cost_lamports = estimated_execution_cost_lamports;
         self.estimated_execution_cost_quote_atoms = estimated_execution_cost_quote_atoms;
         self.expected_net_profit_quote_atoms = clamp_i128(
@@ -138,41 +143,42 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
 
 fn execution_cost_quote_atoms(
     route: &RouteDefinition,
-    snapshots: [&PoolSnapshot; 2],
+    sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
     estimated_execution_cost_lamports: u64,
 ) -> Result<u64, QuoteError> {
     if estimated_execution_cost_lamports == 0 {
         return Ok(0);
     }
 
-    let Some(base_mint) = route.base_mint.as_deref() else {
-        return Err(QuoteError::ExecutionCostNotConvertible);
-    };
     let Some(quote_mint) = route.quote_mint.as_deref() else {
         return Err(QuoteError::ExecutionCostNotConvertible);
     };
     if route.input_mint != route.output_mint || route.input_mint != quote_mint {
         return Err(QuoteError::ExecutionCostNotConvertible);
     }
+    if quote_mint == SOL_MINT {
+        return Ok(estimated_execution_cost_lamports);
+    }
 
-    for snapshot in snapshots {
-        if snapshot.price_bps == 0 {
-            continue;
-        }
-        if snapshot.token_mint_a == base_mint && snapshot.token_mint_b == quote_mint {
-            return mul_div_u64(
-                estimated_execution_cost_lamports,
-                snapshot.price_bps,
-                10_000,
-            );
-        }
-        if snapshot.token_mint_a == quote_mint && snapshot.token_mint_b == base_mint {
-            return mul_div_u64(
-                estimated_execution_cost_lamports,
-                10_000,
-                snapshot.price_bps,
-            );
-        }
+    let Some(snapshot) = sol_quote_conversion_snapshot else {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    };
+    if snapshot.price_bps == 0 {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    }
+    if snapshot.token_mint_a == SOL_MINT && snapshot.token_mint_b == quote_mint {
+        return mul_div_u64(
+            estimated_execution_cost_lamports,
+            snapshot.price_bps,
+            10_000,
+        );
+    }
+    if snapshot.token_mint_a == quote_mint && snapshot.token_mint_b == SOL_MINT {
+        return mul_div_u64(
+            estimated_execution_cost_lamports,
+            10_000,
+            snapshot.price_bps,
+        );
     }
 
     Err(QuoteError::ExecutionCostNotConvertible)
@@ -356,4 +362,174 @@ fn apply_route_price(
         net_output,
         fee_paid,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use state::types::{
+        FreshnessState, LiquidityModel, PoolConfidence, PoolId, PoolSnapshot, RouteId,
+    };
+
+    use crate::{
+        quote::{QuoteError, RouteQuote, SOL_MINT},
+        route_registry::{RouteDefinition, RouteLeg, SwapSide},
+    };
+
+    fn route_definition(
+        base_mint: &str,
+        quote_mint: &str,
+        conversion_pool: Option<&str>,
+    ) -> RouteDefinition {
+        RouteDefinition {
+            route_id: RouteId("route-a".into()),
+            input_mint: quote_mint.into(),
+            output_mint: quote_mint.into(),
+            base_mint: Some(base_mint.into()),
+            quote_mint: Some(quote_mint.into()),
+            sol_quote_conversion_pool_id: conversion_pool.map(|pool_id| PoolId(pool_id.into())),
+            legs: [
+                RouteLeg {
+                    venue: "venue-a".into(),
+                    pool_id: PoolId("pool-a".into()),
+                    side: SwapSide::BuyBase,
+                    fee_bps: None,
+                },
+                RouteLeg {
+                    venue: "venue-b".into(),
+                    pool_id: PoolId("pool-b".into()),
+                    side: SwapSide::SellBase,
+                    fee_bps: None,
+                },
+            ],
+            min_trade_size: 1,
+            default_trade_size: 1,
+            max_trade_size: 10,
+            size_ladder: Vec::new(),
+            estimated_execution_cost_lamports: 0,
+            execution_protection: None,
+        }
+    }
+
+    fn quote() -> RouteQuote {
+        RouteQuote {
+            quoted_slot: 1,
+            input_amount: 1_000,
+            gross_output_amount: 1_100,
+            net_output_amount: 1_080,
+            expected_gross_profit_quote_atoms: 80,
+            estimated_execution_cost_lamports: 0,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: 80,
+            leg_quotes: [
+                crate::quote::LegQuote {
+                    venue: "venue-a".into(),
+                    pool_id: PoolId("pool-a".into()),
+                    side: SwapSide::BuyBase,
+                    input_amount: 1_000,
+                    output_amount: 1_050,
+                    fee_paid: 0,
+                    current_tick_index: None,
+                },
+                crate::quote::LegQuote {
+                    venue: "venue-b".into(),
+                    pool_id: PoolId("pool-b".into()),
+                    side: SwapSide::SellBase,
+                    input_amount: 1_050,
+                    output_amount: 1_080,
+                    fee_paid: 0,
+                    current_tick_index: None,
+                },
+            ],
+        }
+    }
+
+    fn snapshot(
+        pool_id: &str,
+        token_mint_a: &str,
+        token_mint_b: &str,
+        price_bps: u64,
+    ) -> PoolSnapshot {
+        PoolSnapshot {
+            pool_id: PoolId(pool_id.into()),
+            price_bps,
+            fee_bps: 0,
+            reserve_depth: 1_000_000,
+            reserve_a: Some(1_000_000),
+            reserve_b: Some(1_000_000),
+            active_liquidity: 1_000_000,
+            sqrt_price_x64: None,
+            venue: None,
+            confidence: PoolConfidence::Executable,
+            repair_pending: false,
+            liquidity_model: LiquidityModel::ConstantProduct,
+            slippage_factor_bps: 10_000,
+            token_mint_a: token_mint_a.into(),
+            token_mint_b: token_mint_b.into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 1,
+            derived_at: SystemTime::now(),
+            freshness: FreshnessState::at(1, 1, 1),
+        }
+    }
+
+    #[test]
+    fn execution_cost_in_sol_quote_atoms_is_identity_for_sol_routes() {
+        let route = route_definition("JTO", SOL_MINT, None);
+        let quote = quote()
+            .with_estimated_execution_cost(&route, None, 5_000)
+            .expect("sol quote cost should be an identity conversion");
+
+        assert_eq!(quote.estimated_execution_cost_quote_atoms, 5_000);
+        assert_eq!(quote.expected_net_profit_quote_atoms, -4_920);
+    }
+
+    #[test]
+    fn execution_cost_uses_explicit_sol_quote_snapshot() {
+        let route = route_definition("USDT", "USDC", Some("pool-sol-usdc"));
+        let sol_quote_snapshot = snapshot("pool-sol-usdc", SOL_MINT, "USDC", 1_500_000);
+        let route_leg_snapshot = snapshot("pool-usdt-usdc", "USDT", "USDC", 9_900);
+        let quote = quote()
+            .with_estimated_execution_cost(&route, Some(&sol_quote_snapshot), 5_000)
+            .expect("sol/usdc conversion should succeed");
+
+        assert_eq!(quote.estimated_execution_cost_quote_atoms, 750_000);
+        assert_ne!(
+            quote.estimated_execution_cost_quote_atoms, 4_950,
+            "must not reuse the base/quote route price"
+        );
+        assert_eq!(route_leg_snapshot.price_bps, 9_900);
+    }
+
+    #[test]
+    fn execution_cost_supports_inverted_sol_quote_snapshot_orientation() {
+        let route = route_definition("USDT", "USDC", Some("pool-sol-usdc"));
+        let sol_quote_snapshot = snapshot("pool-sol-usdc", "USDC", SOL_MINT, 50);
+        let quote = quote()
+            .with_estimated_execution_cost(&route, Some(&sol_quote_snapshot), 5_000)
+            .expect("inverted usdc/sol conversion should succeed");
+
+        assert_eq!(quote.estimated_execution_cost_quote_atoms, 1_000_000);
+    }
+
+    #[test]
+    fn execution_cost_rejects_missing_or_invalid_sol_quote_snapshot() {
+        let route = route_definition("USDT", "USDC", Some("pool-sol-usdc"));
+        let wrong_pair_snapshot = snapshot("pool-usdt-usdc", "USDT", "USDC", 10_000);
+
+        let missing = quote().with_estimated_execution_cost(&route, None, 5_000);
+        assert!(matches!(
+            missing,
+            Err(QuoteError::ExecutionCostNotConvertible)
+        ));
+
+        let invalid =
+            quote().with_estimated_execution_cost(&route, Some(&wrong_pair_snapshot), 5_000);
+        assert!(matches!(
+            invalid,
+            Err(QuoteError::ExecutionCostNotConvertible)
+        ));
+    }
 }

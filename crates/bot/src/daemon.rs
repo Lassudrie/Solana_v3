@@ -9,11 +9,12 @@ use submit::SubmitRejectionReason;
 use thiserror::Error;
 
 use crate::{
-    bootstrap::{BootstrapError, bootstrap},
+    bootstrap::{BootstrapError, bootstrap_with_health},
     config::{BotConfig, RuntimeControlConfig},
     control::{RuntimeIssue, RuntimeMode, RuntimeStatus, SharedRuntimeStatus},
     observer::ObserverHandle,
-    refresh::AsyncStateRefresher,
+    refresh::{AsyncStateRefresher, RefreshFailure},
+    route_health::RouteHealthRegistry,
     runtime::BotRuntime,
     sources::{EventSourceConfigError, build_event_source},
     submit_dispatch::{EnqueueError, SubmitDispatcher},
@@ -57,7 +58,7 @@ pub struct BotDaemon {
     reconciliation_poll_interval: Duration,
     last_reconcile_at: Option<Instant>,
     last_shredstream_sequence: Option<u64>,
-    last_shredstream_seen_at: Option<SystemTime>,
+    last_shredstream_source_event_at: Option<SystemTime>,
 }
 
 impl BotDaemon {
@@ -71,17 +72,22 @@ impl BotDaemon {
                 source,
             });
         }
-        let observer =
-            ObserverHandle::spawn(&config.runtime.monitor_server, &config).map_err(|source| {
-                DaemonError::HealthServer {
-                    bind_address: config.runtime.monitor_server.bind_address.clone(),
-                    source,
-                }
-            })?;
+        let route_health = std::sync::Arc::new(std::sync::Mutex::new(RouteHealthRegistry::new(
+            config.runtime.live_set_health.clone(),
+        )));
+        let mut runtime = bootstrap_with_health(config.clone(), route_health.clone())?;
+        let observer = ObserverHandle::spawn(
+            &config.runtime.monitor_server,
+            &config,
+            route_health.clone(),
+        )
+        .map_err(|source| DaemonError::HealthServer {
+            bind_address: config.runtime.monitor_server.bind_address.clone(),
+            source,
+        })?;
         let submit_dispatcher = SubmitDispatcher::from_config(&config)
             .map_err(|source| DaemonError::SubmitDispatcher { source })?;
-        let source = build_event_source(&config, observer.clone())?;
-        let mut runtime = bootstrap(config.clone())?;
+        let source = build_event_source(&config, observer.clone(), route_health)?;
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
         let lookup_table_keys = config
             .routes
@@ -125,7 +131,7 @@ impl BotDaemon {
             ),
             last_reconcile_at: None,
             last_shredstream_sequence: None,
-            last_shredstream_seen_at: None,
+            last_shredstream_source_event_at: None,
         };
         daemon.refresh_status(None, None, None);
         Ok(daemon)
@@ -140,12 +146,15 @@ impl BotDaemon {
         let idle_wait = Duration::from_millis(self.control.idle_sleep_millis);
 
         loop {
-            self.runtime
-                .apply_async_refresh(self.refresher.drain_snapshot());
+            let refresh_snapshot = self.refresher.drain_snapshot();
+            let refresh_failure_status = self.refresh_failure_status(&refresh_snapshot.failures);
+            self.runtime.apply_async_refresh(refresh_snapshot);
             self.drain_submit_completions();
             self.reconcile_if_due();
             let kill_switch_active = self.refresh_kill_switch();
-            if kill_switch_active {
+            if let Some((issue, detail)) = refresh_failure_status {
+                self.refresh_status(Some(RuntimeMode::Degraded), Some(issue), Some(detail));
+            } else if kill_switch_active {
                 self.refresh_status(None, Some(RuntimeIssue::KillSwitchActive), None);
             } else {
                 self.refresh_status(None, None, None);
@@ -228,7 +237,32 @@ impl BotDaemon {
     fn dispatch_submission(&mut self, report: crate::runtime::HotPathReport) {
         match self.submit_dispatcher.try_enqueue(report) {
             Ok(()) => self.refresh_status(None, None, None),
-            Err(EnqueueError::Full(report) | EnqueueError::Disconnected(report)) => {
+            Err(EnqueueError::Full(report)) => {
+                let congestion_issue = {
+                    let load = self.submit_dispatcher.load();
+                    RuntimeIssue::SubmitPathCongested {
+                        pending: load.pending,
+                        capacity: load.capacity,
+                        workers: load.workers,
+                    }
+                };
+                let rejected = self
+                    .submit_dispatcher
+                    .queue_rejection(&report, SubmitRejectionReason::PathCongested);
+                let report = self.runtime.finalize_submission(
+                    report,
+                    rejected,
+                    Duration::ZERO,
+                    SystemTime::now(),
+                );
+                self.observer.publish_hot_path(report);
+                self.refresh_status(
+                    Some(RuntimeMode::Degraded),
+                    Some(congestion_issue),
+                    Some("submit path congested".into()),
+                );
+            }
+            Err(EnqueueError::Disconnected(report)) => {
                 let rejected = self
                     .submit_dispatcher
                     .queue_rejection(&report, SubmitRejectionReason::ChannelUnavailable);
@@ -351,7 +385,8 @@ impl BotDaemon {
     }
 
     fn record_shredstream_metrics(&mut self, event: &NormalizedEvent) {
-        let observed_at = event.latency.source_received_at;
+        let source_received_at = event.latency.source_received_at;
+        let source_event_at = event.latency.source_event_at();
         let normalized_latency = event
             .latency
             .normalized_at
@@ -359,9 +394,9 @@ impl BotDaemon {
             .unwrap_or(Duration::ZERO);
 
         self.runtime.telemetry().metrics.record_shredstream_event(
-            observed_at,
-            observed_at,
-            self.last_shredstream_seen_at,
+            source_event_at,
+            source_received_at,
+            self.last_shredstream_source_event_at,
             normalized_latency,
         );
 
@@ -389,7 +424,7 @@ impl BotDaemon {
         }
 
         self.last_shredstream_sequence = Some(event.source.sequence);
-        self.last_shredstream_seen_at = Some(observed_at);
+        self.last_shredstream_source_event_at = source_event_at;
     }
 
     fn refresh_status(
@@ -402,6 +437,7 @@ impl BotDaemon {
         let total_routes = self.runtime.route_count();
         let warm_routes = self.runtime.ready_route_count();
         let tradable_routes = self.runtime.tradable_route_count();
+        let health_summary = self.runtime.route_health_summary();
         let inflight_submissions = self
             .runtime
             .pending_submissions()
@@ -420,9 +456,10 @@ impl BotDaemon {
                     total_routes,
                 });
             }
-            if tradable_routes == 0 {
+            if tradable_routes == 0 || health_summary.eligible_live_routes == 0 {
                 return Some(RuntimeIssue::NoTradableRoutes {
-                    warm_routes,
+                    tradable_routes,
+                    eligible_live_routes: health_summary.eligible_live_routes,
                     total_routes,
                 });
             }
@@ -443,7 +480,7 @@ impl BotDaemon {
                         maximum: self.max_blockhash_slot_lag,
                     })
                 }
-                _ => None,
+                _ => self.submit_path_congestion_issue(),
             }
         });
         let ready = derived_issue.is_none();
@@ -454,6 +491,8 @@ impl BotDaemon {
                 derived_issue,
                 Some(
                     RuntimeIssue::KillSwitchActive
+                        | RuntimeIssue::SubmitPathCongested { .. }
+                        | RuntimeIssue::AsyncRefreshFailed { .. }
                         | RuntimeIssue::EventSourceFailure { .. }
                         | RuntimeIssue::RuntimeFailure { .. }
                 )
@@ -475,6 +514,10 @@ impl BotDaemon {
             total_routes,
             warm_routes,
             tradable_routes,
+            eligible_live_routes: health_summary.eligible_live_routes,
+            shadow_routes: health_summary.shadow_routes,
+            quarantined_pools: health_summary.quarantined_pools,
+            disabled_pools: health_summary.disabled_pools,
             inflight_submissions,
             wallet_ready: execution_state.wallet_ready,
             wallet_balance_lamports: execution_state.wallet_balance_lamports,
@@ -491,6 +534,34 @@ impl BotDaemon {
         };
         self.status.replace(snapshot.clone());
         self.observer.publish_status(snapshot);
+    }
+
+    fn submit_path_congestion_issue(&self) -> Option<RuntimeIssue> {
+        self.submit_dispatcher
+            .congestion_load()
+            .map(|load| RuntimeIssue::SubmitPathCongested {
+                pending: load.pending,
+                capacity: load.capacity,
+                workers: load.workers,
+            })
+    }
+
+    fn refresh_failure_status(
+        &self,
+        failures: &[RefreshFailure],
+    ) -> Option<(RuntimeIssue, String)> {
+        let first = failures.first()?;
+        let detail = failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.worker, failure.detail))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Some((
+            RuntimeIssue::AsyncRefreshFailed {
+                worker: first.worker.to_string(),
+            },
+            detail,
+        ))
     }
 }
 
@@ -523,8 +594,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("acct-a", 1, 12_000),
-                replay_event("acct-b", 2, 12_000)
+                replay_event("pool-a", 1, 12_000),
+                replay_event("pool-b", 2, 12_000)
             ),
         )
         .unwrap();
@@ -554,8 +625,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("acct-a", 1, 12_000),
-                replay_event("acct-b", 2, 12_000)
+                replay_event("pool-a", 1, 12_000),
+                replay_event("pool-b", 2, 12_000)
             ),
         )
         .unwrap();
@@ -585,8 +656,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("acct-a", 1, 12_000),
-                replay_event("acct-b", 2, 12_000)
+                replay_event("pool-a", 1, 12_000),
+                replay_event("pool-b", 2, 12_000)
             ),
         )
         .unwrap();
@@ -628,6 +699,7 @@ mod tests {
         config.builder.compute_unit_limit = 1;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.runtime.live_set_health.enabled = false;
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
         config.runtime.refresh.enabled = false;
@@ -641,6 +713,7 @@ mod tests {
                 output_mint: "USDC".into(),
                 base_mint: None,
                 quote_mint: None,
+                sol_quote_conversion_pool_id: None,
                 min_trade_size: None,
                 default_trade_size: 10_000,
                 max_trade_size: 20_000,
@@ -730,24 +803,10 @@ mod tests {
         Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
     }
 
-    fn replay_event(pubkey: &str, sequence: u64, price_bps: u64) -> String {
+    fn replay_event(pool_id: &str, sequence: u64, price_bps: u64) -> String {
         format!(
-            "{{\"type\":\"account_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pubkey\":\"{pubkey}\",\"owner\":\"owner\",\"lamports\":0,\"data_hex\":\"{}\",\"slot\":{sequence},\"write_version\":1}}",
-            encode_pool_hex(price_bps, 4, 100_000)
+            "{{\"type\":\"pool_snapshot_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pool_id\":\"{pool_id}\",\"price_bps\":{price_bps},\"fee_bps\":4,\"reserve_depth\":100000,\"reserve_a\":100000,\"reserve_b\":100000,\"active_liquidity\":100000,\"sqrt_price_x64\":null,\"confidence\":\"executable\",\"repair_pending\":false,\"token_mint_a\":\"SOL\",\"token_mint_b\":\"USDC\",\"tick_spacing\":0,\"current_tick_index\":null,\"slot\":{sequence},\"write_version\":1}}"
         )
-    }
-
-    fn encode_pool_hex(price_bps: u64, fee_bps: u16, reserve_depth: u64) -> String {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&price_bps.to_le_bytes());
-        bytes.extend_from_slice(&fee_bps.to_le_bytes());
-        bytes.extend_from_slice(&reserve_depth.to_le_bytes());
-        let mut hex = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            use std::fmt::Write as _;
-            write!(&mut hex, "{byte:02x}").expect("write hex");
-        }
-        hex
     }
 
     fn temp_path(prefix: &str, extension: &str) -> PathBuf {

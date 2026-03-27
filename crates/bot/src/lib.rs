@@ -5,6 +5,7 @@ pub mod daemon;
 mod live;
 pub mod observer;
 pub mod refresh;
+pub mod route_health;
 pub mod runtime;
 pub mod sources;
 mod submit_dispatch;
@@ -16,6 +17,10 @@ pub use daemon::{BotDaemon, DaemonError, DaemonExit};
 pub use observer::{
     MonitorOverview, MonitorSignalMetric, MonitorSignalSample, MonitorSignalsResponse,
     MonitorSnapshot, MonitorTradeEvent, MonitorTradesResponse, ObserverHandle, PoolMonitorView,
-    RejectionEvent, RejectionsResponse,
+    RejectionEvent, RejectionsResponse, RouteMonitorView, RoutesResponse,
+};
+pub use route_health::{
+    PoolHealthState, PoolHealthTransition, RouteHealthRegistry, RouteHealthState,
+    RouteHealthSummary, SharedRouteHealth,
 };
 pub use runtime::{BotRuntime, ColdPathServices, HotPathPipeline, HotPathReport, RuntimeError};

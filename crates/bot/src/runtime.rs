@@ -17,6 +17,7 @@ use telemetry::{LogLevel, PipelineStage, TelemetryStack};
 use thiserror::Error;
 
 use crate::refresh::AsyncRefreshSnapshot;
+use crate::route_health::{RouteHealthSummary, SharedRouteHealth};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathReport {
@@ -73,15 +74,13 @@ impl PipelineTrace {
             .normalized_at
             .duration_since(event.latency.source_received_at)
             .unwrap_or(Duration::ZERO);
-        let source_latency =
-            (!event.latency.source_latency.is_zero()).then_some(event.latency.source_latency);
         Self {
             source: event.source.source,
             source_sequence: event.source.sequence,
             observed_slot: event.source.observed_slot,
             source_received_at: event.latency.source_received_at,
             normalized_at: event.latency.normalized_at,
-            source_latency,
+            source_latency: event.latency.source_latency,
             ingest_duration,
             queue_wait_duration: Duration::ZERO,
             state_apply_duration: Duration::ZERO,
@@ -215,6 +214,7 @@ pub struct BotRuntime {
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
     jito_tip_lamports: u64,
+    route_health: SharedRouteHealth,
 }
 
 impl BotRuntime {
@@ -225,6 +225,7 @@ impl BotRuntime {
         compute_unit_limit: u32,
         compute_unit_price_micro_lamports: u64,
         jito_tip_lamports: u64,
+        route_health: SharedRouteHealth,
     ) -> Self {
         Self {
             hot_path,
@@ -236,6 +237,7 @@ impl BotRuntime {
             compute_unit_limit,
             compute_unit_price_micro_lamports,
             jito_tip_lamports,
+            route_health,
         }
     }
 
@@ -327,6 +329,19 @@ impl BotRuntime {
         self.tracker.pending_count()
     }
 
+    pub fn route_health_summary(&self) -> RouteHealthSummary {
+        self.route_health
+            .lock()
+            .ok()
+            .map(|health| health.summary(self.latest_slot()))
+            .unwrap_or(RouteHealthSummary {
+                eligible_live_routes: 0,
+                shadow_routes: 0,
+                quarantined_pools: 0,
+                disabled_pools: 0,
+            })
+    }
+
     pub fn execution_record(
         &self,
         submission_id: &submit::SubmissionId,
@@ -339,6 +354,7 @@ impl BotRuntime {
         let transitions = self.reconciler.tick(&mut self.tracker, observed_slot);
         self.telemetry
             .record_stage(PipelineStage::Reconcile, reconcile_started.elapsed());
+        let mut route_health = self.route_health.lock().ok();
         for transition in &transitions {
             if let Some(record) = self.tracker.get(&transition.submission_id) {
                 match &transition.current_outcome {
@@ -351,6 +367,21 @@ impl BotRuntime {
                         .strategy
                         .record_execution_too_little_output(&record.route_id),
                     _ => {}
+                }
+                if let Some(route_health) = route_health.as_mut() {
+                    match &transition.current_outcome {
+                        ExecutionOutcome::Included { .. } => {
+                            route_health.on_execution_success(&record.route_id, observed_slot);
+                        }
+                        ExecutionOutcome::Failed(class) => {
+                            route_health.on_execution_failure(
+                                &record.route_id,
+                                class,
+                                observed_slot,
+                            );
+                        }
+                        ExecutionOutcome::Pending => {}
+                    }
                 }
             }
             self.record_transition_metrics(transition);
@@ -400,7 +431,38 @@ impl BotRuntime {
             .hot_path
             .state
             .pool_snapshots_for(&state_outcome.impacted_pools);
+        if let Ok(mut route_health) = self.route_health.lock() {
+            route_health.on_pool_snapshots(&pool_snapshots, pipeline_trace.observed_slot);
+        }
         if state_outcome.impacted_routes.is_empty() {
+            return Ok(HotPathReport {
+                state_outcome: Some(state_outcome),
+                pool_snapshots,
+                selection: SelectionOutcome {
+                    decisions: Vec::new(),
+                    best_candidate: None,
+                },
+                build_result: None,
+                signed_envelope: None,
+                submit_result: None,
+                execution_record: None,
+                pipeline_trace,
+            });
+        }
+
+        let impacted_routes = self
+            .route_health
+            .lock()
+            .ok()
+            .map(|health| {
+                health.eligible_impacted_routes(
+                    &state_outcome.impacted_routes,
+                    pipeline_trace.observed_slot,
+                )
+            })
+            .unwrap_or_else(|| state_outcome.impacted_routes.clone());
+        if impacted_routes.is_empty() {
+            self.telemetry.metrics.increment_rejection();
             return Ok(HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
@@ -419,7 +481,7 @@ impl BotRuntime {
         let strategy_started = Instant::now();
         let selection = self.hot_path.strategy.evaluate(
             &self.hot_path.state,
-            &state_outcome.impacted_routes,
+            &impacted_routes,
             self.tracker
                 .pending_count()
                 .saturating_add(additional_pending_submissions),
@@ -531,6 +593,15 @@ impl BotRuntime {
             self.submit_mode,
             submit_result.clone(),
         );
+        if let ExecutionOutcome::Failed(class) = &execution_record.outcome {
+            if let Ok(mut route_health) = self.route_health.lock() {
+                route_health.on_execution_failure(
+                    &execution_record.route_id,
+                    class,
+                    execution_record.build_slot,
+                );
+            }
+        }
         self.record_submission_metrics(&execution_record);
         report.submit_result = Some(submit_result);
         report.execution_record = Some(execution_record);
@@ -586,7 +657,7 @@ impl BotRuntime {
 
 #[cfg(test)]
 mod tests {
-    use detection::{AccountUpdate, EventSourceKind, NormalizedEvent};
+    use detection::{EventSourceKind, NormalizedEvent, PoolSnapshotUpdate, SnapshotConfidence};
     use signerd::{SecureSignerService, SecureSignerServiceConfig};
     use solana_sdk::{
         hash::hashv,
@@ -619,16 +690,34 @@ mod tests {
         (keypair.pubkey().to_string(), keypair.to_base58_string())
     }
 
-    fn encode_pool(price_bps: u64, fee_bps: u16, reserve_depth: u64) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&price_bps.to_le_bytes());
-        data.extend_from_slice(&fee_bps.to_le_bytes());
-        data.extend_from_slice(&reserve_depth.to_le_bytes());
-        data
-    }
-
     fn test_pubkey(label: &str) -> String {
         Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
+    }
+
+    fn snapshot_event(sequence: u64, pool_id: &str) -> NormalizedEvent {
+        NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::Synthetic,
+            sequence,
+            sequence + 9,
+            PoolSnapshotUpdate {
+                pool_id: pool_id.into(),
+                price_bps: 12_000,
+                fee_bps: 4,
+                reserve_depth: 100_000,
+                reserve_a: Some(100_000),
+                reserve_b: Some(100_000),
+                active_liquidity: Some(100_000),
+                sqrt_price_x64: None,
+                confidence: SnapshotConfidence::Executable,
+                repair_pending: Some(false),
+                token_mint_a: "SOL".into(),
+                token_mint_b: "USDC".into(),
+                tick_spacing: 0,
+                current_tick_index: None,
+                slot: sequence + 9,
+                write_version: 1,
+            },
+        )
     }
 
     fn route_execution() -> RouteExecutionConfig {
@@ -652,6 +741,7 @@ mod tests {
             output_mint: "USDC".into(),
             base_mint: None,
             quote_mint: None,
+            sol_quote_conversion_pool_id: None,
             min_trade_size: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
@@ -732,6 +822,7 @@ mod tests {
         config.builder.compute_unit_limit = 1;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
         config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
@@ -741,32 +832,8 @@ mod tests {
         config.signing.keypair_base58 = Some(keypair_base58);
         let mut runtime = bootstrap(config).unwrap();
 
-        let first = NormalizedEvent::account_update(
-            EventSourceKind::Synthetic,
-            1,
-            10,
-            AccountUpdate {
-                pubkey: "acct-a".into(),
-                owner: "owner".into(),
-                lamports: 0,
-                data: encode_pool(12_000, 4, 100_000),
-                slot: 10,
-                write_version: 1,
-            },
-        );
-        let second = NormalizedEvent::account_update(
-            EventSourceKind::Synthetic,
-            2,
-            11,
-            AccountUpdate {
-                pubkey: "acct-b".into(),
-                owner: "owner".into(),
-                lamports: 0,
-                data: encode_pool(12_000, 4, 100_000),
-                slot: 11,
-                write_version: 1,
-            },
-        );
+        let first = snapshot_event(1, "pool-a");
+        let second = snapshot_event(2, "pool-b");
 
         let first_report = runtime.process_event(first).unwrap();
         assert!(first_report.submit_result.is_none());
@@ -786,6 +853,7 @@ mod tests {
         config.builder.compute_unit_limit = 1;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
         config.jito.ws_endpoint = "mock://jito-tip-stream".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
@@ -811,32 +879,8 @@ mod tests {
 
         let mut runtime = bootstrap(config).unwrap();
 
-        let first = NormalizedEvent::account_update(
-            EventSourceKind::Synthetic,
-            1,
-            10,
-            AccountUpdate {
-                pubkey: "acct-a".into(),
-                owner: "owner".into(),
-                lamports: 0,
-                data: encode_pool(12_000, 4, 100_000),
-                slot: 10,
-                write_version: 1,
-            },
-        );
-        let second = NormalizedEvent::account_update(
-            EventSourceKind::Synthetic,
-            2,
-            11,
-            AccountUpdate {
-                pubkey: "acct-b".into(),
-                owner: "owner".into(),
-                lamports: 0,
-                data: encode_pool(12_000, 4, 100_000),
-                slot: 11,
-                write_version: 1,
-            },
-        );
+        let first = snapshot_event(1, "pool-a");
+        let second = snapshot_event(2, "pool-b");
 
         let first_report = runtime.process_event(first).unwrap();
         assert!(first_report.submit_result.is_none());

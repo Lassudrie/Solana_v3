@@ -7,7 +7,6 @@ use state::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardrailConfig {
     pub min_profit_quote_atoms: i64,
-    pub max_snapshot_slot_lag: u64,
     pub require_route_warm: bool,
     pub max_inflight_submissions: usize,
     pub min_wallet_balance_lamports: u64,
@@ -18,7 +17,6 @@ impl Default for GuardrailConfig {
     fn default() -> Self {
         Self {
             min_profit_quote_atoms: 1,
-            max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
             min_wallet_balance_lamports: 1,
@@ -37,6 +35,16 @@ impl GuardrailSet {
         Self { config }
     }
 
+    pub fn minimum_acceptable_output(
+        &self,
+        trade_size: u64,
+        estimated_execution_cost_quote_atoms: u64,
+    ) -> u64 {
+        trade_size
+            .saturating_add(estimated_execution_cost_quote_atoms)
+            .saturating_add(self.config.min_profit_quote_atoms.max(0) as u64)
+    }
+
     pub fn evaluate_route_readiness(
         &self,
         route_id: &RouteId,
@@ -49,7 +57,7 @@ impl GuardrailSet {
         Ok(())
     }
 
-    pub fn evaluate_snapshots(&self, snapshots: [&PoolSnapshot; 2]) -> Result<(), RejectionReason> {
+    pub fn evaluate_snapshots(&self, snapshots: &[&PoolSnapshot]) -> Result<(), RejectionReason> {
         for snapshot in snapshots {
             if snapshot.freshness.is_stale {
                 if snapshot.repair_pending {
@@ -62,13 +70,18 @@ impl GuardrailSet {
                     slot_lag: snapshot.freshness.slot_lag,
                 });
             }
-            if !snapshot.is_exact() {
+            if !snapshot.is_executable() {
                 if snapshot.repair_pending {
                     return Err(RejectionReason::PoolRepairPending {
                         pool_id: snapshot.pool_id.clone(),
                     });
                 }
-                return Err(RejectionReason::PoolStateNotExact {
+                return Err(RejectionReason::PoolStateNotExecutable {
+                    pool_id: snapshot.pool_id.clone(),
+                });
+            }
+            if !snapshot.has_executable_quote_model() {
+                return Err(RejectionReason::PoolQuoteModelNotExecutable {
                     pool_id: snapshot.pool_id.clone(),
                 });
             }
@@ -140,7 +153,7 @@ mod tests {
         route_registry::{RouteDefinition, RouteLeg, SwapSide},
     };
 
-    fn exact_snapshot(pool_id: &str, slot_lag: u64) -> PoolSnapshot {
+    fn executable_snapshot(pool_id: &str, slot_lag: u64) -> PoolSnapshot {
         PoolSnapshot {
             pool_id: PoolId(pool_id.into()),
             price_bps: 10_000,
@@ -151,7 +164,7 @@ mod tests {
             active_liquidity: 100_000,
             sqrt_price_x64: None,
             venue: None,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
             liquidity_model: LiquidityModel::ConstantProduct,
             slippage_factor_bps: 100,
@@ -176,6 +189,7 @@ mod tests {
             output_mint: "USDC".into(),
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
+            sol_quote_conversion_pool_id: Some(PoolId("pool-a".into())),
             legs: [
                 RouteLeg {
                     venue: "venue-a".into(),
@@ -202,11 +216,11 @@ mod tests {
     #[test]
     fn rejects_exact_but_stale_snapshot() {
         let guards = GuardrailSet::new(GuardrailConfig::default());
-        let first = exact_snapshot("pool-a", 3);
-        let second = exact_snapshot("pool-b", 0);
+        let first = executable_snapshot("pool-a", 3);
+        let second = executable_snapshot("pool-b", 0);
 
         let rejection = guards
-            .evaluate_snapshots([&first, &second])
+            .evaluate_snapshots(&[&first, &second])
             .expect_err("stale snapshots should be rejected");
 
         assert_eq!(
@@ -214,6 +228,30 @@ mod tests {
             RejectionReason::SnapshotStale {
                 pool_id: PoolId("pool-a".into()),
                 slot_lag: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_concentrated_liquidity_without_executable_quote_model() {
+        let guards = GuardrailSet::new(GuardrailConfig::default());
+        let mut first = executable_snapshot("pool-a", 0);
+        first.liquidity_model = LiquidityModel::ConcentratedLiquidity;
+        first.sqrt_price_x64 = Some(1u128 << 64);
+        first.tick_spacing = 4;
+        first.current_tick_index = Some(12);
+        first.reserve_a = None;
+        first.reserve_b = None;
+        let second = executable_snapshot("pool-b", 0);
+
+        let rejection = guards
+            .evaluate_snapshots([&first, &second].as_slice())
+            .expect_err("clmm quotes should be blocked until tick-aware modeling exists");
+
+        assert_eq!(
+            rejection,
+            RejectionReason::PoolQuoteModelNotExecutable {
+                pool_id: PoolId("pool-a".into()),
             }
         );
     }
@@ -305,5 +343,15 @@ mod tests {
         );
 
         assert_eq!(result, Err(RejectionReason::BlockhashUnavailable));
+    }
+
+    #[test]
+    fn minimum_acceptable_output_includes_positive_profit_floor() {
+        let guardrails = GuardrailSet::new(GuardrailConfig {
+            min_profit_quote_atoms: 25,
+            ..GuardrailConfig::default()
+        });
+
+        assert_eq!(guardrails.minimum_acceptable_output(1_000, 15), 1_040);
     }
 }

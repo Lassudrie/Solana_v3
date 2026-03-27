@@ -3,9 +3,9 @@ use std::{
     io::{Read, Write},
     net::TcpListener,
     sync::{
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
-        Arc, Mutex,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -18,9 +18,11 @@ use state::types::PoolSnapshot;
 use strategy::{opportunity::OpportunityDecision, reasons::RejectionReason};
 use submit::SubmitRejectionReason;
 
+pub use crate::route_health::RouteMonitorView;
 use crate::{
     config::{BotConfig, MonitorServerConfig, RouteClassConfig, RuntimeProfileConfig},
     control::{RuntimeMode, RuntimeStatus},
+    route_health::{PoolHealthState, RouteHealthState, SharedRouteHealth},
     runtime::{HotPathReport, PipelineTrace},
 };
 
@@ -29,6 +31,7 @@ pub struct PoolMonitorView {
     pub pool_id: String,
     pub venues: Vec<String>,
     pub route_ids: Vec<String>,
+    pub health_state: PoolHealthState,
     pub price_bps: u64,
     pub fee_bps: u16,
     pub reserve_depth: u64,
@@ -41,12 +44,17 @@ pub struct PoolMonitorView {
     pub refresh_attempt_count: u64,
     pub refresh_failure_count: u64,
     pub refresh_success_count: u64,
+    pub consecutive_refresh_failures: u32,
     pub last_refresh_latency_ms: Option<u64>,
     pub refresh_deadline_slot_lag: Option<u64>,
     pub repair_pending: bool,
     pub repair_attempt_count: u64,
     pub repair_failure_count: u64,
     pub repair_success_count: u64,
+    pub consecutive_repair_failures: u32,
+    pub quarantined_until_slot: Option<u64>,
+    pub disable_reason: Option<String>,
+    pub last_executable_slot: Option<u64>,
     pub last_repair_latency_ms: Option<u64>,
     pub last_repair_invalidation_ms: Option<u64>,
     pub last_seen_unix_millis: u128,
@@ -55,6 +63,11 @@ pub struct PoolMonitorView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolsResponse {
     pub items: Vec<PoolMonitorView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutesResponse {
+    pub items: Vec<RouteMonitorView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,12 +161,17 @@ pub struct MonitorOverview {
     pub live: bool,
     pub ready: bool,
     pub issue: Option<String>,
+    pub last_error: Option<String>,
     pub kill_switch_active: bool,
     pub latest_slot: u64,
     pub rpc_slot: Option<u64>,
     pub warm_routes: usize,
     pub tradable_routes: usize,
+    pub eligible_live_routes: usize,
+    pub shadow_routes: usize,
     pub total_routes: usize,
+    pub quarantined_pools: usize,
+    pub disabled_pools: usize,
     pub inflight_submissions: usize,
     pub wallet_ready: bool,
     pub wallet_balance_lamports: u64,
@@ -178,6 +196,7 @@ pub struct MonitorOverview {
 pub struct MonitorSnapshot {
     pub overview: MonitorOverview,
     pub pools: PoolsResponse,
+    pub routes: RoutesResponse,
     pub signals: MonitorSignalsResponse,
     pub rejections: RejectionsResponse,
     pub trades: MonitorTradesResponse,
@@ -228,6 +247,7 @@ pub(crate) enum RepairEventKind {
 struct ObserverState {
     config: MonitorServerConfig,
     max_snapshot_slot_lag: u64,
+    route_health: SharedRouteHealth,
     runtime_status: RuntimeStatus,
     pool_metadata: BTreeMap<String, PoolStaticMetadata>,
     repair_stats: BTreeMap<String, PoolRepairStats>,
@@ -246,10 +266,12 @@ impl ObserverState {
         config: MonitorServerConfig,
         pool_metadata: BTreeMap<String, PoolStaticMetadata>,
         max_snapshot_slot_lag: u64,
+        route_health: SharedRouteHealth,
     ) -> Self {
         Self {
             config,
             max_snapshot_slot_lag,
+            route_health,
             runtime_status: RuntimeStatus::default(),
             pool_metadata,
             repair_stats: BTreeMap::new(),
@@ -341,7 +363,7 @@ impl ObserverState {
             repair_stats
                 .invalidated_at_unix_millis
                 .get_or_insert(last_seen_unix_millis);
-        } else if snapshot.is_exact() {
+        } else if snapshot.is_executable() {
             if let Some(invalidated_at) = repair_stats.invalidated_at_unix_millis.take() {
                 repair_stats.last_repair_invalidation_ms = Some(
                     last_seen_unix_millis
@@ -361,6 +383,7 @@ impl ObserverState {
                 route_ids: metadata
                     .map(|entry| entry.route_ids.clone())
                     .unwrap_or_default(),
+                health_state: PoolHealthState::Degraded,
                 price_bps: snapshot.price_bps,
                 fee_bps: snapshot.fee_bps,
                 reserve_depth: snapshot.reserve_depth,
@@ -376,6 +399,7 @@ impl ObserverState {
                 refresh_attempt_count: repair_stats.refresh_attempt_count,
                 refresh_failure_count: repair_stats.refresh_failure_count,
                 refresh_success_count: repair_stats.refresh_success_count,
+                consecutive_refresh_failures: 0,
                 last_refresh_latency_ms: repair_stats.last_refresh_latency_ms,
                 refresh_deadline_slot_lag: repair_stats
                     .refresh_deadline_slot
@@ -384,6 +408,10 @@ impl ObserverState {
                 repair_attempt_count: repair_stats.repair_attempt_count,
                 repair_failure_count: repair_stats.repair_failure_count,
                 repair_success_count: repair_stats.repair_success_count,
+                consecutive_repair_failures: 0,
+                quarantined_until_slot: None,
+                disable_reason: None,
+                last_executable_slot: None,
                 last_repair_latency_ms: repair_stats.last_repair_latency_ms,
                 last_repair_invalidation_ms: repair_stats.last_repair_invalidation_ms,
                 last_seen_unix_millis,
@@ -676,12 +704,17 @@ impl ObserverState {
             live: self.runtime_status.live,
             ready: self.runtime_status.ready,
             issue: self.runtime_status.issue.as_ref().map(issue_label),
+            last_error: self.runtime_status.last_error.clone(),
             kill_switch_active: self.runtime_status.kill_switch_active,
             latest_slot: self.runtime_status.latest_slot,
             rpc_slot: self.runtime_status.rpc_slot,
             warm_routes: self.runtime_status.warm_routes,
             tradable_routes: self.runtime_status.tradable_routes,
+            eligible_live_routes: self.runtime_status.eligible_live_routes,
+            shadow_routes: self.runtime_status.shadow_routes,
             total_routes: self.runtime_status.total_routes,
+            quarantined_pools: self.runtime_status.quarantined_pools,
+            disabled_pools: self.runtime_status.disabled_pools,
             inflight_submissions: self.runtime_status.inflight_submissions,
             wallet_ready: self.runtime_status.wallet_ready,
             wallet_balance_lamports: self.runtime_status.wallet_balance_lamports,
@@ -713,6 +746,9 @@ impl ObserverState {
         limit: Option<usize>,
     ) -> PoolsResponse {
         let mut items = self.pools.values().cloned().collect::<Vec<_>>();
+        for item in &mut items {
+            self.apply_pool_health(item);
+        }
         if let Some(filter) = filter {
             let filter = filter.to_ascii_lowercase();
             items.retain(|item| {
@@ -739,6 +775,42 @@ impl ObserverState {
             items.truncate(limit);
         }
         PoolsResponse { items }
+    }
+
+    fn routes_response(
+        &self,
+        status: Option<&str>,
+        filter: Option<&str>,
+        limit: Option<usize>,
+    ) -> RoutesResponse {
+        let mut items = self
+            .route_health
+            .lock()
+            .ok()
+            .map(|health| health.route_views(self.runtime_status.latest_slot))
+            .unwrap_or_default();
+        if let Some(status) = status {
+            items.retain(|item| route_status_matches(item, status));
+        }
+        if let Some(filter) = filter {
+            let filter = filter.to_ascii_lowercase();
+            items.retain(|item| {
+                item.route_id.to_ascii_lowercase().contains(&filter)
+                    || item
+                        .pool_ids
+                        .iter()
+                        .any(|pool_id| pool_id.to_ascii_lowercase().contains(&filter))
+                    || item
+                        .blocking_reason
+                        .as_ref()
+                        .map(|reason| reason.to_ascii_lowercase().contains(&filter))
+                        .unwrap_or(false)
+            });
+        }
+        if let Some(limit) = limit {
+            items.truncate(limit);
+        }
+        RoutesResponse { items }
     }
 
     fn signals_response(&self, window: &str, limit: Option<usize>) -> MonitorSignalsResponse {
@@ -817,10 +889,27 @@ impl ObserverState {
         MonitorSnapshot {
             overview: self.overview(drop_count),
             pools: self.pools_response(Some("freshness"), None, Some(200)),
+            routes: self.routes_response(Some("all"), None, Some(200)),
             signals: self.signals_response("1m", Some(128)),
             rejections: self.rejections_response(Some("all"), None, Some(200)),
             trades: self.trades_response(Some("all"), None, Some(200)),
         }
+    }
+
+    fn apply_pool_health(&self, item: &mut PoolMonitorView) {
+        let Some(health) =
+            self.route_health.lock().ok().and_then(|health| {
+                health.pool_view(&item.pool_id, self.runtime_status.latest_slot)
+            })
+        else {
+            return;
+        };
+        item.health_state = health.health_state;
+        item.consecutive_refresh_failures = health.consecutive_refresh_failures;
+        item.consecutive_repair_failures = health.consecutive_repair_failures;
+        item.quarantined_until_slot = health.quarantined_until_slot;
+        item.disable_reason = health.disable_reason;
+        item.last_executable_slot = health.last_executable_slot;
     }
 }
 
@@ -865,6 +954,18 @@ impl SharedObserverState {
             .pools_response(sort, filter, limit)
     }
 
+    fn routes(
+        &self,
+        status: Option<&str>,
+        filter: Option<&str>,
+        limit: Option<usize>,
+    ) -> RoutesResponse {
+        self.inner
+            .lock()
+            .expect("observer lock")
+            .routes_response(status, filter, limit)
+    }
+
     fn signals(&self, window: &str, limit: Option<usize>) -> MonitorSignalsResponse {
         self.inner
             .lock()
@@ -904,7 +1005,11 @@ pub struct ObserverHandle {
 }
 
 impl ObserverHandle {
-    pub fn spawn(config: &MonitorServerConfig, bot_config: &BotConfig) -> std::io::Result<Self> {
+    pub fn spawn(
+        config: &MonitorServerConfig,
+        bot_config: &BotConfig,
+        route_health: SharedRouteHealth,
+    ) -> std::io::Result<Self> {
         if !config.enabled {
             return Ok(Self::default());
         }
@@ -915,6 +1020,7 @@ impl ObserverHandle {
                 config.clone(),
                 pool_metadata,
                 bot_config.state.max_snapshot_slot_lag,
+                route_health,
             ))),
             drop_count: Arc::new(AtomicU64::new(0)),
         };
@@ -998,6 +1104,12 @@ fn spawn_http_server(
                     "/monitor/overview" => serde_json::to_vec(&state.overview()).unwrap_or_default(),
                     "/monitor/pools" => serde_json::to_vec(&state.pools(
                         query.get("sort").map(String::as_str),
+                        query.get("filter").map(String::as_str),
+                        parse_usize(query.get("limit")),
+                    ))
+                    .unwrap_or_default(),
+                    "/monitor/routes" => serde_json::to_vec(&state.routes(
+                        query.get("status").map(String::as_str),
                         query.get("filter").map(String::as_str),
                         parse_usize(query.get("limit")),
                     ))
@@ -1166,6 +1278,16 @@ fn status_matches(item: &MonitorTradeEvent, status: Option<&str>) -> bool {
     }
 }
 
+fn route_status_matches(item: &RouteMonitorView, status: &str) -> bool {
+    match status {
+        "all" => true,
+        "eligible" => item.eligible_live,
+        "shadow" => item.health_state == RouteHealthState::ShadowOnly,
+        "blocked" => !item.eligible_live && item.health_state != RouteHealthState::ShadowOnly,
+        other => route_health_label(item.health_state) == other,
+    }
+}
+
 fn split_path_and_query(raw: &str) -> (&str, BTreeMap<String, String>) {
     let Some((path, query)) = raw.split_once('?') else {
         return (raw, BTreeMap::new());
@@ -1247,7 +1369,8 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::MissingSnapshot { .. } => "missing_snapshot",
         RejectionReason::SnapshotStale { .. } => "snapshot_stale",
         RejectionReason::PoolRepairPending { .. } => "pool_repair_pending",
-        RejectionReason::PoolStateNotExact { .. } => "pool_state_not_exact",
+        RejectionReason::PoolStateNotExecutable { .. } => "pool_state_not_executable",
+        RejectionReason::PoolQuoteModelNotExecutable { .. } => "pool_quote_model_not_executable",
         RejectionReason::ReserveUsageTooHigh { .. } => "reserve_usage_too_high",
         RejectionReason::BlockhashUnavailable => "blockhash_unavailable",
         RejectionReason::BlockhashTooStale { .. } => "blockhash_too_stale",
@@ -1272,7 +1395,10 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
             format!("pool_id={}, slot_lag={slot_lag}", pool_id.0)
         }
         RejectionReason::PoolRepairPending { pool_id } => format!("pool_id={}", pool_id.0),
-        RejectionReason::PoolStateNotExact { pool_id } => format!("pool_id={}", pool_id.0),
+        RejectionReason::PoolStateNotExecutable { pool_id } => format!("pool_id={}", pool_id.0),
+        RejectionReason::PoolQuoteModelNotExecutable { pool_id } => {
+            format!("pool_id={}", pool_id.0)
+        }
         RejectionReason::ReserveUsageTooHigh {
             pool_id,
             usage_bps,
@@ -1339,6 +1465,7 @@ fn submit_reason_code(reason: &SubmitRejectionReason) -> &'static str {
         SubmitRejectionReason::RateLimited => "rate_limited",
         SubmitRejectionReason::DuplicateSubmission => "duplicate_submission",
         SubmitRejectionReason::TipTooLow => "tip_too_low",
+        SubmitRejectionReason::PathCongested => "path_congested",
         SubmitRejectionReason::ChannelUnavailable => "channel_unavailable",
         SubmitRejectionReason::RemoteRejected => "remote_rejected",
     }
@@ -1350,9 +1477,22 @@ fn submit_reason_detail(reason: &SubmitRejectionReason) -> String {
 
 fn pool_confidence_label(confidence: state::types::PoolConfidence) -> &'static str {
     match confidence {
-        state::types::PoolConfidence::Exact => "exact",
-        state::types::PoolConfidence::Probable => "probable",
+        state::types::PoolConfidence::Decoded => "decoded",
+        state::types::PoolConfidence::Verified => "verified",
+        state::types::PoolConfidence::Executable => "executable",
         state::types::PoolConfidence::Invalid => "invalid",
+    }
+}
+
+fn route_health_label(state: RouteHealthState) -> &'static str {
+    match state {
+        RouteHealthState::Eligible => "eligible",
+        RouteHealthState::BlockedPoolStale => "blocked_pool_stale",
+        RouteHealthState::BlockedPoolNotExecutable => "blocked_pool_not_executable",
+        RouteHealthState::BlockedPoolRepair => "blocked_pool_repair",
+        RouteHealthState::BlockedPoolQuarantined => "blocked_pool_quarantined",
+        RouteHealthState::BlockedPoolDisabled => "blocked_pool_disabled",
+        RouteHealthState::ShadowOnly => "shadow_only",
     }
 }
 
@@ -1382,8 +1522,8 @@ fn clamp_i128(value: i128) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_reason_code, parse_window, strategy_reason_code, MonitorServerConfig, ObserverState,
-        PoolStaticMetadata, RepairEvent, RepairEventKind,
+        MonitorServerConfig, ObserverState, PoolStaticMetadata, RepairEvent, RepairEventKind,
+        build_reason_code, parse_window, strategy_reason_code,
     };
     use builder::BuildRejectionReason;
     use detection::EventSourceKind;
@@ -1396,7 +1536,11 @@ mod tests {
     use strategy::{opportunity::SelectionOutcome, reasons::RejectionReason};
     use submit::{SubmissionId, SubmitMode, SubmitStatus};
 
-    use crate::runtime::{HotPathReport, PipelineTrace};
+    use crate::{
+        config::LiveSetHealthConfig,
+        route_health::{RouteHealthRegistry, SharedRouteHealth},
+        runtime::{HotPathReport, PipelineTrace},
+    };
 
     fn test_config() -> MonitorServerConfig {
         MonitorServerConfig {
@@ -1407,6 +1551,12 @@ mod tests {
             max_rejections: 2,
             max_trades: 2,
         }
+    }
+
+    fn test_route_health() -> SharedRouteHealth {
+        std::sync::Arc::new(std::sync::Mutex::new(RouteHealthRegistry::new(
+            LiveSetHealthConfig::default(),
+        )))
     }
 
     #[test]
@@ -1447,6 +1597,7 @@ mod tests {
             test_config(),
             BTreeMap::<String, PoolStaticMetadata>::new(),
             2,
+            test_route_health(),
         );
         state.next_seq = 1;
         state.signals.push_back(super::MonitorSignalSample {
@@ -1513,6 +1664,7 @@ mod tests {
             test_config(),
             BTreeMap::<String, PoolStaticMetadata>::new(),
             2,
+            test_route_health(),
         );
         let created_at = UNIX_EPOCH.checked_add(Duration::from_secs(1)).unwrap();
         let record = ExecutionRecord {
@@ -1583,6 +1735,7 @@ mod tests {
             test_config(),
             BTreeMap::<String, PoolStaticMetadata>::new(),
             2,
+            test_route_health(),
         );
 
         state.upsert_pool(state::types::PoolSnapshot {
@@ -1595,7 +1748,7 @@ mod tests {
             active_liquidity: 100_000,
             sqrt_price_x64: None,
             venue: None,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
             liquidity_model: state::types::LiquidityModel::ConstantProduct,
             slippage_factor_bps: 10_000,
@@ -1624,6 +1777,7 @@ mod tests {
             test_config(),
             BTreeMap::<String, PoolStaticMetadata>::new(),
             2,
+            test_route_health(),
         );
 
         state.apply_repair(RepairEvent {
@@ -1678,7 +1832,7 @@ mod tests {
             active_liquidity: 100_000,
             sqrt_price_x64: None,
             venue: None,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
             liquidity_model: state::types::LiquidityModel::ConstantProduct,
             slippage_factor_bps: 10_000,
@@ -1707,6 +1861,7 @@ mod tests {
             test_config(),
             BTreeMap::<String, PoolStaticMetadata>::new(),
             2,
+            test_route_health(),
         );
 
         state.apply_status(crate::control::RuntimeStatus {
@@ -1753,7 +1908,7 @@ mod tests {
             active_liquidity: 100_000,
             sqrt_price_x64: None,
             venue: None,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
             liquidity_model: state::types::LiquidityModel::ConstantProduct,
             slippage_factor_bps: 10_000,

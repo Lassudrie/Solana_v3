@@ -16,8 +16,6 @@ use submit::{
 use crate::config::{BotConfig, SubmitModeConfig};
 use crate::runtime::HotPathReport;
 
-const DEFAULT_SUBMIT_WORKER_COUNT: usize = 4;
-const DEFAULT_SUBMIT_QUEUE_CAPACITY: usize = 256;
 const API_V1_PATH: &str = "/api/v1";
 const TRANSACTION_PATH: &str = "/api/v1/transactions";
 const BUNDLE_PATH: &str = "/api/v1/bundles";
@@ -29,6 +27,9 @@ pub(crate) struct SubmitDispatcher {
     submit_mode: SubmitMode,
     endpoint: String,
     pending_count: Arc<AtomicUsize>,
+    worker_count: usize,
+    queue_capacity: usize,
+    congestion_threshold_count: usize,
 }
 
 #[derive(Debug)]
@@ -43,6 +44,13 @@ pub(crate) struct CompletedSubmission {
     pub submit_duration: Duration,
     pub finished_at: SystemTime,
     pub result: Result<SubmitResult, SubmitError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SubmitDispatcherLoad {
+    pub pending: usize,
+    pub capacity: usize,
+    pub workers: usize,
 }
 
 #[derive(Debug)]
@@ -69,12 +77,31 @@ impl SubmitDispatcher {
             idempotency_cache_size: config.jito.idempotency_cache_size,
         }));
         let endpoint = request_url(&config.jito.endpoint, submit_mode);
+        Self::new(
+            submitter,
+            submit_mode,
+            endpoint,
+            config.submit.worker_count,
+            config.submit.queue_capacity,
+            config.submit.congestion_threshold_pct,
+        )
+    }
+
+    fn new(
+        submitter: Arc<dyn Submitter>,
+        submit_mode: SubmitMode,
+        endpoint: String,
+        worker_count: usize,
+        queue_capacity: usize,
+        congestion_threshold_pct: u8,
+    ) -> Result<Self, std::io::Error> {
+        let worker_count = worker_count.max(1);
         let pending_count = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = mpsc::sync_channel(DEFAULT_SUBMIT_QUEUE_CAPACITY);
+        let (sender, receiver) = mpsc::sync_channel(queue_capacity);
         let (completion_sender, completion_receiver) = mpsc::channel();
         let shared_receiver = Arc::new(Mutex::new(receiver));
 
-        for index in 0..DEFAULT_SUBMIT_WORKER_COUNT {
+        for index in 0..worker_count {
             let submitter = Arc::clone(&submitter);
             let receiver = Arc::clone(&shared_receiver);
             let completion_sender = completion_sender.clone();
@@ -89,11 +116,31 @@ impl SubmitDispatcher {
             submit_mode,
             endpoint,
             pending_count,
+            worker_count,
+            queue_capacity,
+            congestion_threshold_count: congestion_threshold_count(
+                worker_count,
+                queue_capacity,
+                congestion_threshold_pct,
+            ),
         })
     }
 
     pub(crate) fn pending_count(&self) -> usize {
         self.pending_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn load(&self) -> SubmitDispatcherLoad {
+        SubmitDispatcherLoad {
+            pending: self.pending_count(),
+            capacity: self.outstanding_capacity(),
+            workers: self.worker_count,
+        }
+    }
+
+    pub(crate) fn congestion_load(&self) -> Option<SubmitDispatcherLoad> {
+        let load = self.load();
+        (load.pending >= self.congestion_threshold_count).then_some(load)
     }
 
     pub(crate) fn try_enqueue(&self, report: HotPathReport) -> Result<(), EnqueueError> {
@@ -160,6 +207,10 @@ impl SubmitDispatcher {
             rejection: Some(reason),
         }
     }
+
+    fn outstanding_capacity(&self) -> usize {
+        self.queue_capacity.saturating_add(self.worker_count)
+    }
 }
 
 fn submit_worker_loop(
@@ -213,6 +264,21 @@ fn request_url(endpoint: &str, mode: SubmitMode) -> String {
     }
 }
 
+fn congestion_threshold_count(
+    worker_count: usize,
+    queue_capacity: usize,
+    congestion_threshold_pct: u8,
+) -> usize {
+    let capacity = queue_capacity.saturating_add(worker_count).max(1);
+    let pct = usize::from(congestion_threshold_pct.clamp(1, 100));
+    capacity
+        .saturating_mul(pct)
+        .saturating_add(99)
+        .checked_div(100)
+        .unwrap_or(capacity)
+        .max(1)
+}
+
 fn rejection_code(reason: &SubmitRejectionReason) -> &'static str {
     match reason {
         SubmitRejectionReason::InvalidEnvelope => "invalid-envelope",
@@ -222,6 +288,7 @@ fn rejection_code(reason: &SubmitRejectionReason) -> &'static str {
         SubmitRejectionReason::RateLimited => "rate-limited",
         SubmitRejectionReason::DuplicateSubmission => "duplicate-submission",
         SubmitRejectionReason::TipTooLow => "tip-too-low",
+        SubmitRejectionReason::PathCongested => "path-congested",
         SubmitRejectionReason::ChannelUnavailable => "channel-unavailable",
         SubmitRejectionReason::RemoteRejected => "remote-rejected",
     }
@@ -239,15 +306,48 @@ fn signature_component(signature: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::{Duration, Instant, SystemTime},
+    };
 
     use detection::EventSourceKind;
     use state::types::RouteId;
     use strategy::opportunity::SelectionOutcome;
-    use submit::{SubmissionId, SubmitStatus};
+    use submit::{
+        SubmissionId, SubmitError, SubmitMode, SubmitRequest, SubmitResult, SubmitStatus, Submitter,
+    };
 
-    use super::{CompletedSubmission, SubmitDispatcher};
+    use super::{CompletedSubmission, SubmitDispatcher, SubmitDispatcherLoad};
     use crate::runtime::{HotPathReport, PipelineTrace};
+
+    #[derive(Debug)]
+    struct BlockingSubmitter {
+        started: Arc<AtomicUsize>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+
+    impl Submitter for BlockingSubmitter {
+        fn submit(&self, request: SubmitRequest) -> Result<SubmitResult, SubmitError> {
+            self.started.fetch_add(1, Ordering::Relaxed);
+            self.release
+                .lock()
+                .expect("release receiver lock")
+                .recv()
+                .expect("release signal");
+            Ok(SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId(format!("accepted-{}", request.envelope.signature)),
+                endpoint: "mock://jito/api/v1/transactions".into(),
+                rejection: None,
+            })
+        }
+    }
 
     fn report(signature: &str) -> HotPathReport {
         HotPathReport {
@@ -324,5 +424,71 @@ mod tests {
             .expect("completion");
         assert_eq!(dispatcher.pending_count(), 0);
         assert_eq!(result.unwrap().status, SubmitStatus::Accepted);
+    }
+
+    #[test]
+    fn dispatcher_reports_congestion_and_rejects_when_capacity_is_exhausted() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let (release_sender, release_receiver) = mpsc::channel();
+        let dispatcher = SubmitDispatcher::new(
+            Arc::new(BlockingSubmitter {
+                started: Arc::clone(&started),
+                release: Arc::new(Mutex::new(release_receiver)),
+            }),
+            SubmitMode::SingleTransaction,
+            "mock://jito/api/v1/transactions".into(),
+            1,
+            1,
+            100,
+        )
+        .expect("dispatcher");
+
+        dispatcher
+            .try_enqueue(report("sig-1"))
+            .expect("first enqueue");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while started.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(started.load(Ordering::Relaxed), 1);
+
+        dispatcher
+            .try_enqueue(report("sig-2"))
+            .expect("second enqueue");
+
+        assert_eq!(
+            dispatcher.congestion_load(),
+            Some(SubmitDispatcherLoad {
+                pending: 2,
+                capacity: 2,
+                workers: 1,
+            })
+        );
+
+        let rejected = match dispatcher.try_enqueue(report("sig-3")) {
+            Err(super::EnqueueError::Full(report)) => {
+                dispatcher.queue_rejection(&report, submit::SubmitRejectionReason::PathCongested)
+            }
+            other => panic!("expected full queue, got {other:?}"),
+        };
+        assert_eq!(
+            rejected.rejection,
+            Some(submit::SubmitRejectionReason::PathCongested)
+        );
+        assert_eq!(
+            rejected.submission_id,
+            SubmissionId("dispatch-path-congested-sig-3".into())
+        );
+
+        release_sender.send(()).expect("release first");
+        release_sender.send(()).expect("release second");
+
+        dispatcher
+            .wait_for_completion(Duration::from_secs(1))
+            .expect("first completion");
+        dispatcher
+            .wait_for_completion(Duration::from_secs(1))
+            .expect("second completion");
+        assert_eq!(dispatcher.pending_count(), 0);
     }
 }

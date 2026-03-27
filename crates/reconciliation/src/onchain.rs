@@ -219,7 +219,16 @@ impl OnChainReconciler {
                     };
                     match status.status.as_str() {
                         "Pending" => {}
-                        "Landed" => {}
+                        "Landed" => {
+                            if let Some(transition) = tracker.transition(
+                                &record.submission_id,
+                                InclusionStatus::Landed {
+                                    slot: status.landed_slot.unwrap_or(record.build_slot),
+                                },
+                            ) {
+                                transitions.push(transition);
+                            }
+                        }
                         "Failed" | "Invalid" => {
                             if let Some(transition) = tracker.transition(
                                 &record.submission_id,
@@ -536,10 +545,14 @@ impl SignatureWsClient {
             WsSignatureValue::ReceivedSignature(value) if value == "receivedSignature" => {
                 tracker.transition(&submission_id, InclusionStatus::Pending)
             }
-            WsSignatureValue::Processed { err: Some(_) } => {
+            WsSignatureValue::Processed { err: Some(err) } => {
                 self.subscriptions.remove(&params.subscription);
                 self.tracked_submissions.remove(&submission_id);
-                tracker.transition(&submission_id, InclusionStatus::Pending)
+                let (failure_class, failure_detail) = classify_ws_failure(&err);
+                if let Some(detail) = failure_detail {
+                    tracker.set_failure_detail(&submission_id, detail);
+                }
+                tracker.transition(&submission_id, InclusionStatus::Failed(failure_class))
             }
             WsSignatureValue::Processed { err: None } => {
                 self.subscriptions.remove(&params.subscription);
@@ -594,8 +607,7 @@ struct JitoInflightBundleResult {
 struct JitoInflightBundleStatus {
     bundle_id: String,
     status: String,
-    #[serde(rename = "landed_slot")]
-    _landed_slot: Option<u64>,
+    landed_slot: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,6 +647,26 @@ enum WsSignatureValue {
         #[serde(default)]
         err: Option<Value>,
     },
+}
+
+fn classify_ws_failure(err: &Value) -> (FailureClass, Option<ExecutionFailureDetail>) {
+    let custom_code = instruction_error_custom_code(err);
+    let error_name = (custom_code == Some(6_022)).then(|| "TooLittleOutputReceived".to_string());
+    let failure_class = if custom_code == Some(6_022) {
+        FailureClass::ChainExecutionTooLittleOutput
+    } else {
+        FailureClass::ChainExecutionFailed
+    };
+    let detail = ExecutionFailureDetail {
+        instruction_index: instruction_error_index(err),
+        program_id: None,
+        custom_code,
+        error_name,
+    };
+    let has_detail = detail.instruction_index.is_some()
+        || detail.custom_code.is_some()
+        || detail.error_name.is_some();
+    (failure_class, has_detail.then_some(detail))
 }
 
 fn parse_transaction_failure_detail(body: &Value) -> Option<ExecutionFailureDetail> {
@@ -765,5 +797,78 @@ fn bundle_status_url(endpoint: &str) -> String {
         normalized.to_string().trim_end_matches('/').to_owned()
     } else {
         format!("{trimmed}/api/v1")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SignatureWsClient;
+    use crate::{
+        classifier::FailureClass,
+        tracker::{ExecutionTracker, InclusionStatus},
+    };
+    use serde_json::json;
+    use state::types::RouteId;
+    use std::time::Duration;
+    use submit::{SubmissionId, SubmitMode, SubmitResult, SubmitStatus};
+    use tungstenite::Message;
+
+    #[test]
+    fn websocket_processed_error_is_terminal_and_captures_failure_detail() {
+        let mut tracker = ExecutionTracker::default();
+        let record = tracker.register_submission(
+            RouteId("route-a".into()),
+            "chain-sig".into(),
+            10,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-1".into()),
+                endpoint: "mock://jito".into(),
+                rejection: None,
+            },
+        );
+        let mut ws = SignatureWsClient::new("mock://solana-ws", Duration::from_millis(5));
+        ws.subscriptions.insert(7, record.submission_id.clone());
+        ws.tracked_submissions.insert(record.submission_id.clone());
+
+        let transition = ws
+            .handle_message(
+                Message::Text(
+                    json!({
+                        "method": "signatureNotification",
+                        "params": {
+                            "subscription": 7,
+                            "result": {
+                                "context": { "slot": 88 },
+                                "value": {
+                                    "err": { "InstructionError": [2, { "Custom": 6022 }] }
+                                }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ),
+                &mut tracker,
+            )
+            .expect("processed error should transition immediately");
+
+        assert_eq!(
+            transition.current_inclusion_status,
+            InclusionStatus::Failed(FailureClass::ChainExecutionTooLittleOutput)
+        );
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(
+            updated.inclusion_status,
+            InclusionStatus::Failed(FailureClass::ChainExecutionTooLittleOutput)
+        );
+        let detail = updated.failure_detail.as_ref().expect("failure detail");
+        assert_eq!(detail.instruction_index, Some(2));
+        assert_eq!(detail.custom_code, Some(6_022));
+        assert_eq!(
+            detail.error_name.as_deref(),
+            Some("TooLittleOutputReceived")
+        );
     }
 }

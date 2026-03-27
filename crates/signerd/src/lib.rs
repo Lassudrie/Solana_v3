@@ -7,6 +7,7 @@ use std::{
     },
     path::PathBuf,
     sync::Arc,
+    thread,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -45,6 +46,8 @@ pub enum SecureSignerServiceError {
     Io(#[from] std::io::Error),
     #[error("failed to encode signer response: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error("failed to spawn signer client worker: {0}")]
+    Spawn(std::io::Error),
 }
 
 impl SecureSignerService {
@@ -86,49 +89,20 @@ impl SecureSignerService {
 
     pub fn serve_forever(&self) -> Result<(), SecureSignerServiceError> {
         loop {
-            self.serve_one()?;
+            let (stream, _) = self.listener.accept()?;
+            let keypair = Arc::clone(&self.keypair);
+            thread::Builder::new()
+                .name("signerd-client".into())
+                .spawn(move || {
+                    let _ = handle_client(keypair, stream);
+                })
+                .map_err(SecureSignerServiceError::Spawn)?;
         }
     }
 
     pub fn serve_one(&self) -> Result<(), SecureSignerServiceError> {
         let (stream, _) = self.listener.accept()?;
-        self.handle_client(stream)
-    }
-
-    fn handle_client(&self, mut stream: UnixStream) -> Result<(), SecureSignerServiceError> {
-        let mut line = String::new();
-        BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-        let response = match serde_json::from_str::<SignerRequest>(line.trim_end()) {
-            Ok(SignerRequest::GetPublicKey) => SignerResponse::PublicKey {
-                pubkey: self.keypair.pubkey().to_string(),
-            },
-            Ok(SignerRequest::SignMessage { message_base64 }) => {
-                match BASE64_STANDARD.decode(message_base64) {
-                    Ok(message) => match self.keypair.try_sign_message(&message) {
-                        Ok(signature) => SignerResponse::Signature {
-                            signature: signature.to_string(),
-                        },
-                        Err(error) => SignerResponse::Error {
-                            code: "sign_failed".into(),
-                            message: error.to_string(),
-                        },
-                    },
-                    Err(error) => SignerResponse::Error {
-                        code: "invalid_message".into(),
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Err(error) => SignerResponse::Error {
-                code: "invalid_request".into(),
-                message: error.to_string(),
-            },
-        };
-
-        serde_json::to_writer(&mut stream, &response)?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-        Ok(())
+        handle_client(Arc::clone(&self.keypair), stream)
     }
 }
 
@@ -178,5 +152,44 @@ fn prepare_socket_path(socket_path: &PathBuf) -> Result<(), SecureSignerServiceE
         }
     }
 
+    Ok(())
+}
+
+fn handle_client(
+    keypair: Arc<Keypair>,
+    mut stream: UnixStream,
+) -> Result<(), SecureSignerServiceError> {
+    let mut line = String::new();
+    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+    let response = match serde_json::from_str::<SignerRequest>(line.trim_end()) {
+        Ok(SignerRequest::GetPublicKey) => SignerResponse::PublicKey {
+            pubkey: keypair.pubkey().to_string(),
+        },
+        Ok(SignerRequest::SignMessage { message_base64 }) => {
+            match BASE64_STANDARD.decode(message_base64) {
+                Ok(message) => match keypair.try_sign_message(&message) {
+                    Ok(signature) => SignerResponse::Signature {
+                        signature: signature.to_string(),
+                    },
+                    Err(error) => SignerResponse::Error {
+                        code: "sign_failed".into(),
+                        message: error.to_string(),
+                    },
+                },
+                Err(error) => SignerResponse::Error {
+                    code: "invalid_message".into(),
+                    message: error.to_string(),
+                },
+            }
+        }
+        Err(error) => SignerResponse::Error {
+            code: "invalid_request".into(),
+            message: error.to_string(),
+        },
+    };
+
+    serde_json::to_writer(&mut stream, &response)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
     Ok(())
 }

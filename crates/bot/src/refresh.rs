@@ -40,12 +40,19 @@ pub struct WalletRefresh {
     pub slot: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshFailure {
+    pub worker: &'static str,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AsyncRefreshSnapshot {
     pub blockhash: Option<BlockhashRefresh>,
     pub slot: Option<SlotRefresh>,
     pub lookup_tables: Option<LookupTablesRefresh>,
     pub wallet: Option<WalletRefresh>,
+    pub failures: Vec<RefreshFailure>,
 }
 
 enum RefreshUpdate {
@@ -53,6 +60,7 @@ enum RefreshUpdate {
     Slot(SlotRefresh),
     LookupTables(LookupTablesRefresh),
     Wallet(WalletRefresh),
+    Failure(RefreshFailure),
 }
 
 pub struct AsyncStateRefresher {
@@ -79,6 +87,7 @@ impl AsyncStateRefresher {
             spawn_refresher(
                 sender.clone(),
                 Duration::from_millis(config.blockhash_refresh_millis),
+                "blockhash",
                 RpcRefreshClient::new(rpc_http_endpoint),
                 |client| client.latest_blockhash_update(),
             );
@@ -88,6 +97,7 @@ impl AsyncStateRefresher {
             spawn_refresher(
                 sender.clone(),
                 Duration::from_millis(config.slot_refresh_millis),
+                "slot",
                 RpcRefreshClient::new(rpc_http_endpoint),
                 |client| client.latest_slot_update(),
             );
@@ -98,6 +108,7 @@ impl AsyncStateRefresher {
             spawn_refresher(
                 sender.clone(),
                 Duration::from_millis(config.alt_refresh_millis),
+                "lookup_tables",
                 RpcRefreshClient::new(rpc_http_endpoint),
                 move |client| client.lookup_tables_update(&lookup_table_keys),
             );
@@ -108,6 +119,7 @@ impl AsyncStateRefresher {
             spawn_refresher(
                 sender,
                 Duration::from_millis(config.wallet_refresh_millis),
+                "wallet",
                 RpcRefreshClient::new(rpc_http_endpoint),
                 move |client| client.wallet_balance_update(&wallet_pubkey),
             );
@@ -131,6 +143,7 @@ impl AsyncStateRefresher {
                     snapshot.lookup_tables = Some(lookup_tables);
                 }
                 RefreshUpdate::Wallet(wallet) => snapshot.wallet = Some(wallet),
+                RefreshUpdate::Failure(failure) => snapshot.failures.push(failure),
             }
         }
         snapshot
@@ -155,30 +168,30 @@ impl RpcRefreshClient {
         }
     }
 
-    fn latest_blockhash_update(&self) -> Option<RefreshUpdate> {
+    fn latest_blockhash_update(&self) -> Result<RefreshUpdate, String> {
         let body = self.rpc::<LatestBlockhashEnvelope>(
             "getLatestBlockhash",
             json!([{
                 "commitment": "processed"
             }]),
         )?;
-        Some(RefreshUpdate::Blockhash(BlockhashRefresh {
+        Ok(RefreshUpdate::Blockhash(BlockhashRefresh {
             blockhash: body.result.value.blockhash,
             slot: body.result.context.slot,
         }))
     }
 
-    fn latest_slot_update(&self) -> Option<RefreshUpdate> {
+    fn latest_slot_update(&self) -> Result<RefreshUpdate, String> {
         let body = self.rpc::<SlotEnvelope>(
             "getSlot",
             json!([{
                 "commitment": "processed"
             }]),
         )?;
-        Some(RefreshUpdate::Slot(SlotRefresh { slot: body.result }))
+        Ok(RefreshUpdate::Slot(SlotRefresh { slot: body.result }))
     }
 
-    fn lookup_tables_update(&self, lookup_table_keys: &[String]) -> Option<RefreshUpdate> {
+    fn lookup_tables_update(&self, lookup_table_keys: &[String]) -> Result<RefreshUpdate, String> {
         let body = self.rpc::<MultipleAccountsEnvelope>(
             "getMultipleAccounts",
             json!([
@@ -195,13 +208,13 @@ impl RpcRefreshClient {
             .zip(body.result.value)
             .filter_map(|(account_key, account)| decode_lookup_table(account_key, account, slot))
             .collect();
-        Some(RefreshUpdate::LookupTables(LookupTablesRefresh {
+        Ok(RefreshUpdate::LookupTables(LookupTablesRefresh {
             tables,
             slot,
         }))
     }
 
-    fn wallet_balance_update(&self, wallet_pubkey: &str) -> Option<RefreshUpdate> {
+    fn wallet_balance_update(&self, wallet_pubkey: &str) -> Result<RefreshUpdate, String> {
         let body = self.rpc::<BalanceEnvelope>(
             "getBalance",
             json!([
@@ -209,7 +222,7 @@ impl RpcRefreshClient {
                 { "commitment": "processed" }
             ]),
         )?;
-        Some(RefreshUpdate::Wallet(WalletRefresh {
+        Ok(RefreshUpdate::Wallet(WalletRefresh {
             balance_lamports: body.result.value,
             ready: true,
             slot: body.result.context.slot,
@@ -220,8 +233,9 @@ impl RpcRefreshClient {
         &self,
         method: &str,
         params: serde_json::Value,
-    ) -> Option<T> {
-        self.http
+    ) -> Result<T, String> {
+        let response = self
+            .http
             .post(&self.endpoint)
             .json(&json!({
                 "jsonrpc": JSON_RPC_VERSION,
@@ -230,24 +244,39 @@ impl RpcRefreshClient {
                 "params": params,
             }))
             .send()
-            .ok()?
+            .map_err(|error| format!("{method} request failed: {error}"))?;
+        response
             .json::<T>()
-            .ok()
+            .map_err(|error| format!("{method} response decode failed: {error}"))
     }
 }
 
 fn spawn_refresher<F>(
     sender: mpsc::Sender<RefreshUpdate>,
     interval: Duration,
+    worker: &'static str,
     client: RpcRefreshClient,
     mut fetch: F,
 ) where
-    F: FnMut(&RpcRefreshClient) -> Option<RefreshUpdate> + Send + 'static,
+    F: FnMut(&RpcRefreshClient) -> Result<RefreshUpdate, String> + Send + 'static,
 {
     thread::spawn(move || {
         loop {
-            if let Some(update) = fetch(&client) {
-                let _ = sender.send(update);
+            match fetch(&client) {
+                Ok(update) => {
+                    if sender.send(update).is_err() {
+                        break;
+                    }
+                }
+                Err(detail) => {
+                    eprintln!("async refresh {worker} failed: {detail}");
+                    if sender
+                        .send(RefreshUpdate::Failure(RefreshFailure { worker, detail }))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
             thread::sleep(interval);
         }
@@ -335,7 +364,9 @@ fn decode_lookup_table(
 mod tests {
     use std::sync::mpsc;
 
-    use super::{AsyncRefreshSnapshot, AsyncStateRefresher, RefreshUpdate, SlotRefresh};
+    use super::{
+        AsyncRefreshSnapshot, AsyncStateRefresher, RefreshFailure, RefreshUpdate, SlotRefresh,
+    };
 
     #[test]
     fn drain_snapshot_keeps_latest_slot_refresh() {
@@ -356,7 +387,29 @@ mod tests {
                 slot: Some(SlotRefresh { slot: 42 }),
                 lookup_tables: None,
                 wallet: None,
+                failures: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn drain_snapshot_collects_refresh_failures() {
+        let (sender, receiver) = mpsc::channel();
+        let refresher = AsyncStateRefresher { receiver };
+
+        sender
+            .send(RefreshUpdate::Failure(RefreshFailure {
+                worker: "slot",
+                detail: "getSlot request failed".into(),
+            }))
+            .unwrap();
+
+        assert_eq!(
+            refresher.drain_snapshot().failures,
+            vec![RefreshFailure {
+                worker: "slot",
+                detail: "getSlot request failed".into(),
+            }]
         );
     }
 }

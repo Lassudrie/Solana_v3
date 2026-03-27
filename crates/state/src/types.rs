@@ -84,9 +84,20 @@ impl PoolVenue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolConfidence {
-    Exact,
-    Probable,
+    Decoded,
+    Verified,
+    Executable,
     Invalid,
+}
+
+impl PoolConfidence {
+    pub fn is_verified(self) -> bool {
+        matches!(self, Self::Verified | Self::Executable)
+    }
+
+    pub fn is_executable(self) -> bool {
+        self == Self::Executable
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,7 +199,7 @@ impl ExecutablePoolState {
                 state.confidence = confidence;
                 state.last_update_slot = last_update_slot;
                 state.write_version = write_version;
-                state.repair_pending = confidence != PoolConfidence::Exact;
+                state.repair_pending = !confidence.is_executable();
                 if let Some(slot) = last_verified_slot {
                     state.last_verified_slot = slot;
                 }
@@ -197,7 +208,7 @@ impl ExecutablePoolState {
                 state.confidence = confidence;
                 state.last_update_slot = last_update_slot;
                 state.write_version = write_version;
-                state.repair_pending = confidence != PoolConfidence::Exact;
+                state.repair_pending = !confidence.is_executable();
                 if let Some(slot) = last_verified_slot {
                     state.last_verified_slot = slot;
                 }
@@ -273,14 +284,67 @@ impl ExecutablePoolState {
     }
 }
 
-fn sqrt_price_x64_to_price_bps(sqrt_price_x64: u128) -> u64 {
-    let sqrt_ratio = (sqrt_price_x64 as f64) / 18_446_744_073_709_551_616.0;
-    let price = sqrt_ratio * sqrt_ratio;
-    let scaled = (price * 10_000.0).round();
-    if !scaled.is_finite() || scaled <= 0.0 {
-        return 0;
+pub fn sqrt_price_x64_to_price_bps(sqrt_price_x64: u128) -> u64 {
+    let square = mul_u128_to_u256(sqrt_price_x64, sqrt_price_x64);
+    let (mut scaled, overflow_mul) = mul_u256_by_u64(square, 10_000);
+    let overflow_round = add_u64_to_u256(&mut scaled, 1, 1u64 << 63);
+    if overflow_mul || overflow_round || scaled[3] != 0 {
+        return u64::MAX;
     }
-    scaled.min(u64::MAX as f64) as u64
+    scaled[2]
+}
+
+fn mul_u128_to_u256(left: u128, right: u128) -> [u64; 4] {
+    let left_lo = left as u64;
+    let left_hi = (left >> 64) as u64;
+    let right_lo = right as u64;
+    let right_hi = (right >> 64) as u64;
+    let mut product = [0u64; 4];
+
+    add_u128_to_u256(&mut product, 0, u128::from(left_lo) * u128::from(right_lo));
+    add_u128_to_u256(&mut product, 1, u128::from(left_lo) * u128::from(right_hi));
+    add_u128_to_u256(&mut product, 1, u128::from(left_hi) * u128::from(right_lo));
+    add_u128_to_u256(&mut product, 2, u128::from(left_hi) * u128::from(right_hi));
+
+    product
+}
+
+fn mul_u256_by_u64(value: [u64; 4], multiplier: u64) -> ([u64; 4], bool) {
+    let mut out = [0u64; 4];
+    let mut carry = 0u128;
+
+    for (index, limb) in value.into_iter().enumerate() {
+        let product = u128::from(limb) * u128::from(multiplier) + carry;
+        out[index] = product as u64;
+        carry = product >> 64;
+    }
+
+    (out, carry != 0)
+}
+
+fn add_u128_to_u256(target: &mut [u64; 4], offset: usize, value: u128) {
+    add_u64_to_u256(target, offset, value as u64);
+    let _ = add_u64_to_u256(target, offset + 1, (value >> 64) as u64);
+}
+
+fn add_u64_to_u256(target: &mut [u64; 4], offset: usize, value: u64) -> bool {
+    if value == 0 {
+        return false;
+    }
+
+    let mut index = offset;
+    let mut carry = value;
+    while index < target.len() {
+        let (sum, overflow) = target[index].overflowing_add(carry);
+        target[index] = sum;
+        if !overflow {
+            return false;
+        }
+        carry = 1;
+        index += 1;
+    }
+
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,8 +376,16 @@ impl PoolSnapshot {
         self.active_liquidity.max(self.reserve_depth).max(1)
     }
 
-    pub fn is_exact(&self) -> bool {
-        self.confidence == PoolConfidence::Exact && !self.repair_pending
+    pub fn is_verified(&self) -> bool {
+        self.confidence.is_verified()
+    }
+
+    pub fn is_executable(&self) -> bool {
+        self.confidence.is_executable() && !self.repair_pending
+    }
+
+    pub fn has_executable_quote_model(&self) -> bool {
+        self.liquidity_model == LiquidityModel::ConstantProduct
     }
 
     pub fn constant_product_reserves_for(
@@ -421,7 +493,7 @@ pub struct StateApplyOutcome {
 mod tests {
     use super::{
         ConstantProductPoolState, ExecutablePoolState, FreshnessState, LiquidityModel,
-        PoolConfidence, PoolId, PoolSnapshot, PoolVenue,
+        PoolConfidence, PoolId, PoolSnapshot, PoolVenue, sqrt_price_x64_to_price_bps,
     };
     use std::time::SystemTime;
 
@@ -436,7 +508,7 @@ mod tests {
             active_liquidity: 100_000,
             sqrt_price_x64: Some(1u128 << 64),
             venue: Some(PoolVenue::OrcaSimplePool),
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
             liquidity_model,
             slippage_factor_bps: PoolSnapshot::default_slippage_factor_bps(
@@ -479,7 +551,7 @@ mod tests {
             last_update_slot: 9,
             write_version: 3,
             last_verified_slot: 9,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
         });
 
@@ -487,5 +559,13 @@ mod tests {
         assert_eq!(snapshot.pool_id, PoolId("pool-a".into()));
         assert_eq!(snapshot.price_bps, 5_000);
         assert_eq!(snapshot.reserve_depth, 1_000_000);
+    }
+
+    #[test]
+    fn sqrt_price_conversion_uses_fixed_point_arithmetic() {
+        assert_eq!(sqrt_price_x64_to_price_bps(0), 0);
+        assert_eq!(sqrt_price_x64_to_price_bps(1u128 << 63), 2_500);
+        assert_eq!(sqrt_price_x64_to_price_bps(1u128 << 64), 10_000);
+        assert_eq!(sqrt_price_x64_to_price_bps((3u128 << 63) / 1), 22_500);
     }
 }

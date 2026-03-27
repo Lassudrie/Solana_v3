@@ -7,4 +7,5 @@ license.workspace = true
 [dependencies]
 bs58.workspace = true
 detection = { path = "../detection" }
+solana-sdk.workspace = true
 thiserror.workspace = true

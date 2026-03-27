@@ -2,15 +2,16 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     str::FromStr,
     sync::{
+        Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError},
-        Arc, Mutex, RwLock,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use detection::events::SnapshotConfidence;
 use detection::{
     EventSourceKind, IngestError, MarketEventSource, NormalizedEvent, PoolInvalidation,
     PoolSnapshotUpdate,
@@ -21,8 +22,8 @@ use serde::Deserialize;
 use serde_json::json;
 use solana_entry_legacy::entry::Entry as LegacyEntry;
 use solana_message_legacy::{
-    compiled_instruction::CompiledInstruction, v0, AccountKeys,
-    VersionedMessage as LegacyVersionedMessage,
+    AccountKeys, VersionedMessage as LegacyVersionedMessage,
+    compiled_instruction::CompiledInstruction, v0,
 };
 use solana_pubkey_legacy::Pubkey as LegacyPubkey;
 use solana_sdk::hash::hashv;
@@ -40,6 +41,7 @@ use crate::config::{
     BotConfig, ReducerRolloutMode, RouteClassConfig, RouteLegExecutionConfig, RuntimeProfileConfig,
 };
 use crate::observer::{ObserverHandle, RepairEvent, RepairEventKind};
+use crate::route_health::{PoolHealthTransition, SharedRouteHealth};
 
 #[allow(dead_code)]
 pub mod shared {
@@ -63,6 +65,10 @@ const ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME: &str = "two_hop_swap_v2";
 const RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME: &str = "swap_v2";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const CLMM_REFRESH_GRACE_SLOTS: u64 = 8;
+const ORCA_WHIRLPOOL_ACCOUNT_NAME: &str = "Whirlpool";
+const RAYDIUM_CLMM_ACCOUNT_NAME: &str = "PoolState";
+const ORCA_WHIRLPOOL_ACCOUNT_MIN_LEN: usize = 245;
+const RAYDIUM_CLMM_ACCOUNT_MIN_LEN: usize = 273;
 
 #[derive(Debug)]
 pub struct GrpcEntriesEventSource {
@@ -70,7 +76,11 @@ pub struct GrpcEntriesEventSource {
 }
 
 impl GrpcEntriesEventSource {
-    pub fn spawn(config: &BotConfig, observer: ObserverHandle) -> Result<Self, String> {
+    pub fn spawn(
+        config: &BotConfig,
+        observer: ObserverHandle,
+        route_health: SharedRouteHealth,
+    ) -> Result<Self, String> {
         Endpoint::from_shared(config.shredstream.grpc_endpoint.clone())
             .map_err(|error| error.to_string())?;
 
@@ -95,6 +105,7 @@ impl GrpcEntriesEventSource {
             event_tx.clone(),
             Arc::clone(&sequence),
             observer.clone(),
+            route_health.clone(),
         );
 
         for pool_id in registry.pool_ids() {
@@ -102,6 +113,7 @@ impl GrpcEntriesEventSource {
                 pool_id,
                 mode: SyncRequestMode::RepairAfterInvalidation,
                 priority: RepairPriority::Immediate,
+                observed_slot: 0,
             });
         }
 
@@ -115,6 +127,7 @@ impl GrpcEntriesEventSource {
             repair_tx,
             sequence,
             observer,
+            route_health,
         );
 
         Ok(Self { receiver: event_rx })
@@ -584,6 +597,7 @@ struct RepairRequest {
     pool_id: String,
     mode: SyncRequestMode,
     priority: RepairPriority,
+    observed_slot: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,6 +617,7 @@ struct RepairJob {
     pool_id: String,
     attempt: u32,
     mode: SyncRequestMode,
+    observed_slot: u64,
 }
 
 #[derive(Debug)]
@@ -619,10 +634,12 @@ enum RepairJobResult {
         pool_id: String,
         mode: SyncRequestMode,
         attempt: u32,
+        observed_slot: u64,
     },
     Dropped {
         pool_id: String,
         mode: SyncRequestMode,
+        observed_slot: u64,
     },
 }
 
@@ -631,6 +648,8 @@ struct PoolSyncState {
     refresh_pending: bool,
     refresh_in_flight: bool,
     refresh_deadline_slot: Option<u64>,
+    repair_pending: bool,
+    repair_in_flight: bool,
 }
 
 #[derive(Debug, Default)]
@@ -688,6 +707,53 @@ impl PoolSyncTracker {
         self.pools
             .get(pool_id)
             .map(|entry| entry.refresh_pending)
+            .unwrap_or(false)
+    }
+
+    fn repair_requested(&mut self, pool_id: &str) -> bool {
+        let entry = self.pools.entry(pool_id.to_string()).or_default();
+        if entry.repair_pending || entry.repair_in_flight {
+            return false;
+        }
+        entry.repair_pending = true;
+        true
+    }
+
+    fn mark_repair_started(&mut self, pool_id: &str) {
+        let entry = self.pools.entry(pool_id.to_string()).or_default();
+        entry.repair_pending = true;
+        entry.repair_in_flight = true;
+    }
+
+    fn mark_repair_failed(&mut self, pool_id: &str) {
+        if let Some(entry) = self.pools.get_mut(pool_id) {
+            entry.repair_pending = true;
+            entry.repair_in_flight = false;
+        }
+    }
+
+    fn clear_repair(&mut self, pool_id: &str) -> bool {
+        let Some(entry) = self.pools.get_mut(pool_id) else {
+            return false;
+        };
+        let was_pending = entry.repair_pending || entry.repair_in_flight;
+        entry.repair_pending = false;
+        entry.repair_in_flight = false;
+        let remove = !entry.refresh_pending
+            && !entry.refresh_in_flight
+            && !entry.repair_pending
+            && !entry.repair_in_flight;
+        let _ = entry;
+        if remove {
+            self.pools.remove(pool_id);
+        }
+        was_pending
+    }
+
+    fn repair_required(&self, pool_id: &str) -> bool {
+        self.pools
+            .get(pool_id)
+            .map(|entry| entry.repair_pending || entry.repair_in_flight)
             .unwrap_or(false)
     }
 
@@ -787,6 +853,7 @@ fn spawn_stream_worker(
     repair_tx: mpsc::Sender<RepairRequest>,
     sequence: Arc<AtomicU64>,
     observer: ObserverHandle,
+    route_health: SharedRouteHealth,
 ) {
     let grpc_endpoint = config.shredstream.grpc_endpoint.clone();
     let connect_timeout = Duration::from_millis(config.shredstream.grpc_connect_timeout_ms.max(1));
@@ -859,6 +926,7 @@ fn spawn_stream_worker(
                         &repair_tx,
                         &sequence,
                         &observer,
+                        &route_health,
                     );
                 }
 
@@ -882,6 +950,7 @@ fn handle_entry_batch(
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     observer: &ObserverHandle,
+    route_health: &SharedRouteHealth,
 ) {
     let Ok(entries) = bincode::deserialize::<Vec<LegacyEntry>>(payload) else {
         return;
@@ -902,6 +971,7 @@ fn handle_entry_batch(
         repair_tx,
         sequence,
         observer,
+        route_health,
         source_received_at,
         source_latency,
         &mut invalidated_pools,
@@ -946,6 +1016,7 @@ fn handle_entry_batch(
                             sync_tracker,
                             repair_tx,
                             observer,
+                            route_health,
                         ),
                         None => invalidate_and_repair(
                             &tracked_pool,
@@ -958,6 +1029,7 @@ fn handle_entry_batch(
                             repair_tx,
                             sequence,
                             observer,
+                            route_health,
                             &mut invalidated_pools,
                         ),
                     },
@@ -974,6 +1046,7 @@ fn handle_entry_batch(
                             repair_tx,
                             sequence,
                             observer,
+                            route_health,
                             &mut invalidated_pools,
                         );
                     }
@@ -988,6 +1061,7 @@ fn handle_entry_batch(
                         repair_tx,
                         sequence,
                         observer,
+                        route_health,
                         &mut invalidated_pools,
                     ),
                 }
@@ -998,7 +1072,14 @@ fn handle_entry_batch(
                     continue;
                 }
                 if tracked_pool.uses_hybrid_refresh() {
-                    schedule_exact_refresh(&tracked_pool, slot, sync_tracker, repair_tx, observer);
+                    schedule_exact_refresh(
+                        &tracked_pool,
+                        slot,
+                        sync_tracker,
+                        repair_tx,
+                        observer,
+                        route_health,
+                    );
                     continue;
                 }
                 invalidate_and_repair(
@@ -1012,6 +1093,7 @@ fn handle_entry_batch(
                     repair_tx,
                     sequence,
                     observer,
+                    route_health,
                     &mut invalidated_pools,
                 );
             }
@@ -1126,7 +1208,7 @@ fn apply_mutation_shadow(
         ReductionStatus::Probable => {
             if let Some(state) = store.get_mut(&pool_id) {
                 let next_write_version = state.write_version().saturating_add(1);
-                state.set_confidence(PoolConfidence::Probable, slot, next_write_version, None);
+                state.set_confidence(PoolConfidence::Verified, slot, next_write_version, None);
             }
             ReductionStatus::Probable
         }
@@ -1301,7 +1383,7 @@ fn reduce_constant_product_swap(
     }
     next.last_update_slot = slot;
     next.write_version = next.write_version.saturating_add(1);
-    next.confidence = PoolConfidence::Exact;
+    next.confidence = PoolConfidence::Executable;
     next.repair_pending = false;
 
     Some(match venue {
@@ -1341,7 +1423,7 @@ fn reduce_constant_product_swap_exact_out(
     }
     next.last_update_slot = slot;
     next.write_version = next.write_version.saturating_add(1);
-    next.confidence = PoolConfidence::Exact;
+    next.confidence = PoolConfidence::Executable;
     next.repair_pending = false;
 
     Some(match venue {
@@ -1439,9 +1521,26 @@ fn invalidate_and_repair(
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     observer: &ObserverHandle,
+    route_health: &SharedRouteHealth,
     invalidated_pools: &mut HashSet<String>,
 ) {
     if !invalidated_pools.insert(tracked_pool.pool_id.clone()) {
+        return;
+    }
+    if route_health
+        .lock()
+        .ok()
+        .map(|health| health.pool_is_blocked_from_repair(&tracked_pool.pool_id, slot))
+        .unwrap_or(false)
+    {
+        return;
+    }
+    let repair_requested = sync_tracker
+        .lock()
+        .ok()
+        .map(|mut tracker| tracker.repair_requested(&tracked_pool.pool_id))
+        .unwrap_or(false);
+    if !repair_requested {
         return;
     }
 
@@ -1451,6 +1550,13 @@ fn invalidate_and_repair(
             kind: RepairEventKind::RefreshCleared,
             occurred_at: source_received_at,
         });
+        if let Ok(mut health) = route_health.lock() {
+            health.on_repair_transition(
+                &tracked_pool.pool_id,
+                PoolHealthTransition::RefreshCleared,
+                slot,
+            );
+        }
     }
 
     if let Ok(mut store) = executable_states.write() {
@@ -1476,7 +1582,15 @@ fn invalidate_and_repair(
         pool_id: tracked_pool.pool_id.clone(),
         mode: SyncRequestMode::RepairAfterInvalidation,
         priority: RepairPriority::Immediate,
+        observed_slot: slot,
     });
+    if let Ok(mut health) = route_health.lock() {
+        health.on_repair_transition(
+            &tracked_pool.pool_id,
+            PoolHealthTransition::RepairQueued,
+            slot,
+        );
+    }
 }
 
 fn schedule_exact_refresh(
@@ -1485,6 +1599,7 @@ fn schedule_exact_refresh(
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     observer: &ObserverHandle,
+    route_health: &SharedRouteHealth,
 ) {
     let (deadline_slot, should_enqueue) = match sync_tracker.lock() {
         Ok(mut tracker) => tracker.schedule_refresh(&tracked_pool.pool_id, slot),
@@ -1495,11 +1610,19 @@ fn schedule_exact_refresh(
         kind: RepairEventKind::RefreshScheduled { deadline_slot },
         occurred_at: SystemTime::now(),
     });
+    if let Ok(mut health) = route_health.lock() {
+        health.on_repair_transition(
+            &tracked_pool.pool_id,
+            PoolHealthTransition::RefreshScheduled,
+            slot,
+        );
+    }
     if should_enqueue {
         let _ = repair_tx.send(RepairRequest {
             pool_id: tracked_pool.pool_id.clone(),
             mode: SyncRequestMode::RefreshExact,
             priority: RepairPriority::Immediate,
+            observed_slot: slot,
         });
     }
 }
@@ -1513,6 +1636,7 @@ fn expire_exact_refreshes(
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     observer: &ObserverHandle,
+    route_health: &SharedRouteHealth,
     source_received_at: SystemTime,
     source_latency: Option<Duration>,
     invalidated_pools: &mut HashSet<String>,
@@ -1528,6 +1652,9 @@ fn expire_exact_refreshes(
             kind: RepairEventKind::RefreshCleared,
             occurred_at: source_received_at,
         });
+        if let Ok(mut health) = route_health.lock() {
+            health.on_repair_transition(&pool_id, PoolHealthTransition::RefreshCleared, slot);
+        }
         let Some(tracked_pool) = registry.tracked_pool(&pool_id) else {
             continue;
         };
@@ -1542,6 +1669,7 @@ fn expire_exact_refreshes(
             repair_tx,
             sequence,
             observer,
+            route_health,
             invalidated_pools,
         );
     }
@@ -1595,7 +1723,7 @@ fn publish_pool_snapshot_update(
             reserve_b: snapshot.reserve_b,
             active_liquidity: Some(snapshot.active_liquidity),
             sqrt_price_x64: snapshot.sqrt_price_x64,
-            exact: Some(snapshot.is_exact()),
+            confidence: snapshot_confidence(snapshot.confidence),
             repair_pending: Some(snapshot.repair_pending),
             token_mint_a: snapshot.token_mint_a,
             token_mint_b: snapshot.token_mint_b,
@@ -1648,17 +1776,19 @@ fn spawn_lookup_table_refresher(
 
     let endpoint = config.reconciliation.rpc_http_endpoint.clone();
     let interval = Duration::from_millis(config.runtime.refresh.alt_refresh_millis);
-    thread::spawn(move || loop {
-        if let Some(tables) = fetch_lookup_tables(&endpoint, &lookup_table_keys) {
-            let next = tables
-                .into_iter()
-                .map(|table| (table.account_key.clone(), table))
-                .collect::<HashMap<_, _>>();
-            if let Ok(mut guard) = lookup_cache.write() {
-                *guard = next;
+    thread::spawn(move || {
+        loop {
+            if let Some(tables) = fetch_lookup_tables(&endpoint, &lookup_table_keys) {
+                let next = tables
+                    .into_iter()
+                    .map(|table| (table.account_key.clone(), table))
+                    .collect::<HashMap<_, _>>();
+                if let Ok(mut guard) = lookup_cache.write() {
+                    *guard = next;
+                }
             }
+            thread::sleep(interval);
         }
-        thread::sleep(interval);
     });
 }
 
@@ -1670,6 +1800,7 @@ fn spawn_repair_worker(
     event_tx: SyncSender<NormalizedEvent>,
     sequence: Arc<AtomicU64>,
     observer: ObserverHandle,
+    route_health: SharedRouteHealth,
 ) -> mpsc::Sender<RepairRequest> {
     let (repair_tx, repair_rx) = mpsc::channel::<RepairRequest>();
     let rpc_endpoint = config.reconciliation.rpc_http_endpoint.clone();
@@ -1704,6 +1835,7 @@ fn spawn_repair_worker(
                     let _ = result_tx.send(RepairJobResult::Dropped {
                         pool_id: job.pool_id,
                         mode: job.mode,
+                        observed_slot: job.observed_slot,
                     });
                     continue;
                 };
@@ -1717,6 +1849,7 @@ fn spawn_repair_worker(
                         pool_id: job.pool_id,
                         mode: job.mode,
                         attempt: job.attempt,
+                        observed_slot: job.observed_slot,
                     });
                     continue;
                 };
@@ -1731,6 +1864,7 @@ fn spawn_repair_worker(
                         pool_id: job.pool_id,
                         mode: job.mode,
                         attempt: job.attempt,
+                        observed_slot: job.observed_slot,
                     });
                     continue;
                 };
@@ -1750,7 +1884,7 @@ fn spawn_repair_worker(
 
     thread::spawn(move || {
         let mut pending = VecDeque::new();
-        let mut pending_modes = HashMap::<String, SyncRequestMode>::new();
+        let mut pending_modes = HashMap::<String, RepairRequest>::new();
         let mut in_flight = HashMap::<String, SyncRequestMode>::new();
         let mut attempts = HashMap::<(String, SyncRequestMode), u32>::new();
 
@@ -1762,6 +1896,7 @@ fn spawn_repair_worker(
                 &event_tx,
                 &sequence,
                 &observer,
+                &route_health,
                 &retry_tx,
                 &mut in_flight,
                 &mut attempts,
@@ -1771,6 +1906,7 @@ fn spawn_repair_worker(
                 &executable_states,
                 &sync_tracker,
                 &observer,
+                &route_health,
                 &mut pending,
                 &mut pending_modes,
                 &mut in_flight,
@@ -1783,6 +1919,7 @@ fn spawn_repair_worker(
                         request,
                         &executable_states,
                         &sync_tracker,
+                        &route_health,
                         &mut pending,
                         &mut pending_modes,
                         &in_flight,
@@ -1792,6 +1929,7 @@ fn spawn_repair_worker(
                             next,
                             &executable_states,
                             &sync_tracker,
+                            &route_health,
                             &mut pending,
                             &mut pending_modes,
                             &in_flight,
@@ -1807,6 +1945,7 @@ fn spawn_repair_worker(
                         &event_tx,
                         &sequence,
                         &observer,
+                        &route_health,
                         &retry_tx,
                         &mut in_flight,
                         &mut attempts,
@@ -1826,23 +1965,30 @@ fn enqueue_repair_request(
     request: RepairRequest,
     executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
+    route_health: &SharedRouteHealth,
     pending: &mut VecDeque<String>,
-    pending_modes: &mut HashMap<String, SyncRequestMode>,
+    pending_modes: &mut HashMap<String, RepairRequest>,
     in_flight: &HashMap<String, SyncRequestMode>,
 ) {
-    if !request_still_needed(&request, executable_states, sync_tracker) {
+    if !request_still_needed(&request, executable_states, sync_tracker, route_health) {
+        if request.mode == SyncRequestMode::RepairAfterInvalidation {
+            if let Ok(mut tracker) = sync_tracker.lock() {
+                tracker.clear_repair(&request.pool_id);
+            }
+        }
         return;
     }
     if in_flight.contains_key(&request.pool_id) {
         return;
     }
 
-    if let Some(existing_mode) = pending_modes.get_mut(&request.pool_id) {
-        if *existing_mode == SyncRequestMode::RefreshExact
+    if let Some(existing) = pending_modes.get_mut(&request.pool_id) {
+        if existing.mode == SyncRequestMode::RefreshExact
             && request.mode == SyncRequestMode::RepairAfterInvalidation
         {
-            *existing_mode = SyncRequestMode::RepairAfterInvalidation;
+            existing.mode = SyncRequestMode::RepairAfterInvalidation;
         }
+        existing.observed_slot = existing.observed_slot.max(request.observed_slot);
         if request.priority == RepairPriority::Immediate {
             promote_pending_repair(&request.pool_id, pending);
         }
@@ -1853,7 +1999,7 @@ fn enqueue_repair_request(
         RepairPriority::Immediate => pending.push_front(request.pool_id.clone()),
         RepairPriority::Retry => pending.push_back(request.pool_id.clone()),
     }
-    pending_modes.insert(request.pool_id, request.mode);
+    pending_modes.insert(request.pool_id.clone(), request);
 }
 
 fn promote_pending_repair(pool_id: &str, pending: &mut VecDeque<String>) {
@@ -1869,8 +2015,9 @@ fn dispatch_repair_jobs(
     executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
     observer: &ObserverHandle,
+    route_health: &SharedRouteHealth,
     pending: &mut VecDeque<String>,
-    pending_modes: &mut HashMap<String, SyncRequestMode>,
+    pending_modes: &mut HashMap<String, RepairRequest>,
     in_flight: &mut HashMap<String, SyncRequestMode>,
     attempts: &mut HashMap<(String, SyncRequestMode), u32>,
 ) {
@@ -1878,45 +2025,58 @@ fn dispatch_repair_jobs(
         let Some(pool_id) = pending.pop_front() else {
             break;
         };
-        let Some(mode) = pending_modes.remove(&pool_id) else {
+        let Some(request) = pending_modes.remove(&pool_id) else {
             continue;
         };
-        let request = RepairRequest {
-            pool_id: pool_id.clone(),
-            mode,
-            priority: RepairPriority::Immediate,
-        };
-        if !request_still_needed(&request, executable_states, sync_tracker) {
-            attempts.remove(&(pool_id.clone(), mode));
+        if !request_still_needed(&request, executable_states, sync_tracker, route_health) {
+            if request.mode == SyncRequestMode::RepairAfterInvalidation {
+                if let Ok(mut tracker) = sync_tracker.lock() {
+                    tracker.clear_repair(&pool_id);
+                }
+            }
+            attempts.remove(&(pool_id.clone(), request.mode));
             continue;
         }
 
         let attempt = attempts
-            .get(&(pool_id.clone(), mode))
+            .get(&(pool_id.clone(), request.mode))
             .copied()
             .unwrap_or(0)
             .saturating_add(1);
-        attempts.insert((pool_id.clone(), mode), attempt);
-        in_flight.insert(pool_id.clone(), mode);
+        attempts.insert((pool_id.clone(), request.mode), attempt);
+        in_flight.insert(pool_id.clone(), request.mode);
         observer.publish_repair(RepairEvent {
             pool_id: pool_id.clone(),
-            kind: match mode {
+            kind: match request.mode {
                 SyncRequestMode::RefreshExact => RepairEventKind::RefreshAttemptStarted,
                 SyncRequestMode::RepairAfterInvalidation => RepairEventKind::RepairAttemptStarted,
             },
             occurred_at: SystemTime::now(),
         });
-        if mode == SyncRequestMode::RefreshExact {
+        if let Ok(mut health) = route_health.lock() {
+            health.on_repair_transition(
+                &pool_id,
+                match request.mode {
+                    SyncRequestMode::RefreshExact => PoolHealthTransition::RefreshStarted,
+                    SyncRequestMode::RepairAfterInvalidation => PoolHealthTransition::RepairStarted,
+                },
+                request.observed_slot,
+            );
+        }
+        if request.mode == SyncRequestMode::RefreshExact {
             if let Ok(mut tracker) = sync_tracker.lock() {
                 tracker.mark_refresh_started(&pool_id);
             }
+        } else if let Ok(mut tracker) = sync_tracker.lock() {
+            tracker.mark_repair_started(&pool_id);
         }
 
         if job_tx
             .send(RepairJob {
                 pool_id,
                 attempt,
-                mode,
+                mode: request.mode,
+                observed_slot: request.observed_slot,
             })
             .is_err()
         {
@@ -1932,6 +2092,7 @@ fn drain_repair_results(
     event_tx: &SyncSender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
     observer: &ObserverHandle,
+    route_health: &SharedRouteHealth,
     retry_tx: &mpsc::Sender<RepairRequest>,
     in_flight: &mut HashMap<String, SyncRequestMode>,
     attempts: &mut HashMap<(String, SyncRequestMode), u32>,
@@ -1963,6 +2124,8 @@ fn drain_repair_results(
                 }
                 if mode == SyncRequestMode::RefreshExact {
                     clear_exact_refresh(sync_tracker, &pool_id);
+                } else if let Ok(mut tracker) = sync_tracker.lock() {
+                    tracker.clear_repair(&pool_id);
                 }
                 attempts.remove(&(pool_id.clone(), mode));
                 observer.publish_repair(RepairEvent {
@@ -1979,17 +2142,32 @@ fn drain_repair_results(
                     },
                     occurred_at: SystemTime::now(),
                 });
+                if let Ok(mut health) = route_health.lock() {
+                    health.on_repair_transition(
+                        next_state.pool_id().0.as_str(),
+                        match mode {
+                            SyncRequestMode::RefreshExact => PoolHealthTransition::RefreshSucceeded,
+                            SyncRequestMode::RepairAfterInvalidation => {
+                                PoolHealthTransition::RepairSucceeded
+                            }
+                        },
+                        slot,
+                    );
+                }
             }
             RepairJobResult::Retry {
                 pool_id,
                 mode,
                 attempt,
+                observed_slot,
             } => {
                 in_flight.remove(&pool_id);
                 if mode == SyncRequestMode::RefreshExact {
                     if let Ok(mut tracker) = sync_tracker.lock() {
                         tracker.mark_refresh_failed(&pool_id);
                     }
+                } else if let Ok(mut tracker) = sync_tracker.lock() {
+                    tracker.mark_repair_failed(&pool_id);
                 }
                 observer.publish_repair(RepairEvent {
                     pool_id: pool_id.clone(),
@@ -2001,6 +2179,18 @@ fn drain_repair_results(
                     },
                     occurred_at: SystemTime::now(),
                 });
+                if let Ok(mut health) = route_health.lock() {
+                    health.on_repair_transition(
+                        &pool_id,
+                        match mode {
+                            SyncRequestMode::RefreshExact => PoolHealthTransition::RefreshFailed,
+                            SyncRequestMode::RepairAfterInvalidation => {
+                                PoolHealthTransition::RepairFailed
+                            }
+                        },
+                        observed_slot,
+                    );
+                }
                 let retry_tx = retry_tx.clone();
                 thread::spawn(move || {
                     thread::sleep(repair_backoff(attempt));
@@ -2008,15 +2198,34 @@ fn drain_repair_results(
                         pool_id,
                         mode,
                         priority: RepairPriority::Retry,
+                        observed_slot,
                     });
                 });
             }
-            RepairJobResult::Dropped { pool_id, mode } => {
+            RepairJobResult::Dropped {
+                pool_id,
+                mode,
+                observed_slot,
+            } => {
                 in_flight.remove(&pool_id);
                 if mode == SyncRequestMode::RefreshExact {
                     clear_exact_refresh(sync_tracker, &pool_id);
+                } else if let Ok(mut tracker) = sync_tracker.lock() {
+                    tracker.clear_repair(&pool_id);
                 }
-                attempts.remove(&(pool_id, mode));
+                attempts.remove(&(pool_id.clone(), mode));
+                if let Ok(mut health) = route_health.lock() {
+                    health.on_repair_transition(
+                        &pool_id,
+                        match mode {
+                            SyncRequestMode::RefreshExact => PoolHealthTransition::RefreshCleared,
+                            SyncRequestMode::RepairAfterInvalidation => {
+                                PoolHealthTransition::RepairFailed
+                            }
+                        },
+                        observed_slot,
+                    );
+                }
             }
         }
     }
@@ -2026,7 +2235,16 @@ fn request_still_needed(
     request: &RepairRequest,
     executable_states: &Arc<RwLock<ExecutablePoolStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
+    route_health: &SharedRouteHealth,
 ) -> bool {
+    if route_health
+        .lock()
+        .ok()
+        .map(|health| health.pool_is_blocked_from_repair(&request.pool_id, request.observed_slot))
+        .unwrap_or(false)
+    {
+        return false;
+    }
     match request.mode {
         SyncRequestMode::RefreshExact => sync_tracker
             .lock()
@@ -2034,7 +2252,12 @@ fn request_still_needed(
             .map(|tracker| tracker.refresh_required(&request.pool_id))
             .unwrap_or(false),
         SyncRequestMode::RepairAfterInvalidation => {
-            pool_requires_repair(&request.pool_id, executable_states)
+            sync_tracker
+                .lock()
+                .ok()
+                .map(|tracker| tracker.repair_required(&request.pool_id))
+                .unwrap_or(false)
+                && pool_requires_repair(&request.pool_id, executable_states)
         }
     }
 }
@@ -2044,7 +2267,8 @@ fn repair_backoff(attempt: u32) -> Duration {
         0 | 1 => Duration::from_millis(100),
         2 => Duration::from_millis(250),
         3 => Duration::from_millis(500),
-        _ => Duration::from_millis(1_000),
+        4 => Duration::from_millis(1_000),
+        _ => Duration::from_millis(2_000),
     }
 }
 
@@ -2062,10 +2286,10 @@ fn pool_requires_repair(
     match state {
         ExecutablePoolState::OrcaSimplePool(state)
         | ExecutablePoolState::RaydiumSimplePool(state) => {
-            state.confidence != PoolConfidence::Exact || state.repair_pending
+            !state.confidence.is_executable() || state.repair_pending
         }
         ExecutablePoolState::OrcaWhirlpool(state) | ExecutablePoolState::RaydiumClmm(state) => {
-            state.confidence != PoolConfidence::Exact || state.repair_pending
+            !state.confidence.is_executable() || state.repair_pending
         }
     }
 }
@@ -2104,7 +2328,7 @@ fn build_executable_state_from_accounts(
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Exact,
+                    confidence: PoolConfidence::Executable,
                     repair_pending: false,
                 },
             ))
@@ -2126,13 +2350,23 @@ fn build_executable_state_from_accounts(
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Exact,
+                    confidence: PoolConfidence::Executable,
                     repair_pending: false,
                 },
             ))
         }
         TrackedPoolKind::OrcaWhirlpool(config) => {
-            let raw = decode_base64_account(accounts.get(&config.whirlpool)?)?;
+            let account = accounts.get(&config.whirlpool)?;
+            let raw = decode_base64_account(account)?;
+            if !is_anchor_account_value(
+                account,
+                &raw,
+                &config.program_id,
+                ORCA_WHIRLPOOL_ACCOUNT_NAME,
+                ORCA_WHIRLPOOL_ACCOUNT_MIN_LEN,
+            ) {
+                return None;
+            }
             let liquidity = read_u128(&raw, 49)?;
             let sqrt_price_x64 = read_u128(&raw, 65)?;
             let current_tick_index = read_i32(&raw, 81)?;
@@ -2158,13 +2392,23 @@ fn build_executable_state_from_accounts(
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Exact,
+                    confidence: PoolConfidence::Verified,
                     repair_pending: false,
                 },
             ))
         }
         TrackedPoolKind::RaydiumClmm(config) => {
-            let raw = decode_base64_account(accounts.get(&config.pool_state)?)?;
+            let account = accounts.get(&config.pool_state)?;
+            let raw = decode_base64_account(account)?;
+            if !is_anchor_account_value(
+                account,
+                &raw,
+                &config.program_id,
+                RAYDIUM_CLMM_ACCOUNT_NAME,
+                RAYDIUM_CLMM_ACCOUNT_MIN_LEN,
+            ) {
+                return None;
+            }
             let liquidity = read_u128(&raw, 237)?;
             let sqrt_price_x64 = read_u128(&raw, 253)?;
             let current_tick_index = read_i32(&raw, 269)?;
@@ -2187,7 +2431,7 @@ fn build_executable_state_from_accounts(
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Exact,
+                    confidence: PoolConfidence::Verified,
                     repair_pending: false,
                 },
             ))
@@ -2299,6 +2543,18 @@ fn decode_base64_account(account: &RpcAccountValue) -> Option<Vec<u8>> {
     BASE64_STANDARD.decode(account.data.0.as_bytes()).ok()
 }
 
+fn is_anchor_account_value(
+    account: &RpcAccountValue,
+    raw: &[u8],
+    expected_owner: &str,
+    account_name: &str,
+    min_len: usize,
+) -> bool {
+    account.owner == expected_owner
+        && raw.len() >= min_len
+        && raw.starts_with(&anchor_account_discriminator(account_name))
+}
+
 fn token_account_amount(account: &RpcAccountValue) -> Option<u64> {
     let raw = decode_base64_account(account)?;
     read_u64(&raw, 64)
@@ -2321,7 +2577,7 @@ fn event_with_timing(
         latency: detection::LatencyMetadata {
             source_received_at,
             normalized_at: SystemTime::now(),
-            source_latency: source_latency.unwrap_or(Duration::ZERO),
+            source_latency,
         },
     }
 }
@@ -2344,8 +2600,25 @@ fn instruction_has_anchor_discriminator(instruction: &ResolvedInstruction, name:
         .starts_with(&anchor_instruction_discriminator(name))
 }
 
+fn snapshot_confidence(confidence: PoolConfidence) -> SnapshotConfidence {
+    match confidence {
+        PoolConfidence::Decoded => SnapshotConfidence::Decoded,
+        PoolConfidence::Verified => SnapshotConfidence::Verified,
+        PoolConfidence::Executable => SnapshotConfidence::Executable,
+        PoolConfidence::Invalid => SnapshotConfidence::Decoded,
+    }
+}
+
 fn anchor_instruction_discriminator(name: &str) -> [u8; 8] {
     let preimage = format!("global:{name}");
+    let hash = hashv(&[preimage.as_bytes()]);
+    hash.to_bytes()[..8]
+        .try_into()
+        .expect("anchor discriminator should be 8 bytes")
+}
+
+fn anchor_account_discriminator(name: &str) -> [u8; 8] {
+    let preimage = format!("account:{name}");
     let hash = hashv(&[preimage.as_bytes()]);
     hash.to_bytes()[..8]
         .try_into()
@@ -2428,7 +2701,7 @@ mod tests {
         time::{Duration, UNIX_EPOCH},
     };
 
-    use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use prost_types::Timestamp;
     use state::{
         executable_pool_state::ExecutablePoolStateStore,
@@ -2436,16 +2709,17 @@ mod tests {
     };
 
     use super::{
+        CompiledInstruction, LegacyVersionedMessage, LegacyVersionedTransaction,
+        ORCA_SWAP_INSTRUCTION_TAG, ORCA_SWAP_V2_DISCRIMINATOR_NAME,
+        ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME, ORCA_WHIRLPOOL_ACCOUNT_NAME,
+        OrcaSimpleTrackedConfig, OrcaWhirlpoolTrackedConfig, PoolMutation, PoolSyncTracker,
+        RAYDIUM_CLMM_ACCOUNT_NAME, RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME, RAYDIUM_SWAP_BASE_OUT_TAG,
+        RaydiumClmmTrackedConfig, RaydiumSimpleTrackedConfig, ResolvedInstruction, RpcAccountValue,
+        TrackedPool, TrackedPoolKind, TrackedPoolRegistry, anchor_account_discriminator,
         anchor_instruction_discriminator, associated_token_address,
         build_executable_state_from_accounts, constant_product_amount_in_for_output,
         constant_product_amount_out, parse_legacy_pubkey, reduce_orca_simple_swap,
         reduce_raydium_simple_swap, resolve_transaction, timestamp_to_system_time,
-        CompiledInstruction, LegacyVersionedMessage, LegacyVersionedTransaction,
-        OrcaSimpleTrackedConfig, OrcaWhirlpoolTrackedConfig, PoolMutation, PoolSyncTracker,
-        RaydiumClmmTrackedConfig, RaydiumSimpleTrackedConfig, ResolvedInstruction, RpcAccountValue,
-        TrackedPool, TrackedPoolKind, TrackedPoolRegistry, ORCA_SWAP_INSTRUCTION_TAG,
-        ORCA_SWAP_V2_DISCRIMINATOR_NAME, ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME,
-        RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME, RAYDIUM_SWAP_BASE_OUT_TAG,
     };
     use crate::config::{BotConfig, ReducerRolloutMode, RouteLegExecutionConfig};
 
@@ -2465,10 +2739,10 @@ mod tests {
         data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn rpc_account(raw: Vec<u8>) -> RpcAccountValue {
+    fn rpc_account_with_owner(raw: Vec<u8>, owner: &str) -> RpcAccountValue {
         RpcAccountValue {
             data: (BASE64_STANDARD.encode(raw), "base64".into()),
-            owner: "owner".into(),
+            owner: owner.into(),
             lamports: 0,
         }
     }
@@ -2581,10 +2855,12 @@ mod tests {
                 "JVoPtWWDsRcLvQosu5fWc2CaNF6jEtJzbxdPtcEuvZo".to_string(),
             ])
         );
-        assert!(registry
-            .pools_by_id
-            .values()
-            .all(|tracked| tracked.reducer_mode == ReducerRolloutMode::Active));
+        assert!(
+            registry
+                .pools_by_id
+                .values()
+                .all(|tracked| tracked.reducer_mode == ReducerRolloutMode::Active)
+        );
         assert_eq!(
             registry.lookup_table_keys,
             vec![
@@ -2612,7 +2888,7 @@ mod tests {
             last_update_slot: 10,
             write_version: 2,
             last_verified_slot: 10,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
         };
 
@@ -2640,7 +2916,7 @@ mod tests {
             last_update_slot: 10,
             write_version: 2,
             last_verified_slot: 10,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
         };
         let owner = parse_legacy_pubkey("11111111111111111111111111111112").unwrap();
@@ -2693,7 +2969,7 @@ mod tests {
             last_update_slot: 10,
             write_version: 2,
             last_verified_slot: 10,
-            confidence: PoolConfidence::Exact,
+            confidence: PoolConfidence::Executable,
             repair_pending: false,
         };
         let owner = parse_legacy_pubkey("11111111111111111111111111111112").unwrap();
@@ -3147,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_builds_orca_whirlpool_as_exact_snapshot() {
+    fn repair_builds_orca_whirlpool_as_verified_state() {
         let tracked_pool = TrackedPool {
             pool_id: "pool-orca".into(),
             reducer_mode: ReducerRolloutMode::Active,
@@ -3164,11 +3440,15 @@ mod tests {
             }),
         };
         let mut raw = vec![0u8; 245];
+        raw[..8].copy_from_slice(&anchor_account_discriminator(ORCA_WHIRLPOOL_ACCOUNT_NAME));
         write_u16(&mut raw, 45, 400);
         write_u128(&mut raw, 49, 500_000);
         write_u128(&mut raw, 65, 1u128 << 64);
         write_i32(&mut raw, 81, 12);
-        let accounts = HashMap::from([("whirlpool".into(), rpc_account(raw))]);
+        let accounts = HashMap::from([(
+            "whirlpool".into(),
+            rpc_account_with_owner(raw, "orca-program"),
+        )]);
         let states = Arc::new(RwLock::new(ExecutablePoolStateStore::default()));
 
         let next = build_executable_state_from_accounts(&tracked_pool, &accounts, 77, &states)
@@ -3177,13 +3457,13 @@ mod tests {
         let state::types::ExecutablePoolState::OrcaWhirlpool(state) = next else {
             panic!("expected whirlpool state");
         };
-        assert_eq!(state.confidence, PoolConfidence::Exact);
+        assert_eq!(state.confidence, PoolConfidence::Verified);
         assert!(!state.repair_pending);
         assert_eq!(state.last_verified_slot, 77);
     }
 
     #[test]
-    fn repair_builds_raydium_clmm_as_exact_snapshot() {
+    fn repair_builds_raydium_clmm_as_verified_state() {
         let tracked_pool = TrackedPool {
             pool_id: "pool-ray".into(),
             reducer_mode: ReducerRolloutMode::Active,
@@ -3200,10 +3480,14 @@ mod tests {
             }),
         };
         let mut raw = vec![0u8; 273];
+        raw[..8].copy_from_slice(&anchor_account_discriminator(RAYDIUM_CLMM_ACCOUNT_NAME));
         write_u128(&mut raw, 237, 750_000);
         write_u128(&mut raw, 253, 1u128 << 64);
         write_i32(&mut raw, 269, -8);
-        let accounts = HashMap::from([("pool-state".into(), rpc_account(raw))]);
+        let accounts = HashMap::from([(
+            "pool-state".into(),
+            rpc_account_with_owner(raw, "raydium-program"),
+        )]);
         let states = Arc::new(RwLock::new(ExecutablePoolStateStore::default()));
 
         let next = build_executable_state_from_accounts(&tracked_pool, &accounts, 88, &states)
@@ -3212,7 +3496,7 @@ mod tests {
         let state::types::ExecutablePoolState::RaydiumClmm(state) = next else {
             panic!("expected raydium clmm state");
         };
-        assert_eq!(state.confidence, PoolConfidence::Exact);
+        assert_eq!(state.confidence, PoolConfidence::Verified);
         assert!(!state.repair_pending);
         assert_eq!(state.last_verified_slot, 88);
     }

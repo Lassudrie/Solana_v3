@@ -16,7 +16,10 @@ pub enum RejectionReason {
     PoolRepairPending {
         pool_id: PoolId,
     },
-    PoolStateNotExact {
+    PoolStateNotExecutable {
+        pool_id: PoolId,
+    },
+    PoolQuoteModelNotExecutable {
         pool_id: PoolId,
     },
     ReserveUsageTooHigh {

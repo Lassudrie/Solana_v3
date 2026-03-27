@@ -7,8 +7,10 @@ pub mod pool_snapshots;
 pub mod types;
 pub mod warmup;
 
+use std::collections::HashSet;
 use std::time::SystemTime;
 
+use detection::events::SnapshotConfidence;
 use detection::{
     AccountUpdate, MarketEvent, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
 };
@@ -64,11 +66,19 @@ impl StatePlane {
     }
 
     pub fn register_route(&mut self, route_id: crate::types::RouteId, required_pools: Vec<PoolId>) {
-        for pool_id in &required_pools {
+        let mut deduped_pools = Vec::with_capacity(required_pools.len());
+        let mut seen = HashSet::with_capacity(required_pools.len());
+        for pool_id in required_pools {
+            if seen.insert(pool_id.clone()) {
+                deduped_pools.push(pool_id);
+            }
+        }
+
+        for pool_id in &deduped_pools {
             self.dependency_graph
                 .register_pool_route(pool_id.clone(), route_id.clone());
         }
-        self.warmup.register_route(route_id, required_pools);
+        self.warmup.register_route(route_id, deduped_pools);
     }
 
     pub fn register_account_dependency(
@@ -146,7 +156,11 @@ impl StatePlane {
             && pool_ids.iter().all(|pool_id| {
                 self.pool_snapshots
                     .get(pool_id)
-                    .map(|snapshot| snapshot.is_exact() && !snapshot.freshness.is_stale)
+                    .map(|snapshot| {
+                        snapshot.is_executable()
+                            && snapshot.has_executable_quote_model()
+                            && !snapshot.freshness.is_stale
+                    })
                     .unwrap_or(false)
             })
     }
@@ -250,10 +264,10 @@ impl StatePlane {
             active_liquidity: update.active_liquidity.unwrap_or(update.reserve_depth),
             sqrt_price_x64: update.sqrt_price_x64,
             venue: None,
-            confidence: if update.exact.unwrap_or(true) {
-                PoolConfidence::Exact
-            } else {
-                PoolConfidence::Probable
+            confidence: match update.confidence {
+                SnapshotConfidence::Decoded => PoolConfidence::Decoded,
+                SnapshotConfidence::Verified => PoolConfidence::Verified,
+                SnapshotConfidence::Executable => PoolConfidence::Executable,
             },
             repair_pending: update.repair_pending.unwrap_or(false),
             liquidity_model: LiquidityModel::from_market_hints(
@@ -330,6 +344,7 @@ impl StatePlane {
 
 #[cfg(test)]
 mod tests {
+    use detection::events::SnapshotConfidence;
     use detection::{
         AccountUpdate, EventSourceKind, NormalizedEvent, PoolInvalidation, PoolSnapshotUpdate,
     };
@@ -424,7 +439,7 @@ mod tests {
                 reserve_b: None,
                 active_liquidity: Some(77_000),
                 sqrt_price_x64: None,
-                exact: None,
+                confidence: SnapshotConfidence::Decoded,
                 repair_pending: None,
                 token_mint_a: "mint-a".into(),
                 token_mint_b: "mint-b".into(),
@@ -440,6 +455,49 @@ mod tests {
         assert_eq!(outcome.impacted_pools, vec![pool_id.clone()]);
         assert_eq!(outcome.latest_slot, 55);
         assert_eq!(plane.pool_snapshot(&pool_id).unwrap().price_bps, 10_250);
+    }
+
+    #[test]
+    fn conversion_pool_updates_mark_route_impacted() {
+        let route_id = RouteId("route-usdt-usdc".into());
+        let pool_a = PoolId("pool-usdt-usdc-a".into());
+        let pool_b = PoolId("pool-usdt-usdc-b".into());
+        let conversion_pool = PoolId("pool-sol-usdc".into());
+        let mut plane = StatePlane::new(2);
+        plane.register_route(
+            route_id.clone(),
+            vec![pool_a, pool_b, conversion_pool.clone()],
+        );
+
+        let outcome = plane
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                1,
+                55,
+                PoolSnapshotUpdate {
+                    pool_id: conversion_pool.0.clone(),
+                    price_bps: 1_500_000,
+                    fee_bps: 4,
+                    reserve_depth: 77_000,
+                    reserve_a: Some(77_000),
+                    reserve_b: Some(77_000),
+                    active_liquidity: Some(77_000),
+                    sqrt_price_x64: None,
+                    confidence: SnapshotConfidence::Decoded,
+                    repair_pending: Some(false),
+                    token_mint_a: "So11111111111111111111111111111111111111112".into(),
+                    token_mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot: 55,
+                    write_version: 1,
+                },
+            ))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.impacted_pools, vec![conversion_pool]);
+        assert_eq!(outcome.impacted_routes, vec![route_id]);
     }
 
     #[test]
@@ -459,7 +517,7 @@ mod tests {
                 reserve_b: None,
                 active_liquidity: Some(1_000),
                 sqrt_price_x64: None,
-                exact: None,
+                confidence: SnapshotConfidence::Decoded,
                 repair_pending: None,
                 token_mint_a: "mint-a".into(),
                 token_mint_b: "mint-b".into(),
@@ -507,7 +565,7 @@ mod tests {
                         reserve_b: Some(1_000),
                         active_liquidity: Some(1_000),
                         sqrt_price_x64: None,
-                        exact: Some(true),
+                        confidence: SnapshotConfidence::Executable,
                         repair_pending: Some(false),
                         token_mint_a: "mint-a".into(),
                         token_mint_b: "mint-b".into(),
@@ -531,6 +589,68 @@ mod tests {
                     slot: 13,
                     leader: None,
                 }),
+            ))
+            .unwrap();
+
+        assert_eq!(plane.tradable_route_count(), 0);
+    }
+
+    #[test]
+    fn tradable_route_count_excludes_executable_clmm_without_quote_model() {
+        let route_id = RouteId("route-clmm".into());
+        let pool_a = PoolId("pool-a".into());
+        let pool_b = PoolId("pool-b".into());
+        let mut plane = StatePlane::new(2);
+        plane.register_route(route_id, vec![pool_a.clone(), pool_b.clone()]);
+
+        plane
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                1,
+                10,
+                PoolSnapshotUpdate {
+                    pool_id: pool_a.0.clone(),
+                    price_bps: 10_000,
+                    fee_bps: 4,
+                    reserve_depth: 1_000,
+                    reserve_a: None,
+                    reserve_b: None,
+                    active_liquidity: Some(1_000),
+                    sqrt_price_x64: Some(1u128 << 64),
+                    confidence: SnapshotConfidence::Executable,
+                    repair_pending: Some(false),
+                    token_mint_a: "mint-a".into(),
+                    token_mint_b: "mint-b".into(),
+                    tick_spacing: 4,
+                    current_tick_index: Some(12),
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+        plane
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                2,
+                10,
+                PoolSnapshotUpdate {
+                    pool_id: pool_b.0.clone(),
+                    price_bps: 10_000,
+                    fee_bps: 4,
+                    reserve_depth: 1_000,
+                    reserve_a: Some(1_000),
+                    reserve_b: Some(1_000),
+                    active_liquidity: Some(1_000),
+                    sqrt_price_x64: None,
+                    confidence: SnapshotConfidence::Executable,
+                    repair_pending: Some(false),
+                    token_mint_a: "mint-a".into(),
+                    token_mint_b: "mint-b".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot: 10,
+                    write_version: 1,
+                },
             ))
             .unwrap();
 
