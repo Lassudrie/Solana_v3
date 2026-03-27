@@ -149,6 +149,7 @@ pub fn bootstrap_with_health(
                     fee_bps: route.legs[1].fee_bps,
                 },
             ],
+            max_quote_slot_lag: effective_max_quote_slot_lag(route),
             min_trade_size,
             default_trade_size: route.default_trade_size,
             max_trade_size: route.max_trade_size,

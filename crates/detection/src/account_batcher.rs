@@ -138,6 +138,14 @@ impl GetMultipleAccountsBatcher {
     }
 
     pub fn fetch(&self, account_keys: &[String]) -> Result<FetchedAccounts, RpcError> {
+        self.fetch_with_min_context_slot(account_keys, None)
+    }
+
+    pub fn fetch_with_min_context_slot(
+        &self,
+        account_keys: &[String],
+        min_context_slot: Option<u64>,
+    ) -> Result<FetchedAccounts, RpcError> {
         if account_keys.is_empty() {
             return Err(RpcError::RequestFailed {
                 method: "getMultipleAccounts".into(),
@@ -148,6 +156,7 @@ impl GetMultipleAccountsBatcher {
         self.sender
             .send(BatchRequest {
                 account_keys: account_keys.to_vec(),
+                min_context_slot,
                 response_tx,
             })
             .map_err(|_| RpcError::RequestFailed {
@@ -186,6 +195,7 @@ pub fn decode_lookup_table(
 
 struct BatchRequest {
     account_keys: Vec<String>,
+    min_context_slot: Option<u64>,
     response_tx: Sender<Result<FetchedAccounts, RpcError>>,
 }
 
@@ -253,6 +263,10 @@ fn fetch_batch(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let min_context_slot = requests
+        .iter()
+        .filter_map(|request| request.min_context_slot)
+        .max();
     if account_keys.is_empty() {
         return Err(RpcError::RequestFailed {
             method: "getMultipleAccounts".into(),
@@ -271,7 +285,8 @@ fn fetch_batch(
                 chunk,
                 {
                     "commitment": "processed",
-                    "encoding": "base64"
+                    "encoding": "base64",
+                    "minContextSlot": min_context_slot
                 }
             ]),
         )?;
@@ -467,6 +482,61 @@ mod tests {
                 last_extended_slot: 9,
                 fetched_slot: 11,
             })
+        );
+    }
+
+    #[test]
+    fn batches_requests_with_maximum_min_context_slot() {
+        let seen_min_context_slot = Arc::new(Mutex::new(Vec::<Option<u64>>::new()));
+        let endpoint = spawn_mock_rpc_server({
+            let seen_min_context_slot = Arc::clone(&seen_min_context_slot);
+            move |body| {
+                let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+                let min_context_slot = payload["params"][1]["minContextSlot"].as_u64();
+                seen_min_context_slot
+                    .lock()
+                    .expect("min context slots")
+                    .push(min_context_slot);
+                let keys = payload["params"][0]
+                    .as_array()
+                    .expect("keys array")
+                    .iter()
+                    .map(|value| value.as_str().expect("key").to_string())
+                    .collect::<Vec<_>>();
+                multiple_accounts_response(42, &keys)
+            }
+        });
+        let batcher = GetMultipleAccountsBatcher::new(&endpoint);
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first = {
+            let batcher = batcher.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                batcher.fetch_with_min_context_slot(&["acct-a".into()], Some(40))
+            })
+        };
+        let second = {
+            let batcher = batcher.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                thread::sleep(Duration::from_millis(5));
+                batcher.fetch_with_min_context_slot(&["acct-b".into()], Some(45))
+            })
+        };
+        barrier.wait();
+
+        first.join().expect("first join").expect("first result");
+        second.join().expect("second join").expect("second result");
+
+        assert_eq!(
+            seen_min_context_slot
+                .lock()
+                .expect("min context slots")
+                .as_slice(),
+            &[Some(45)]
         );
     }
 

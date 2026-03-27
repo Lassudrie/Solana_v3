@@ -161,6 +161,7 @@ mod tests {
                     fee_bps: None,
                 },
             ],
+            max_quote_slot_lag: 32,
             min_trade_size: 10_000,
             default_trade_size: 10_000,
             max_trade_size: 20_000,

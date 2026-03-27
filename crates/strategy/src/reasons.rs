@@ -13,6 +13,11 @@ pub enum RejectionReason {
         pool_id: PoolId,
         slot_lag: u64,
     },
+    QuoteStaleForExecution {
+        pool_id: PoolId,
+        slot_lag: u64,
+        maximum: u64,
+    },
     PoolRepairPending {
         pool_id: PoolId,
     },

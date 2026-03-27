@@ -485,6 +485,15 @@ fn simulate_concentrated_exact_input(
             upper_bound_tick
         };
         let target_price = tick_sqrt_price(snapshot.venue, target_tick)?;
+        if let Some(tick) = next_tick {
+            if sqrt_price == target_price {
+                liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
+                current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                continue;
+            }
+        } else if sqrt_price == target_price {
+            return Err(QuoteError::ConcentratedWindowExceeded);
+        }
         let step = compute_concentrated_swap_step(
             sqrt_price,
             target_price,
@@ -1158,7 +1167,7 @@ mod tests {
     use std::time::SystemTime;
 
     use domain::quote_models::{
-        ConcentratedQuoteModel, DirectionalConcentratedQuoteModel, TickArrayWindow,
+        ConcentratedQuoteModel, DirectionalConcentratedQuoteModel, InitializedTick, TickArrayWindow,
     };
     use state::types::{
         FreshnessState, LiquidityModel, PoolConfidence, PoolId, PoolSnapshot, PoolVenue, RouteId,
@@ -1195,6 +1204,7 @@ mod tests {
                     fee_bps: None,
                 },
             ],
+            max_quote_slot_lag: 32,
             min_trade_size: 1,
             default_trade_size: 1,
             max_trade_size: 10,
@@ -1390,6 +1400,33 @@ mod tests {
 
         let priced = apply_concentrated_price(&with_venue, Some(&model), "SOL", "USDC", 1_000, 30)
             .expect("whirlpool venue should unlock concentrated tick math");
+        assert!(priced.gross_output >= priced.net_output);
+        assert!(priced.net_output > 0);
+    }
+
+    #[test]
+    fn concentrated_quote_crosses_initialized_tick_when_price_starts_on_boundary() {
+        let snapshot = concentrated_snapshot(Some(PoolVenue::OrcaWhirlpool));
+        let mut model = concentrated_model();
+        model.a_to_b = Some(DirectionalConcentratedQuoteModel {
+            loaded_tick_arrays: 1,
+            expected_tick_arrays: 1,
+            complete: true,
+            windows: vec![TickArrayWindow {
+                start_tick_index: -64,
+                end_tick_index: 0,
+                initialized_tick_count: 1,
+            }],
+            initialized_ticks: vec![InitializedTick {
+                tick_index: 0,
+                liquidity_net: 100_000,
+                liquidity_gross: 100_000,
+            }],
+        });
+
+        let priced = apply_concentrated_price(&snapshot, Some(&model), "SOL", "USDC", 1_000, 30)
+            .expect("price on an initialized boundary should cross the tick instead of failing");
+
         assert!(priced.gross_output >= priced.net_output);
         assert!(priced.net_output > 0);
     }

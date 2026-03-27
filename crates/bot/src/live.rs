@@ -113,6 +113,31 @@ fn map_reducer_mode(mode: crate::config::ReducerRolloutMode) -> ReducerRolloutMo
     }
 }
 
+fn max_repair_workers(ultra_fast: bool, tracked_pools: &[TrackedPool]) -> usize {
+    if !ultra_fast {
+        return 2;
+    }
+
+    let active_hybrid_pools = tracked_pools
+        .iter()
+        .filter(|pool| {
+            pool.reducer_mode == ReducerRolloutMode::Active
+                && matches!(
+                    pool.kind,
+                    TrackedPoolKind::OrcaWhirlpool(_) | TrackedPoolKind::RaydiumClmm(_)
+                )
+        })
+        .map(|pool| pool.pool_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
+
+    if active_hybrid_pools == 0 {
+        1
+    } else {
+        active_hybrid_pools.clamp(2, 8)
+    }
+}
+
 fn build_grpc_entries_config(config: &BotConfig) -> GrpcEntriesConfig {
     let ultra_fast = config.runtime.profile == RuntimeProfileConfig::UltraFast;
     let mut tracked_pools = Vec::new();
@@ -237,7 +262,7 @@ fn build_grpc_entries_config(config: &BotConfig) -> GrpcEntriesConfig {
         grpc_connect_timeout_ms: config.shredstream.grpc_connect_timeout_ms,
         reconnect_backoff_millis: config.shredstream.reconnect_backoff_millis,
         max_reconnect_backoff_millis: config.shredstream.max_reconnect_backoff_millis,
-        max_repair_in_flight: if ultra_fast { 1 } else { 2 },
+        max_repair_in_flight: max_repair_workers(ultra_fast, &tracked_pools),
         tracked_pools,
         lookup_table_keys: lookup_table_keys.into_iter().collect(),
     }
@@ -281,5 +306,55 @@ impl MarketEventSource for GrpcEntriesEventSource {
 
     fn wait_next(&mut self, timeout: Duration) -> Result<Option<NormalizedEvent>, IngestError> {
         self.inner.wait_next(timeout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::config::{BotConfig, RuntimeProfileConfig};
+
+    use super::{build_grpc_entries_config, max_repair_workers};
+
+    fn repo_root_path(file: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join(file)
+    }
+
+    #[test]
+    fn standard_profile_keeps_two_repair_workers() {
+        let config = BotConfig::default();
+        let grpc = build_grpc_entries_config(&config);
+
+        assert_eq!(grpc.max_repair_in_flight, 2);
+    }
+
+    #[test]
+    fn ultra_fast_uses_single_repair_worker_without_hybrid_pools() {
+        let mut config = BotConfig::default();
+        config.runtime.profile = RuntimeProfileConfig::UltraFast;
+        let grpc = build_grpc_entries_config(&config);
+
+        assert_eq!(grpc.max_repair_in_flight, 1);
+        assert_eq!(max_repair_workers(true, &grpc.tracked_pools), 1);
+    }
+
+    #[test]
+    fn ultra_fast_amm_fast_manifest_scales_repair_workers_for_hybrid_pools() {
+        let config = BotConfig::from_path(repo_root_path("sol_usdc_routes_amm_fast.toml")).unwrap();
+        let grpc = build_grpc_entries_config(&config);
+
+        assert!(grpc.max_repair_in_flight > 1);
+    }
+
+    #[test]
+    fn ultra_fast_all_clmm_manifest_caps_repair_workers_at_eight() {
+        let config = BotConfig::from_path(repo_root_path("amm_12_pairs_fast.toml")).unwrap();
+        let grpc = build_grpc_entries_config(&config);
+
+        assert_eq!(grpc.max_repair_in_flight, 8);
     }
 }

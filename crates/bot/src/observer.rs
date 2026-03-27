@@ -1368,6 +1368,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::RouteNotWarm { .. } => "route_not_warm",
         RejectionReason::MissingSnapshot { .. } => "missing_snapshot",
         RejectionReason::SnapshotStale { .. } => "snapshot_stale",
+        RejectionReason::QuoteStaleForExecution { .. } => "quote_stale_for_execution",
         RejectionReason::PoolRepairPending { .. } => "pool_repair_pending",
         RejectionReason::PoolStateNotExecutable { .. } => "pool_state_not_executable",
         RejectionReason::PoolQuoteModelNotExecutable { .. } => "pool_quote_model_not_executable",
@@ -1394,6 +1395,14 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
         RejectionReason::SnapshotStale { pool_id, slot_lag } => {
             format!("pool_id={}, slot_lag={slot_lag}", pool_id.0)
         }
+        RejectionReason::QuoteStaleForExecution {
+            pool_id,
+            slot_lag,
+            maximum,
+        } => format!(
+            "pool_id={}, slot_lag={slot_lag}, maximum={maximum}",
+            pool_id.0
+        ),
         RejectionReason::PoolRepairPending { pool_id } => format!("pool_id={}", pool_id.0),
         RejectionReason::PoolStateNotExecutable { pool_id } => format!("pool_id={}", pool_id.0),
         RejectionReason::PoolQuoteModelNotExecutable { pool_id } => {

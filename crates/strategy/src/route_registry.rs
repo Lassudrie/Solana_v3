@@ -34,6 +34,7 @@ pub struct RouteDefinition {
     pub quote_mint: Option<String>,
     pub sol_quote_conversion_pool_id: Option<PoolId>,
     pub legs: [RouteLeg; 2],
+    pub max_quote_slot_lag: u64,
     pub min_trade_size: u64,
     pub default_trade_size: u64,
     pub max_trade_size: u64,
