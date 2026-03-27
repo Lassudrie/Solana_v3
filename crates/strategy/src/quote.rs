@@ -57,6 +57,11 @@ impl RouteQuote {
             sol_quote_conversion_snapshot,
             estimated_execution_cost_lamports,
         )?;
+        if route_uses_sol_quote_conversion(route, estimated_execution_cost_lamports) {
+            let snapshot =
+                sol_quote_conversion_snapshot.ok_or(QuoteError::ExecutionCostNotConvertible)?;
+            self.quoted_slot = self.quoted_slot.min(snapshot.last_update_slot);
+        }
         self.estimated_execution_cost_lamports = estimated_execution_cost_lamports;
         self.estimated_execution_cost_quote_atoms = estimated_execution_cost_quote_atoms;
         self.expected_net_profit_quote_atoms = clamp_i128(
@@ -153,6 +158,16 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
             ],
         })
     }
+}
+
+pub(crate) fn route_uses_sol_quote_conversion(
+    route: &RouteDefinition,
+    estimated_execution_cost_lamports: u64,
+) -> bool {
+    estimated_execution_cost_lamports > 0
+        && route.input_mint == route.output_mint
+        && route.quote_mint.as_deref() == Some(route.input_mint.as_str())
+        && route.quote_mint.as_deref() != Some(SOL_MINT)
 }
 
 fn execution_cost_quote_atoms(
@@ -1355,6 +1370,21 @@ mod tests {
             "must not reuse the base/quote route price"
         );
         assert_eq!(route_leg_snapshot.price_bps, 9_900);
+    }
+
+    #[test]
+    fn execution_cost_caps_quoted_slot_to_conversion_snapshot_slot() {
+        let route = route_definition("USDT", "USDC", Some("pool-sol-usdc"));
+        let mut sol_quote_snapshot = snapshot("pool-sol-usdc", SOL_MINT, "USDC", 10_000);
+        sol_quote_snapshot.last_update_slot = 7;
+        let mut route_quote = quote();
+        route_quote.quoted_slot = 12;
+
+        let quote = route_quote
+            .with_estimated_execution_cost(&route, Some(&sol_quote_snapshot), 1)
+            .expect("sol/usdc conversion should succeed");
+
+        assert_eq!(quote.quoted_slot, 7);
     }
 
     #[test]

@@ -82,7 +82,7 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
         if request
             .dynamic
             .head_slot
-            .saturating_sub(request.candidate.oldest_leg_snapshot_slot())
+            .saturating_sub(request.candidate.oldest_relevant_snapshot_slot())
             > route_execution.max_quote_slot_lag
         {
             return rejected(BuildRejectionReason::QuoteStaleForExecution);

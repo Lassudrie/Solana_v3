@@ -1,7 +1,10 @@
 use crate::{
     guards::GuardrailSet,
     opportunity::{OpportunityCandidate, OpportunityDecision, SelectionOutcome},
-    quote::{LocalTwoLegQuoteEngine, PoolPricingView, QuoteEngine, QuoteExecutionAdjustments},
+    quote::{
+        LocalTwoLegQuoteEngine, PoolPricingView, QuoteEngine, QuoteExecutionAdjustments,
+        route_uses_sol_quote_conversion,
+    },
     reasons::RejectionReason,
     route_registry::{RouteDefinition, RouteRegistry, SwapSide},
 };
@@ -121,13 +124,21 @@ where
                     })
             })
             .transpose()?;
+        let used_sol_quote_conversion_snapshot =
+            route_uses_sol_quote_conversion(route, route.estimated_execution_cost_lamports)
+                .then_some(sol_quote_conversion_snapshot)
+                .flatten();
 
         let mut snapshots = vec![first, second];
         if let Some(snapshot) = sol_quote_conversion_snapshot {
             snapshots.push(snapshot);
         }
         self.guards.evaluate_snapshots(state, &snapshots)?;
-        reject_stale_for_execution(route, execution_state.head_slot, [first, second])?;
+        let mut execution_snapshots = vec![first, second];
+        if let Some(snapshot) = used_sol_quote_conversion_snapshot {
+            execution_snapshots.push(snapshot);
+        }
+        reject_stale_for_execution(route, execution_state.head_slot, &execution_snapshots)?;
 
         let mut best_candidate: Option<OpportunityCandidate> = None;
         let mut last_rejection = None;
@@ -178,6 +189,8 @@ where
                         route_id: route.route_id.clone(),
                         quoted_slot: quote.quoted_slot,
                         leg_snapshot_slots: [first.last_update_slot, second.last_update_slot],
+                        sol_quote_conversion_snapshot_slot: used_sol_quote_conversion_snapshot
+                            .map(|snapshot| snapshot.last_update_slot),
                         trade_size: quote.input_amount,
                         active_execution_buffer_bps: route
                             .execution_protection
@@ -330,11 +343,12 @@ fn reserve_usage_rejection(
 fn reject_stale_for_execution(
     route: &RouteDefinition,
     head_slot: u64,
-    snapshots: [&PoolSnapshot; 2],
+    snapshots: &[&PoolSnapshot],
 ) -> Result<(), RejectionReason> {
     let maximum = route.max_quote_slot_lag;
     let Some((pool_id, slot_lag)) = snapshots
         .iter()
+        .copied()
         .map(|snapshot| {
             (
                 snapshot.pool_id.clone(),
@@ -363,6 +377,8 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
     use super::{OpportunitySelector, trade_sizes};
     use crate::{
@@ -714,6 +730,73 @@ mod tests {
     }
 
     #[test]
+    fn selector_carries_conversion_snapshot_slot_when_fee_conversion_uses_third_pool() {
+        let mut route = route_definition();
+        route.base_mint = Some(SOL_MINT.into());
+        route.sol_quote_conversion_pool_id = Some(PoolId("pool-c".into()));
+        route.estimated_execution_cost_lamports = 1;
+        let execution_state = ExecutionStateSnapshot {
+            head_slot: 12,
+            rpc_slot: Some(12),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(12),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        };
+        let selector = OpportunitySelector::new(
+            MockQuoteEngine,
+            GuardrailSet::new(GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: false,
+                ..GuardrailConfig::default()
+            }),
+        );
+        let mut state = StatePlane::new(4);
+
+        for (pool_id, slot) in [("pool-a", 8), ("pool-b", 11), ("pool-c", 7)] {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    1,
+                    slot,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.into(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 10_000_000,
+                        reserve_a: Some(10_000_000),
+                        reserve_b: Some(10_000_000),
+                        active_liquidity: Some(10_000_000),
+                        sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: SOL_MINT.into(),
+                        token_mint_b: "USDC".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot,
+                        write_version: 1,
+                    },
+                ))
+                .expect("snapshot update should apply");
+        }
+        state.set_latest_slot(12);
+
+        let candidate = selector
+            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .expect("candidate should be selected");
+
+        assert_eq!(candidate.quoted_slot, 7);
+        assert_eq!(candidate.leg_snapshot_slots, [8, 11]);
+        assert_eq!(candidate.sol_quote_conversion_snapshot_slot, Some(7));
+        assert_eq!(candidate.oldest_relevant_snapshot_slot(), 7);
+    }
+
+    #[test]
     fn selector_rejects_quote_stale_for_execution_before_quoting() {
         let mut route = route_definition();
         route.max_quote_slot_lag = 32;
@@ -779,6 +862,82 @@ mod tests {
             rejected,
             RejectionReason::QuoteStaleForExecution {
                 pool_id: PoolId("pool-a".into()),
+                slot_lag: 33,
+                maximum: 32,
+            }
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn selector_rejects_stale_conversion_snapshot_for_execution_before_quoting() {
+        let mut route = route_definition();
+        route.base_mint = Some(SOL_MINT.into());
+        route.max_quote_slot_lag = 32;
+        route.sol_quote_conversion_pool_id = Some(PoolId("pool-c".into()));
+        route.estimated_execution_cost_lamports = 1;
+        let execution_state = ExecutionStateSnapshot {
+            head_slot: 43,
+            rpc_slot: Some(43),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(43),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let selector = OpportunitySelector::new(
+            CountingQuoteEngine {
+                calls: Arc::clone(&calls),
+            },
+            GuardrailSet::new(GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: false,
+                ..GuardrailConfig::default()
+            }),
+        );
+        let mut state = StatePlane::new(2_048);
+
+        for (pool_id, slot) in [("pool-a", 43), ("pool-b", 42), ("pool-c", 10)] {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    1,
+                    slot,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.into(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 10_000_000,
+                        reserve_a: Some(10_000_000),
+                        reserve_b: Some(10_000_000),
+                        active_liquidity: Some(10_000_000),
+                        sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: SOL_MINT.into(),
+                        token_mint_b: "USDC".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot,
+                        write_version: 1,
+                    },
+                ))
+                .expect("snapshot update should apply");
+        }
+        state.set_latest_slot(43);
+
+        let rejected = selector
+            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .expect_err("stale conversion pool should be rejected before quoting");
+
+        assert_eq!(
+            rejected,
+            RejectionReason::QuoteStaleForExecution {
+                pool_id: PoolId("pool-c".into()),
                 slot_lag: 33,
                 maximum: 32,
             }

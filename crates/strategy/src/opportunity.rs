@@ -7,6 +7,7 @@ pub struct OpportunityCandidate {
     pub route_id: RouteId,
     pub quoted_slot: u64,
     pub leg_snapshot_slots: [u64; 2],
+    pub sol_quote_conversion_snapshot_slot: Option<u64>,
     pub trade_size: u64,
     pub active_execution_buffer_bps: Option<u16>,
     pub expected_net_output: u64,
@@ -21,6 +22,12 @@ pub struct OpportunityCandidate {
 impl OpportunityCandidate {
     pub fn oldest_leg_snapshot_slot(&self) -> u64 {
         self.leg_snapshot_slots[0].min(self.leg_snapshot_slots[1])
+    }
+
+    pub fn oldest_relevant_snapshot_slot(&self) -> u64 {
+        self.sol_quote_conversion_snapshot_slot
+            .map(|slot| self.oldest_leg_snapshot_slot().min(slot))
+            .unwrap_or_else(|| self.oldest_leg_snapshot_slot())
     }
 }
 

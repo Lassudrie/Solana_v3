@@ -53,6 +53,7 @@ mod tests {
             route_id: RouteId("route-a".into()),
             quoted_slot: 42,
             leg_snapshot_slots: [42, 42],
+            sol_quote_conversion_snapshot_slot: None,
             trade_size: 10_000,
             active_execution_buffer_bps: None,
             expected_net_output: 10_250,
@@ -272,6 +273,27 @@ mod tests {
         let mut candidate = candidate();
         candidate.quoted_slot = 43;
         candidate.leg_snapshot_slots = [38, 43];
+
+        let result = builder.build(BuildRequest {
+            candidate,
+            dynamic: dynamic_params(Vec::new(), 43),
+        });
+
+        assert_eq!(result.status, BuildStatus::Rejected);
+        assert_eq!(
+            result.rejection,
+            Some(BuildRejectionReason::QuoteStaleForExecution)
+        );
+    }
+
+    #[test]
+    fn builder_rejects_stale_conversion_snapshot_even_when_leg_snapshots_are_recent() {
+        let builder =
+            AtomicArbTransactionBuilder::new(execution_registry(MessageMode::V0OrLegacy, false));
+        let mut candidate = candidate();
+        candidate.quoted_slot = 43;
+        candidate.leg_snapshot_slots = [43, 42];
+        candidate.sol_quote_conversion_snapshot_slot = Some(38);
 
         let result = builder.build(BuildRequest {
             candidate,
