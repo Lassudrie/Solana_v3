@@ -387,6 +387,18 @@ impl RouteHealthRegistry {
         items
     }
 
+    pub fn blocked_route_view(
+        &self,
+        route_id: &RouteId,
+        observed_slot: u64,
+    ) -> Option<RouteMonitorView> {
+        if !self.config.enabled {
+            return None;
+        }
+        let view = self.route_state(route_id.0.as_str(), observed_slot)?;
+        (!view.eligible_live).then_some(view)
+    }
+
     pub fn pool_is_blocked_from_repair(&self, pool_id: &str, observed_slot: u64) -> bool {
         matches!(
             self.pool_health_state(pool_id, observed_slot),

@@ -6,6 +6,7 @@ pub enum RejectionReason {
     RouteNotWarm {
         status: WarmupStatus,
     },
+    RoutePendingSubmission,
     MissingSnapshot {
         pool_id: PoolId,
     },
@@ -20,6 +21,13 @@ pub enum RejectionReason {
     },
     PoolRepairPending {
         pool_id: PoolId,
+    },
+    PoolQuarantined {
+        pool_id: PoolId,
+    },
+    PoolDisabled {
+        pool_id: PoolId,
+        detail: Option<String>,
     },
     PoolStateNotExecutable {
         pool_id: PoolId,
@@ -65,6 +73,9 @@ pub enum RejectionReason {
     TooManyInflight {
         current: usize,
         maximum: usize,
+    },
+    RouteShadowed {
+        until_slot: Option<u64>,
     },
     KillSwitchActive,
     QuoteFailed {

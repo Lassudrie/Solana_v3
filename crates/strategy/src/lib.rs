@@ -121,6 +121,12 @@ impl StrategyPlane {
         })
     }
 
+    pub fn route_metadata(&self, route_id: &RouteId) -> Option<(RouteKind, usize, u64)> {
+        self.registry
+            .get(route_id)
+            .map(|route| (route.kind, route.leg_count(), route.max_quote_slot_lag))
+    }
+
     pub fn record_execution_too_little_output(&mut self, route_id: &RouteId) {
         let Some(route) = self.registry.get(route_id) else {
             return;

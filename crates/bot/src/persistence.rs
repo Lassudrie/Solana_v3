@@ -1193,10 +1193,13 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
     match reason {
         RejectionReason::RouteNotRegistered => "route_not_registered",
         RejectionReason::RouteNotWarm { .. } => "route_not_warm",
+        RejectionReason::RoutePendingSubmission => "route_pending_submission",
         RejectionReason::MissingSnapshot { .. } => "missing_snapshot",
         RejectionReason::SnapshotStale { .. } => "snapshot_stale",
         RejectionReason::QuoteStaleForExecution { .. } => "quote_stale_for_execution",
         RejectionReason::PoolRepairPending { .. } => "pool_repair_pending",
+        RejectionReason::PoolQuarantined { .. } => "pool_quarantined",
+        RejectionReason::PoolDisabled { .. } => "pool_disabled",
         RejectionReason::PoolStateNotExecutable { .. } => "pool_state_not_executable",
         RejectionReason::PoolQuoteModelNotExecutable { .. } => "pool_quote_model_not_executable",
         RejectionReason::ReserveUsageTooHigh { .. } => "reserve_usage_too_high",
@@ -1210,6 +1213,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::WalletNotReady => "wallet_not_ready",
         RejectionReason::WalletBalanceTooLow { .. } => "wallet_balance_too_low",
         RejectionReason::TooManyInflight { .. } => "too_many_inflight",
+        RejectionReason::RouteShadowed { .. } => "route_shadowed",
         RejectionReason::KillSwitchActive => "kill_switch_active",
         RejectionReason::QuoteFailed { .. } => "quote_failed",
         RejectionReason::ExecutionCostNotConvertible { .. } => "execution_cost_not_convertible",
@@ -1222,6 +1226,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
 fn strategy_reason_detail(reason: &RejectionReason) -> String {
     match reason {
         RejectionReason::RouteNotWarm { status } => format!("warmup_status={status:?}"),
+        RejectionReason::RoutePendingSubmission => "pending_submission=true".into(),
         RejectionReason::MissingSnapshot { pool_id } => format!("pool_id={}", pool_id.0),
         RejectionReason::SnapshotStale { pool_id, slot_lag } => {
             format!("pool_id={}, slot_lag={slot_lag}", pool_id.0)
@@ -1235,6 +1240,11 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
             pool_id.0
         ),
         RejectionReason::PoolRepairPending { pool_id } => format!("pool_id={}", pool_id.0),
+        RejectionReason::PoolQuarantined { pool_id } => format!("pool_id={}", pool_id.0),
+        RejectionReason::PoolDisabled { pool_id, detail } => detail
+            .as_ref()
+            .map(|detail| format!("pool_id={}, detail={detail}", pool_id.0))
+            .unwrap_or_else(|| format!("pool_id={}", pool_id.0)),
         RejectionReason::PoolStateNotExecutable { pool_id } => format!("pool_id={}", pool_id.0),
         RejectionReason::PoolQuoteModelNotExecutable { pool_id } => {
             format!("pool_id={}", pool_id.0)
@@ -1275,6 +1285,9 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
         RejectionReason::TooManyInflight { current, maximum } => {
             format!("current={current}, maximum={maximum}")
         }
+        RejectionReason::RouteShadowed { until_slot } => until_slot
+            .map(|until_slot| format!("until_slot={until_slot}"))
+            .unwrap_or_else(|| "until_slot=unknown".into()),
         RejectionReason::QuoteFailed { detail } => detail.clone(),
         RejectionReason::ExecutionCostNotConvertible { detail } => detail.clone(),
         RejectionReason::SizingFloorNotConvertible { detail } => detail.clone(),

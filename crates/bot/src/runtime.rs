@@ -7,21 +7,27 @@ use std::{
 use builder::{BuildRequest, BuildResult, BuildStatus, DynamicBuildParameters, TransactionBuilder};
 use domain::{
     AccountUpdateStatus, EventLane, EventSourceKind, ExecutionSnapshot, LookupTableSnapshot,
-    MarketEvent, NormalizedEvent, PoolSnapshot, StateApplyOutcome,
+    MarketEvent, NormalizedEvent, PoolId, PoolSnapshot, RouteId, StateApplyOutcome,
 };
 use reconciliation::{
     ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, FailureClass,
 };
 use signing::{HotWallet, SignedTransactionEnvelope, Signer, SigningError, SigningRequest};
 use state::{StateError, StatePlane};
-use strategy::{StrategyPlane, opportunity::SelectionOutcome};
+use strategy::{
+    StrategyPlane,
+    opportunity::{OpportunityDecision, SelectionOutcome},
+    reasons::RejectionReason,
+};
 use submit::{SubmitError, SubmitMode, SubmitRequest, SubmitResult, Submitter};
 use telemetry::{PipelineStage, TelemetryStack};
 use thiserror::Error;
 
 use crate::execution_context::ExecutionContext;
 use crate::refresh::AsyncRefreshSnapshot;
-use crate::route_health::{RouteHealthSummary, SharedRouteHealth};
+use crate::route_health::{
+    RouteHealthState, RouteHealthSummary, RouteMonitorView, SharedRouteHealth,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotPathReport {
@@ -436,6 +442,132 @@ impl BotRuntime {
             })
     }
 
+    fn filter_impacted_routes(
+        &self,
+        impacted_routes: &[RouteId],
+        observed_slot: u64,
+    ) -> (Vec<RouteId>, Vec<OpportunityDecision>) {
+        let route_health = self.route_health.lock().ok();
+        let mut eligible_routes = Vec::with_capacity(impacted_routes.len());
+        let mut decisions = Vec::new();
+
+        for route_id in impacted_routes {
+            if let Some(view) = route_health
+                .as_ref()
+                .and_then(|health| health.blocked_route_view(route_id, observed_slot))
+            {
+                decisions.push(self.blocked_route_decision(route_id, observed_slot, &view));
+                continue;
+            }
+            if self.tracker.has_pending_route(route_id) {
+                decisions.push(
+                    self.rejected_route_decision(route_id, RejectionReason::RoutePendingSubmission),
+                );
+                continue;
+            }
+            eligible_routes.push(route_id.clone());
+        }
+
+        (eligible_routes, decisions)
+    }
+
+    fn blocked_route_decision(
+        &self,
+        route_id: &RouteId,
+        observed_slot: u64,
+        view: &RouteMonitorView,
+    ) -> OpportunityDecision {
+        let blocking_pool_id = view
+            .blocking_pool_id
+            .as_ref()
+            .map(|pool_id| PoolId(pool_id.clone()));
+        let reason = match view.health_state {
+            RouteHealthState::Eligible => RejectionReason::RouteFilteredOut {
+                route_id: route_id.clone(),
+            },
+            RouteHealthState::BlockedPoolRepair => blocking_pool_id.map_or_else(
+                || RejectionReason::RouteFilteredOut {
+                    route_id: route_id.clone(),
+                },
+                |pool_id| RejectionReason::PoolRepairPending { pool_id },
+            ),
+            RouteHealthState::BlockedPoolStale => blocking_pool_id.map_or_else(
+                || RejectionReason::RouteFilteredOut {
+                    route_id: route_id.clone(),
+                },
+                |pool_id| {
+                    let slot_lag = self
+                        .hot_path
+                        .state
+                        .pool_snapshot(&pool_id)
+                        .map(|snapshot| observed_slot.saturating_sub(snapshot.last_update_slot))
+                        .unwrap_or_default();
+                    let maximum = self
+                        .hot_path
+                        .strategy
+                        .route_metadata(route_id)
+                        .map(|(_, _, max_quote_slot_lag)| max_quote_slot_lag)
+                        .unwrap_or_default();
+                    RejectionReason::QuoteStaleForExecution {
+                        pool_id,
+                        slot_lag,
+                        maximum,
+                    }
+                },
+            ),
+            RouteHealthState::BlockedPoolNotExecutable => blocking_pool_id.map_or_else(
+                || RejectionReason::RouteFilteredOut {
+                    route_id: route_id.clone(),
+                },
+                |pool_id| RejectionReason::PoolStateNotExecutable { pool_id },
+            ),
+            RouteHealthState::BlockedPoolQuoteModelNotExecutable => blocking_pool_id.map_or_else(
+                || RejectionReason::RouteFilteredOut {
+                    route_id: route_id.clone(),
+                },
+                |pool_id| RejectionReason::PoolQuoteModelNotExecutable { pool_id },
+            ),
+            RouteHealthState::BlockedPoolQuarantined => blocking_pool_id.map_or_else(
+                || RejectionReason::RouteFilteredOut {
+                    route_id: route_id.clone(),
+                },
+                |pool_id| RejectionReason::PoolQuarantined { pool_id },
+            ),
+            RouteHealthState::BlockedPoolDisabled => blocking_pool_id.map_or_else(
+                || RejectionReason::RouteFilteredOut {
+                    route_id: route_id.clone(),
+                },
+                |pool_id| RejectionReason::PoolDisabled {
+                    pool_id,
+                    detail: view.blocking_reason.clone(),
+                },
+            ),
+            RouteHealthState::ShadowOnly => RejectionReason::RouteShadowed {
+                until_slot: view.shadow_until_slot,
+            },
+        };
+        self.rejected_route_decision(route_id, reason)
+    }
+
+    fn rejected_route_decision(
+        &self,
+        route_id: &RouteId,
+        reason: RejectionReason,
+    ) -> OpportunityDecision {
+        let (route_kind, leg_count) = self
+            .hot_path
+            .strategy
+            .route_metadata(route_id)
+            .map(|(kind, leg_count, _)| (Some(kind), leg_count))
+            .unwrap_or((None, 0));
+        OpportunityDecision::Rejected {
+            route_id: route_id.clone(),
+            route_kind,
+            leg_count,
+            reason,
+        }
+    }
+
     pub fn record_reconcile_duration(&self, duration: Duration) {
         self.telemetry
             .record_stage(PipelineStage::Reconcile, duration);
@@ -636,28 +768,15 @@ impl BotRuntime {
             }));
         }
 
-        let impacted_routes = self
-            .route_health
-            .lock()
-            .ok()
-            .map(|health| {
-                health.eligible_impacted_routes(
-                    &state_outcome.impacted_routes,
-                    pipeline_trace.observed_slot,
-                )
-            })
-            .unwrap_or_else(|| state_outcome.impacted_routes.clone());
-        let impacted_routes = impacted_routes
-            .into_iter()
-            .filter(|route_id| !self.tracker.has_pending_route(route_id))
-            .collect::<Vec<_>>();
+        let (impacted_routes, filtered_decisions) = self
+            .filter_impacted_routes(&state_outcome.impacted_routes, pipeline_trace.observed_slot);
         if impacted_routes.is_empty() {
             self.telemetry.metrics.increment_rejection();
             return Ok(PreparedHotPath::Report(HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
                 selection: SelectionOutcome {
-                    decisions: Vec::new(),
+                    decisions: filtered_decisions,
                     best_candidate: None,
                     shadow_candidate: None,
                 },
@@ -689,6 +808,12 @@ impl BotRuntime {
         self.telemetry.metrics.record_route_eval(select_duration);
         self.telemetry
             .record_stage(PipelineStage::Select, select_duration);
+        let mut selection = selection;
+        if !filtered_decisions.is_empty() {
+            let mut decisions = filtered_decisions;
+            decisions.extend(selection.decisions);
+            selection.decisions = decisions;
+        }
         if selection.best_candidate.is_none() {
             self.telemetry.metrics.increment_rejection();
             return Ok(PreparedHotPath::Report(HotPathReport {
@@ -917,6 +1042,7 @@ mod tests {
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use strategy::{opportunity::OpportunityDecision, reasons::RejectionReason};
     use submit::SubmitStatus;
 
     use super::{BotRuntime, PreparedHotPath};
@@ -1360,8 +1486,73 @@ mod tests {
                 assert!(report.selection.best_candidate.is_none());
                 assert!(report.build_result.is_none());
                 assert!(report.signed_envelope.is_none());
+                assert!(matches!(
+                    report.selection.decisions.as_slice(),
+                    [OpportunityDecision::Rejected {
+                        route_id,
+                        reason: RejectionReason::RoutePendingSubmission,
+                        ..
+                    }] if route_id.0 == "route-a"
+                ));
             }
             other => panic!("expected deduped report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_event_for_dispatch_reports_route_health_filtered_rejection() {
+        let mut config = BotConfig::default();
+        config.routes = RoutesConfig {
+            definitions: vec![route_config()],
+        };
+        config.builder.compute_unit_limit = 300_000;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
+        config.jito.endpoint = "mock://jito".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        let (owner_pubkey, keypair_base58) = test_signing_material();
+        config.signing.owner_pubkey = owner_pubkey.clone();
+        config.signing.keypair_base58 = Some(keypair_base58);
+        let mut runtime = bootstrap(config).unwrap();
+        seed_source_input_balance(&mut runtime);
+        runtime.hot_path.signer = Arc::new(PanicSigner {
+            pubkey: owner_pubkey,
+        });
+
+        let first = snapshot_event(1, "pool-a", 5_000);
+        let second = snapshot_event(2, "pool-b", 20_000);
+        let third = snapshot_event(20, "pool-a", 5_100);
+
+        let first_report = runtime.prepare_event_for_dispatch(first, 0).unwrap();
+        assert!(matches!(first_report, PreparedHotPath::Report(_)));
+
+        let second_report = runtime.prepare_event_for_dispatch(second, 0).unwrap();
+        assert!(matches!(second_report, PreparedHotPath::BuildSign(_)));
+
+        let blocked = runtime.prepare_event_for_dispatch(third, 0).unwrap();
+        match blocked {
+            PreparedHotPath::Report(report) => {
+                assert!(report.selection.best_candidate.is_none());
+                assert!(report.build_result.is_none());
+                assert!(report.signed_envelope.is_none());
+                assert!(matches!(
+                    report.selection.decisions.as_slice(),
+                    [OpportunityDecision::Rejected {
+                        route_id,
+                        reason: RejectionReason::QuoteStaleForExecution {
+                            pool_id,
+                            slot_lag,
+                            maximum,
+                        },
+                        ..
+                    }] if route_id.0 == "route-a"
+                        && pool_id.0 == "pool-b"
+                        && *slot_lag > *maximum
+                ));
+            }
+            other => panic!("expected filtered report, got {other:?}"),
         }
     }
 
