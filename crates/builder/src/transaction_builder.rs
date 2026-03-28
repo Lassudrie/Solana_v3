@@ -26,6 +26,8 @@ use crate::{
         ResolvedAddressLookupTable, SwapAmountMode, UnsignedTransactionEnvelope,
     },
 };
+use strategy::opportunity::OpportunityCandidate;
+use strategy::route_registry::RouteLegSequence;
 
 const BASE_FEE_LAMPORTS_PER_SIGNATURE: u64 = 5_000;
 const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
@@ -40,6 +42,7 @@ const SIGNATURE_BYTES: usize = 64;
 const MAX_SERIALIZED_TRANSACTION_BYTES: usize = 1_232;
 #[allow(deprecated)]
 const MAX_TRANSACTION_ACCOUNT_LOCKS: usize = MAX_TX_ACCOUNT_LOCKS;
+const BUILD_QUOTE_STALENESS_GRACE_SLOTS: u64 = 2;
 
 pub trait TransactionBuilder: Send + Sync {
     fn build(&self, request: BuildRequest) -> BuildResult;
@@ -92,7 +95,9 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             .dynamic
             .head_slot
             .saturating_sub(request.candidate.oldest_relevant_snapshot_slot())
-            > route_execution.max_quote_slot_lag
+            > route_execution
+                .max_quote_slot_lag
+                .saturating_add(BUILD_QUOTE_STALENESS_GRACE_SLOTS)
         {
             return rejected(BuildRejectionReason::QuoteStaleForExecution);
         }
@@ -102,6 +107,9 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             .materialize_leg_plans(&request.candidate, route_execution);
         if !route_matches_execution(route_execution, &leg_plans) {
             return rejected(BuildRejectionReason::UnsupportedVenue);
+        }
+        if let Err(reason) = verify_profitable_execution_plan(&request.candidate, &leg_plans) {
+            return rejected(reason);
         }
 
         let route_lookup_tables =
@@ -114,6 +122,12 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             request.dynamic.compute_unit_limit,
             route_execution.default_compute_unit_limit,
         );
+        if compute_unit_limit < route_execution.minimum_compute_unit_limit {
+            return rejected(BuildRejectionReason::ComputeUnitLimitTooLow {
+                requested: compute_unit_limit,
+                minimum: route_execution.minimum_compute_unit_limit,
+            });
+        }
         let compute_unit_price_micro_lamports = effective_u64(
             request.dynamic.compute_unit_price_micro_lamports,
             route_execution.default_compute_unit_price_micro_lamports,
@@ -137,12 +151,16 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             Ok(setup_instructions) => labeled_instructions.extend(setup_instructions),
             Err(reason) => return rejected(reason),
         }
-        for (index, leg_plan) in leg_plans.iter().enumerate() {
-            let instruction =
-                match compile_leg_instruction(&route_execution.legs[index], fee_payer, leg_plan) {
-                    Ok(instruction) => instruction,
-                    Err(reason) => return rejected(reason),
-                };
+        for (index, (execution, leg_plan)) in route_execution
+            .legs
+            .iter()
+            .zip(leg_plans.iter())
+            .enumerate()
+        {
+            let instruction = match compile_leg_instruction(execution, fee_payer, leg_plan) {
+                Ok(instruction) => instruction,
+                Err(reason) => return rejected(reason),
+            };
             labeled_instructions.push(LabeledInstruction::new(
                 format!("{}-leg-{}", request.candidate.route_id.0, index + 1),
                 instruction,
@@ -299,13 +317,50 @@ fn shortvec_encoded_len(mut value: usize) -> usize {
 
 fn route_matches_execution(
     route_execution: &RouteExecutionConfig,
-    leg_plans: &[AtomicLegPlan; 2],
+    leg_plans: &RouteLegSequence<AtomicLegPlan>,
 ) -> bool {
     route_execution
         .legs
         .iter()
         .zip(leg_plans.iter())
         .all(|(execution, leg)| execution.venue_name().eq_ignore_ascii_case(&leg.venue))
+}
+
+fn verify_profitable_execution_plan(
+    candidate: &OpportunityCandidate,
+    leg_plans: &RouteLegSequence<AtomicLegPlan>,
+) -> Result<(), BuildRejectionReason> {
+    let Some(final_leg) = leg_plans.as_slice().last() else {
+        return Err(BuildRejectionReason::UnsupportedRouteShape);
+    };
+    if final_leg.amount_mode != SwapAmountMode::ExactIn {
+        return Err(BuildRejectionReason::UnsupportedRouteShape);
+    }
+
+    let buffered_input_allowance = candidate
+        .leg_quotes
+        .as_slice()
+        .first()
+        .zip(leg_plans.as_slice().first())
+        .filter(|(_, first_plan)| first_plan.amount_mode == SwapAmountMode::ExactOut)
+        .map(|(first_quote, first_plan)| {
+            first_plan
+                .other_amount_threshold
+                .saturating_sub(first_quote.input_amount)
+        })
+        .unwrap_or(0);
+    let minimum_output = candidate
+        .minimum_acceptable_output
+        .saturating_add(buffered_input_allowance);
+
+    if final_leg.other_amount_threshold < minimum_output {
+        return Err(BuildRejectionReason::UnprofitableExecutionPlan {
+            guaranteed_output: final_leg.other_amount_threshold,
+            minimum_output,
+        });
+    }
+
+    Ok(())
 }
 
 fn resolve_route_lookup_tables(
@@ -909,9 +964,12 @@ mod tests {
     fn associated_token_setup_instructions_deduplicate_clmm_route_mints() {
         let route_execution = RouteExecutionConfig {
             route_id: RouteId("route-clmm".into()),
+            kind: strategy::route_registry::RouteKind::TwoLeg,
             message_mode: MessageMode::V0Required,
             lookup_tables: Vec::new(),
             default_compute_unit_limit: 300_000,
+            minimum_compute_unit_limit: strategy::route_registry::RouteKind::TwoLeg
+                .minimum_compute_unit_limit(),
             default_compute_unit_price_micro_lamports: 25_000,
             default_jito_tip_lamports: 5_000,
             max_quote_slot_lag: 32,
@@ -944,7 +1002,8 @@ mod tests {
                     tick_spacing: 60,
                     zero_for_one: true,
                 }),
-            ],
+            ]
+            .into(),
         };
 
         let fee_payer = parse_static_pubkey(&test_pubkey("fee-payer"));
@@ -1081,6 +1140,80 @@ mod tests {
             Err(BuildRejectionReason::TooManyAccountLocks {
                 account_locks: transaction_account_lock_count(&versioned_message),
                 maximum: MAX_TRANSACTION_ACCOUNT_LOCKS,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_execution_plan_when_final_leg_floor_does_not_cover_exact_out_buffer() {
+        let candidate = OpportunityCandidate {
+            route_id: RouteId("route-a".into()),
+            route_kind: strategy::route_registry::RouteKind::TwoLeg,
+            quoted_slot: 42,
+            leg_snapshot_slots: [42, 42].into(),
+            sol_quote_conversion_snapshot_slot: None,
+            trade_size: 100_000_000,
+            selected_by: strategy::opportunity::CandidateSelectionSource::Legacy,
+            ranking_score_quote_atoms: 5_000,
+            expected_value_quote_atoms: 5_000,
+            p_land_bps: 10_000,
+            expected_shortfall_quote_atoms: 0,
+            active_execution_buffer_bps: Some(25),
+            expected_net_output: 100_150_000,
+            minimum_acceptable_output: 100_005_002,
+            expected_gross_profit_quote_atoms: 5_000,
+            estimated_execution_cost_lamports: 0,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: 5_000,
+            intermediate_output_amounts: vec![8_303_842],
+            leg_quotes: [
+                strategy::quote::LegQuote {
+                    venue: "raydium_clmm".into(),
+                    pool_id: domain::PoolId("pool-a".into()),
+                    side: strategy::route_registry::SwapSide::BuyBase,
+                    input_amount: 100_000_000,
+                    output_amount: 8_303_842,
+                    fee_paid: 0,
+                    current_tick_index: Some(0),
+                },
+                strategy::quote::LegQuote {
+                    venue: "raydium_clmm".into(),
+                    pool_id: domain::PoolId("pool-b".into()),
+                    side: strategy::route_registry::SwapSide::SellBase,
+                    input_amount: 8_303_842,
+                    output_amount: 100_009_567,
+                    fee_paid: 0,
+                    current_tick_index: Some(0),
+                },
+            ]
+            .into(),
+        };
+        let leg_plans = strategy::route_registry::RouteLegSequence::from([
+            AtomicLegPlan {
+                venue: "raydium_clmm".into(),
+                pool_id: domain::PoolId("pool-a".into()),
+                side: strategy::route_registry::SwapSide::BuyBase,
+                amount_mode: SwapAmountMode::ExactOut,
+                specified_amount: 8_303_842,
+                other_amount_threshold: 100_250_000,
+                current_tick_index: Some(0),
+            },
+            AtomicLegPlan {
+                venue: "raydium_clmm".into(),
+                pool_id: domain::PoolId("pool-b".into()),
+                side: strategy::route_registry::SwapSide::SellBase,
+                amount_mode: SwapAmountMode::ExactIn,
+                specified_amount: 8_303_842,
+                other_amount_threshold: 100_005_002,
+                current_tick_index: Some(0),
+            },
+        ]);
+
+        assert_eq!(
+            verify_profitable_execution_plan(&candidate, &leg_plans),
+            Err(BuildRejectionReason::UnprofitableExecutionPlan {
+                guaranteed_output: 100_005_002,
+                minimum_output: 100_255_002,
             })
         );
     }

@@ -5,6 +5,7 @@ use state::StatePlane;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardrailConfig {
     pub min_profit_quote_atoms: i64,
+    pub min_profit_bps: u16,
     pub require_route_warm: bool,
     pub max_inflight_submissions: usize,
     pub min_wallet_balance_lamports: u64,
@@ -15,6 +16,7 @@ impl Default for GuardrailConfig {
     fn default() -> Self {
         Self {
             min_profit_quote_atoms: 1,
+            min_profit_bps: 0,
             require_route_warm: true,
             max_inflight_submissions: 64,
             min_wallet_balance_lamports: 1,
@@ -37,14 +39,61 @@ impl GuardrailSet {
         self.config.min_profit_quote_atoms
     }
 
+    pub fn minimum_profit_quote_atoms_for_trade(&self, trade_size: u64) -> u64 {
+        let absolute = self.config.min_profit_quote_atoms.max(0) as u64;
+        let relative = if self.config.min_profit_bps == 0 {
+            0
+        } else {
+            let numerator = u128::from(trade_size)
+                .saturating_mul(u128::from(self.config.min_profit_bps))
+                .saturating_add(9_999);
+            numerator
+                .checked_div(10_000)
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(u64::MAX)
+        };
+        absolute.max(relative)
+    }
+
+    pub fn minimum_profit_quote_atoms_for_route(
+        &self,
+        route: &RouteDefinition,
+        trade_size: u64,
+    ) -> i64 {
+        let threshold = self.minimum_profit_quote_atoms_for_trade(trade_size);
+        let threshold = threshold
+            .saturating_mul(u64::from(route.kind.minimum_profit_multiplier_bps()))
+            .div_ceil(10_000);
+        let absolute = self.config.min_profit_quote_atoms.max(0) as u64;
+        let route_floor = route.min_profit_quote_atoms.unwrap_or_default().max(0) as u64;
+        threshold
+            .max(absolute)
+            .max(route_floor)
+            .min(i64::MAX as u64) as i64
+    }
+
     pub fn minimum_acceptable_output(
+        &self,
+        route: &RouteDefinition,
+        trade_size: u64,
+        estimated_execution_cost_quote_atoms: u64,
+    ) -> u64 {
+        trade_size
+            .saturating_add(estimated_execution_cost_quote_atoms)
+            .saturating_add(
+                self.minimum_profit_quote_atoms_for_route(route, trade_size)
+                    .max(0) as u64,
+            )
+    }
+
+    pub fn legacy_minimum_acceptable_output(
         &self,
         trade_size: u64,
         estimated_execution_cost_quote_atoms: u64,
     ) -> u64 {
         trade_size
             .saturating_add(estimated_execution_cost_quote_atoms)
-            .saturating_add(self.config.min_profit_quote_atoms.max(0) as u64)
+            .saturating_add(self.minimum_profit_quote_atoms_for_trade(trade_size))
     }
 
     pub fn evaluate_route_readiness(
@@ -65,23 +114,12 @@ impl GuardrailSet {
         snapshots: &[&PoolSnapshot],
     ) -> Result<(), RejectionReason> {
         for snapshot in snapshots {
-            if snapshot.freshness.is_stale {
-                if snapshot.repair_pending {
-                    return Err(RejectionReason::PoolRepairPending {
-                        pool_id: snapshot.pool_id.clone(),
-                    });
-                }
-                return Err(RejectionReason::SnapshotStale {
+            if snapshot.repair_pending {
+                return Err(RejectionReason::PoolRepairPending {
                     pool_id: snapshot.pool_id.clone(),
-                    slot_lag: snapshot.freshness.slot_lag,
                 });
             }
             if !snapshot.is_executable() {
-                if snapshot.repair_pending {
-                    return Err(RejectionReason::PoolRepairPending {
-                        pool_id: snapshot.pool_id.clone(),
-                    });
-                }
                 return Err(RejectionReason::PoolStateNotExecutable {
                     pool_id: snapshot.pool_id.clone(),
                 });
@@ -135,32 +173,41 @@ impl GuardrailSet {
                 maximum: route.max_trade_size,
             });
         }
-        if quote.expected_net_profit_quote_atoms < self.config.min_profit_quote_atoms {
+        let minimum_profit_quote_atoms =
+            self.minimum_profit_quote_atoms_for_route(route, quote.input_amount);
+        if quote.expected_net_profit_quote_atoms < minimum_profit_quote_atoms {
+            let leg_details = quote
+                .leg_quotes
+                .iter()
+                .enumerate()
+                .map(|(index, leg)| {
+                    format!(
+                        "leg{index}={{venue={}, pool_id={}, input={}, output={}, fee={}, tick={:?}}}",
+                        leg.venue,
+                        leg.pool_id.0,
+                        leg.input_amount,
+                        leg.output_amount,
+                        leg.fee_paid,
+                        leg.current_tick_index,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             eprintln!(
-                "profit below threshold: route_id={}, input_amount={}, gross_output={}, net_output={}, expected_gross={}, expected_net={}, estimated_cost_quote_atoms={}, leg0={{venue={}, pool_id={}, input={}, output={}, fee={}, tick={:?}}}, leg1={{venue={}, pool_id={}, input={}, output={}, fee={}, tick={:?}}}",
+                "profit below threshold: route_id={}, kind={:?}, input_amount={}, gross_output={}, net_output={}, expected_gross={}, expected_net={}, estimated_cost_quote_atoms={}, {}",
                 route.route_id.0,
+                route.kind,
                 quote.input_amount,
                 quote.gross_output_amount,
                 quote.net_output_amount,
                 quote.expected_gross_profit_quote_atoms,
                 quote.expected_net_profit_quote_atoms,
                 quote.estimated_execution_cost_quote_atoms,
-                quote.leg_quotes[0].venue,
-                quote.leg_quotes[0].pool_id.0,
-                quote.leg_quotes[0].input_amount,
-                quote.leg_quotes[0].output_amount,
-                quote.leg_quotes[0].fee_paid,
-                quote.leg_quotes[0].current_tick_index,
-                quote.leg_quotes[1].venue,
-                quote.leg_quotes[1].pool_id.0,
-                quote.leg_quotes[1].input_amount,
-                quote.leg_quotes[1].output_amount,
-                quote.leg_quotes[1].fee_paid,
-                quote.leg_quotes[1].current_tick_index,
+                leg_details,
             );
             return Err(RejectionReason::ProfitBelowThreshold {
                 expected: quote.expected_net_profit_quote_atoms,
-                minimum: self.config.min_profit_quote_atoms,
+                minimum: minimum_profit_quote_atoms,
             });
         }
         Ok(())
@@ -180,7 +227,9 @@ mod tests {
         guards::{GuardrailConfig, GuardrailSet},
         quote::{LegQuote, RouteQuote},
         reasons::RejectionReason,
-        route_registry::{RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode, SwapSide},
+        route_registry::{
+            RouteDefinition, RouteKind, RouteLeg, RouteSizingPolicy, SizingMode, SwapSide,
+        },
     };
 
     fn executable_snapshot(pool_id: &str, slot_lag: u64) -> PoolSnapshot {
@@ -215,25 +264,32 @@ mod tests {
     fn route_definition() -> RouteDefinition {
         RouteDefinition {
             route_id: RouteId("route-a".into()),
+            kind: RouteKind::TwoLeg,
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
             sol_quote_conversion_pool_id: Some(PoolId("pool-a".into())),
+            min_profit_quote_atoms: None,
             legs: [
                 RouteLeg {
                     venue: "venue-a".into(),
                     pool_id: PoolId("pool-a".into()),
                     side: SwapSide::BuyBase,
+                    input_mint: "USDC".into(),
+                    output_mint: "SOL".into(),
                     fee_bps: None,
                 },
                 RouteLeg {
                     venue: "venue-b".into(),
                     pool_id: PoolId("pool-b".into()),
                     side: SwapSide::SellBase,
+                    input_mint: "SOL".into(),
+                    output_mint: "USDC".into(),
                     fee_bps: None,
                 },
-            ],
+            ]
+            .into(),
             max_quote_slot_lag: 32,
             min_trade_size: 10_000,
             default_trade_size: 10_000,
@@ -290,22 +346,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_exact_but_stale_snapshot() {
+    fn allows_stale_snapshot_to_flow_to_route_specific_execution_guard() {
         let guards = GuardrailSet::new(GuardrailConfig::default());
         let first = executable_snapshot("pool-a", 3);
         let second = executable_snapshot("pool-b", 0);
         let state = state_with_snapshots(&[first.clone(), second.clone()]);
 
-        let rejection = guards
-            .evaluate_snapshots(&state, &[&first, &second])
-            .expect_err("stale snapshots should be rejected");
-
-        assert_eq!(
-            rejection,
-            RejectionReason::SnapshotStale {
-                pool_id: PoolId("pool-a".into()),
-                slot_lag: 3,
-            }
+        assert!(
+            guards
+                .evaluate_snapshots(&state, &[&first, &second])
+                .is_ok(),
+            "route-level quote staleness should decide whether stale snapshots remain tradable"
         );
     }
 
@@ -363,7 +414,8 @@ mod tests {
                     fee_paid: 0,
                     current_tick_index: None,
                 },
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -430,6 +482,25 @@ mod tests {
             ..GuardrailConfig::default()
         });
 
-        assert_eq!(guardrails.minimum_acceptable_output(1_000, 15), 1_040);
+        let route = route_definition();
+        assert_eq!(
+            guardrails.minimum_acceptable_output(&route, 1_000, 15),
+            1_040
+        );
+    }
+
+    #[test]
+    fn minimum_acceptable_output_uses_relative_profit_floor() {
+        let guardrails = GuardrailSet::new(GuardrailConfig {
+            min_profit_quote_atoms: 0,
+            min_profit_bps: 10,
+            ..GuardrailConfig::default()
+        });
+
+        let route = route_definition();
+        assert_eq!(
+            guardrails.minimum_acceptable_output(&route, 2_000_000, 415),
+            2_002_415
+        );
     }
 }

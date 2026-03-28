@@ -445,12 +445,21 @@ impl BotRuntime {
                 .hot_path
                 .strategy
                 .record_execution_too_little_output(&record.route_id),
+            ExecutionOutcome::Failed(FailureClass::ChainExecutionAmountInAboveMaximum) => self
+                .hot_path
+                .strategy
+                .record_execution_amount_in_above_maximum(&record.route_id),
             ExecutionOutcome::Failed(_) => self
                 .hot_path
                 .strategy
                 .record_execution_failure(&record.route_id),
             _ => {}
         }
+        self.hot_path.strategy.record_realized_execution(
+            &record.route_id,
+            record.expected_pnl_quote_atoms,
+            record.realized_pnl_quote_atoms,
+        );
         if let Some(route_health) = route_health.as_mut() {
             match &transition.current_outcome {
                 ExecutionOutcome::Included { .. } => {
@@ -486,6 +495,8 @@ impl BotRuntime {
                 .execution
                 .set_current_leader(slot_boundary.leader.clone());
         }
+        let is_destabilizing_trigger =
+            matches!(&event.payload, MarketEvent::DestabilizingTransaction(_));
         let submit_leader = self.hot_path.execution.current_leader();
 
         let state_started = Instant::now();
@@ -527,6 +538,23 @@ impl BotRuntime {
                     pipeline_trace.observed_slot,
                 );
             }
+        }
+        if event.source.source == EventSourceKind::ShredStream && !is_destabilizing_trigger {
+            return Ok(PreparedHotPath::Report(HotPathReport {
+                state_outcome: Some(state_outcome),
+                pool_snapshots,
+                selection: SelectionOutcome {
+                    decisions: Vec::new(),
+                    best_candidate: None,
+                    shadow_candidate: None,
+                },
+                build_result: None,
+                signed_envelope: None,
+                submit_result: None,
+                execution_record: None,
+                submit_leader,
+                pipeline_trace,
+            }));
         }
         if state_outcome.impacted_routes.is_empty() {
             return Ok(PreparedHotPath::Report(HotPathReport {
@@ -694,6 +722,36 @@ impl BotRuntime {
             self.submit_mode,
             submit_result.clone(),
         );
+        let _ = self.tracker.set_profit_context(
+            &execution_record.submission_id,
+            self.hot_path
+                .strategy
+                .route_profit_mint(&signed_envelope.route_id),
+            Some(self.hot_path.wallet.owner_pubkey.clone()),
+            report
+                .selection
+                .best_candidate
+                .as_ref()
+                .map(|candidate| candidate.expected_net_profit_quote_atoms),
+            report
+                .selection
+                .best_candidate
+                .as_ref()
+                .map(|candidate| candidate.estimated_execution_cost_quote_atoms),
+        );
+        if matches!(
+            execution_record.outcome,
+            ExecutionOutcome::Failed(FailureClass::SubmitRejected)
+        ) {
+            let _ =
+                self.tracker
+                    .set_realized_pnl(&execution_record.submission_id, Some(0), Some(0));
+        }
+        let execution_record = self
+            .tracker
+            .get(&execution_record.submission_id)
+            .cloned()
+            .unwrap_or(execution_record);
         if let ExecutionOutcome::Failed(class) = &execution_record.outcome {
             self.hot_path
                 .strategy
@@ -753,6 +811,7 @@ impl BotRuntime {
                 FailureClass::Expired => self.telemetry.metrics.increment_expired(),
                 FailureClass::ChainDropped
                 | FailureClass::ChainExecutionTooLittleOutput
+                | FailureClass::ChainExecutionAmountInAboveMaximum
                 | FailureClass::ChainExecutionFailed
                 | FailureClass::Unknown => self.telemetry.metrics.increment_chain_failed(),
             },
@@ -792,7 +851,7 @@ mod tests {
         config::{
             AccountDependencyConfig, BotConfig, MessageModeConfig,
             OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig,
-            RouteClassConfig, RouteConfig, RouteExecutionConfig, RouteLegConfig,
+            RouteClassConfig, RouteConfig, RouteExecutionConfig, RouteKindConfig, RouteLegConfig,
             RouteLegExecutionConfig, RoutesConfig, SigningProviderKind, SwapSideConfig,
         },
     };
@@ -844,6 +903,7 @@ mod tests {
             message_mode: MessageModeConfig::V0Required,
             lookup_tables: Vec::new(),
             default_compute_unit_limit: 300_000,
+            minimum_compute_unit_limit: 0,
             default_compute_unit_price_micro_lamports: 25_000,
             default_jito_tip_lamports: 5_000,
             max_quote_slot_lag: 4,
@@ -878,12 +938,14 @@ mod tests {
         RouteConfig {
             enabled: true,
             route_class: RouteClassConfig::AmmFastPath,
+            kind: RouteKindConfig::TwoLeg,
             route_id: "route-a".into(),
             input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             base_mint: Some("So11111111111111111111111111111111111111112".into()),
             quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
             sol_quote_conversion_pool_id: Some("pool-a".into()),
+            min_profit_quote_atoms: None,
             min_trade_size: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
@@ -893,11 +955,13 @@ mod tests {
                 ..Default::default()
             },
             execution_protection: Default::default(),
-            legs: [
+            legs: vec![
                 RouteLegConfig {
                     venue: "orca".into(),
                     pool_id: "pool-a".into(),
                     side: SwapSideConfig::BuyBase,
+                    input_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                    output_mint: Some("So11111111111111111111111111111111111111112".into()),
                     fee_bps: None,
                     execution: RouteLegExecutionConfig::OrcaSimplePool(
                         OrcaSimplePoolLegExecutionConfig {
@@ -919,6 +983,8 @@ mod tests {
                     venue: "raydium".into(),
                     pool_id: "pool-b".into(),
                     side: SwapSideConfig::SellBase,
+                    input_mint: Some("So11111111111111111111111111111111111111112".into()),
+                    output_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
                     fee_bps: None,
                     execution: RouteLegExecutionConfig::RaydiumSimplePool(
                         RaydiumSimplePoolLegExecutionConfig {
@@ -967,7 +1033,7 @@ mod tests {
         config.routes = RoutesConfig {
             definitions: vec![route_config()],
         };
-        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
         config.runtime.live_set_health.enabled = false;
@@ -997,7 +1063,7 @@ mod tests {
         config.routes = RoutesConfig {
             definitions: vec![route_config()],
         };
-        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
         config.runtime.live_set_health.enabled = false;
@@ -1035,7 +1101,7 @@ mod tests {
         config.routes = RoutesConfig {
             definitions: vec![route_config()],
         };
-        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
         config.runtime.live_set_health.enabled = false;

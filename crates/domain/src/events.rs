@@ -117,6 +117,17 @@ pub struct PoolInvalidation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestabilizingTransaction {
+    pub pool_id: String,
+    pub venue: PoolVenue,
+    pub slot: u64,
+    pub signature: Option<String>,
+    pub input_amount: u64,
+    pub estimated_price_impact_bps: u16,
+    pub trigger_threshold_bps: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotBoundary {
     pub slot: u64,
     pub leader: Option<String>,
@@ -134,6 +145,7 @@ pub enum MarketEvent {
     PoolSnapshotUpdate(PoolSnapshotUpdate),
     PoolQuoteModelUpdate(PoolQuoteModelUpdate),
     PoolInvalidation(PoolInvalidation),
+    DestabilizingTransaction(DestabilizingTransaction),
     SlotBoundary(SlotBoundary),
     Heartbeat(Heartbeat),
 }
@@ -199,6 +211,20 @@ impl NormalizedEvent {
             sequence,
             observed_slot,
             MarketEvent::PoolInvalidation(invalidation),
+        )
+    }
+
+    pub fn destabilizing_transaction(
+        source: EventSourceKind,
+        sequence: u64,
+        observed_slot: u64,
+        trigger: DestabilizingTransaction,
+    ) -> Self {
+        Self::with_payload(
+            source,
+            sequence,
+            observed_slot,
+            MarketEvent::DestabilizingTransaction(trigger),
         )
     }
 

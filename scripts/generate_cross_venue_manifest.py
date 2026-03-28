@@ -43,6 +43,8 @@ class OrcaPool:
     token_mint_b: str
     token_symbol_a: str
     token_symbol_b: str
+    token_decimals_a: int
+    token_decimals_b: int
     token_program_id: str
     token_vault_a: str
     token_vault_b: str
@@ -60,6 +62,8 @@ class RayPool:
     token_mint_b: str
     token_symbol_a: str
     token_symbol_b: str
+    token_decimals_a: int
+    token_decimals_b: int
     token_program_id: str
     token_vault_a: str
     token_vault_b: str
@@ -79,6 +83,8 @@ class RaySimplePool:
     token_mint_b: str
     token_symbol_a: str
     token_symbol_b: str
+    token_decimals_a: int
+    token_decimals_b: int
     token_program_id: str
     amm_coin_vault: str
     amm_pc_vault: str
@@ -140,6 +146,8 @@ def fetch_orca_pools(min_tvl: int, page_size: int, max_pages: int) -> list[OrcaP
                     token_mint_b=item["tokenMintB"],
                     token_symbol_a=item["tokenA"]["symbol"],
                     token_symbol_b=item["tokenB"]["symbol"],
+                    token_decimals_a=int(item["tokenA"]["decimals"]),
+                    token_decimals_b=int(item["tokenB"]["decimals"]),
                     token_program_id=item["tokenA"]["programId"],
                     token_vault_a=item["tokenVaultA"],
                     token_vault_b=item["tokenVaultB"],
@@ -194,22 +202,37 @@ def pair_key(mint_a: str, mint_b: str) -> tuple[str, str]:
     return tuple(sorted((mint_a, mint_b)))
 
 
-def route_sizes(quote_mint: str) -> tuple[int, int, int, list[int]]:
-    if quote_mint == USDC_MINT:
-        ladder = [50_000, 100_000, 250_000, 500_000, 750_000, 1_000_000, 1_500_000, 2_000_000]
-        return ladder[0], 250_000, ladder[-1], ladder
-    ladder = [2_500_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000]
+def route_sizes(
+    quote_mint: str,
+    quote_symbol: str,
+    quote_decimals: int | None,
+) -> tuple[int, int, int, list[int]]:
+    stable_like_quotes = {"usdc", "usdt", "usd1", "usdg", "eurc", "usde", "pyusd"}
+    sol_like_quotes = {"sol", "jitosol", "msol", "jupsol", "stsol", "bsol"}
+    if quote_mint == USDC_MINT or quote_symbol in stable_like_quotes or (
+        quote_decimals is not None and quote_decimals <= 6
+    ):
+        ladder = [2_500_000, 5_000_000, 10_000_000, 15_000_000, 20_000_000, 25_000_000]
+        return ladder[0], 15_000_000, ladder[-1], ladder
+    if quote_mint == SOL_MINT or quote_symbol in sol_like_quotes or (
+        quote_decimals is not None and quote_decimals >= 8
+    ):
+        ladder = [2_500_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000, 100_000_000]
+        return ladder[0], 10_000_000, ladder[-1], ladder
+    ladder = [1_000_000, 2_500_000, 5_000_000, 10_000_000, 20_000_000, 50_000_000]
     return ladder[0], 10_000_000, ladder[-1], ladder
 
 
-def choose_base_quote(pair: tuple[str, str]) -> tuple[str, str]:
+def choose_base_quote(
+    pair: tuple[str, str],
+    quote_priority: list[str],
+) -> tuple[str, str]:
     left, right = pair
     if pair == tuple(sorted((SOL_MINT, USDC_MINT))):
         return SOL_MINT, USDC_MINT
-    if USDC_MINT in pair:
-        return right if left == USDC_MINT else left, USDC_MINT
-    if SOL_MINT in pair:
-        return right if left == SOL_MINT else left, SOL_MINT
+    for quote_mint in quote_priority:
+        if quote_mint in pair:
+            return (right if left == quote_mint else left), quote_mint
     raise ValueError(f"unsupported pair {pair}")
 
 
@@ -242,6 +265,47 @@ def pool_address(pool: OrcaPool | RayPool | RaySimplePool) -> str:
 
 def pool_lookup_table(pool: OrcaPool | RayPool | RaySimplePool) -> str | None:
     return pool.address_lookup_table if isinstance(pool, OrcaPool) else pool.lookup_table_account
+
+
+def pool_tvl(pool: OrcaPool | RayPool | RaySimplePool) -> float:
+    return pool.tvl_usdc
+
+
+def token_symbol_for_mint(pool: OrcaPool | RayPool | RaySimplePool, mint: str) -> str:
+    if pool.token_mint_a == mint:
+        return pool.token_symbol_a
+    if pool.token_mint_b == mint:
+        return pool.token_symbol_b
+    raise ValueError(f"pool {pool.address} does not contain mint {mint}")
+
+
+def token_decimals_for_mint(pool: OrcaPool | RayPool | RaySimplePool, mint: str) -> int:
+    if pool.token_mint_a == mint:
+        return pool.token_decimals_a
+    if pool.token_mint_b == mint:
+        return pool.token_decimals_b
+    raise ValueError(f"pool {pool.address} does not contain mint {mint}")
+
+
+def top_n_unique(items, key_fn, id_fn, limit: int):
+    selected = []
+    seen = set()
+    for item in sorted(items, key=key_fn, reverse=True):
+        item_id = id_fn(item)
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def route_id_from_rendered(rendered: str) -> str:
+    for line in rendered.splitlines():
+        if line.startswith('route_id = "'):
+            return line.split('"')[1]
+    raise ValueError("rendered route is missing route_id")
 
 
 def render_account_dependencies(
@@ -370,6 +434,8 @@ def render_route(
     quote_symbol: str,
     base_mint: str,
     quote_mint: str,
+    quote_decimals: int,
+    sol_quote_conversion_pool_id: str | None,
     first_pool: OrcaPool | RayPool | RaySimplePool,
     second_pool: OrcaPool | RayPool | RaySimplePool,
 ) -> str:
@@ -377,7 +443,11 @@ def render_route(
         f"{base_symbol}-{quote_symbol}-{venue_tag(first_pool)}-{short_id(pool_address(first_pool))}"
         f"-{venue_tag(second_pool)}-{short_id(pool_address(second_pool))}"
     )
-    min_trade_size, default_trade_size, max_trade_size, size_ladder = route_sizes(quote_mint)
+    min_trade_size, default_trade_size, max_trade_size, size_ladder = route_sizes(
+        quote_mint,
+        quote_symbol,
+        quote_decimals,
+    )
 
     lines = [
         "",
@@ -390,8 +460,8 @@ def render_route(
         f'base_mint = "{base_mint}"',
         f'quote_mint = "{quote_mint}"',
     ]
-    if quote_mint == USDC_MINT:
-        lines.append(f'sol_quote_conversion_pool_id = "{SOL_USDC_CONVERSION_POOL}"')
+    if quote_mint != SOL_MINT and sol_quote_conversion_pool_id:
+        lines.append(f'sol_quote_conversion_pool_id = "{sol_quote_conversion_pool_id}"')
     lines.extend(
         [
             f"min_trade_size = {min_trade_size}",
@@ -411,8 +481,8 @@ def render_route(
             "[routes.definitions.execution]",
             'message_mode = "v0_required"',
             "default_compute_unit_limit = 300000",
-            "default_compute_unit_price_micro_lamports = 10000",
-            "default_jito_tip_lamports = 1000",
+            "default_compute_unit_price_micro_lamports = 1",
+            "default_jito_tip_lamports = 1",
             "max_quote_slot_lag = 32",
             "max_alt_slot_lag = 32",
         ]
@@ -442,6 +512,8 @@ def render_raydium_only_route(
     quote_symbol: str,
     base_mint: str,
     quote_mint: str,
+    quote_decimals: int,
+    sol_quote_conversion_pool_id: str | None,
     first_pool: RayPool,
     second_pool: RayPool,
 ) -> str:
@@ -449,7 +521,11 @@ def render_raydium_only_route(
         f"{base_symbol}-{quote_symbol}-ray-{short_id(first_pool.address)}"
         f"-ray-{short_id(second_pool.address)}"
     )
-    min_trade_size, default_trade_size, max_trade_size, size_ladder = route_sizes(quote_mint)
+    min_trade_size, default_trade_size, max_trade_size, size_ladder = route_sizes(
+        quote_mint,
+        quote_symbol,
+        quote_decimals,
+    )
     first_zero_for_one = quote_mint == first_pool.token_mint_a
     second_zero_for_one = base_mint == second_pool.token_mint_a
     lines = [
@@ -463,8 +539,8 @@ def render_raydium_only_route(
         f'base_mint = "{base_mint}"',
         f'quote_mint = "{quote_mint}"',
     ]
-    if quote_mint == USDC_MINT:
-        lines.append(f'sol_quote_conversion_pool_id = "{SOL_USDC_CONVERSION_POOL}"')
+    if quote_mint != SOL_MINT and sol_quote_conversion_pool_id:
+        lines.append(f'sol_quote_conversion_pool_id = "{sol_quote_conversion_pool_id}"')
     lines.extend(
         [
             f"min_trade_size = {min_trade_size}",
@@ -541,8 +617,8 @@ def render_raydium_only_route(
             "[routes.definitions.execution]",
             'message_mode = "v0_required"',
             "default_compute_unit_limit = 300000",
-            "default_compute_unit_price_micro_lamports = 10000",
-            "default_jito_tip_lamports = 1000",
+            "default_compute_unit_price_micro_lamports = 1",
+            "default_jito_tip_lamports = 1",
             "max_quote_slot_lag = 32",
             "max_alt_slot_lag = 32",
         ]
@@ -574,6 +650,8 @@ def build_raydium_clmm_pool(stub: dict, detail: dict) -> RayPool:
         token_mint_b=detail["mintB"]["address"],
         token_symbol_a=detail["mintA"]["symbol"],
         token_symbol_b=detail["mintB"]["symbol"],
+        token_decimals_a=int(detail["mintA"]["decimals"]),
+        token_decimals_b=int(detail["mintB"]["decimals"]),
         token_program_id=detail["mintA"]["programId"],
         token_vault_a=detail["vault"]["A"],
         token_vault_b=detail["vault"]["B"],
@@ -594,6 +672,8 @@ def build_raydium_simple_pool(stub: dict, detail: dict) -> RaySimplePool:
         token_mint_b=detail["mintB"]["address"],
         token_symbol_a=detail["mintA"]["symbol"],
         token_symbol_b=detail["mintB"]["symbol"],
+        token_decimals_a=int(detail["mintA"]["decimals"]),
+        token_decimals_b=int(detail["mintB"]["decimals"]),
         token_program_id=detail["mintA"]["programId"],
         amm_coin_vault=detail["vault"]["A"],
         amm_pc_vault=detail["vault"]["B"],
@@ -630,6 +710,13 @@ def build_manifest(
     max_ray_pages: int,
     include_intra_ray: bool,
     include_raydium_simple: bool,
+    top_orca_per_pair: int,
+    top_ray_clmm_per_pair: int,
+    top_ray_simple_per_pair: int,
+    include_extra_quotes: bool,
+    extra_quote_min_conversion_tvl: int,
+    extra_quote_min_pairs: int,
+    max_extra_quotes: int,
 ) -> tuple[int, int]:
     template_text = template_path.read_text(encoding="utf-8")
     prefix, _, _ = template_text.partition("[[routes.definitions]]")
@@ -641,112 +728,185 @@ def build_manifest(
     orca_pools = fetch_orca_pools(min_orca_tvl, page_size=100, max_pages=max_orca_pages)
     ray_list = fetch_raydium_list(max_pages=max_ray_pages, page_size=100)
 
-    best_orca_by_pair: dict[tuple[str, str], OrcaPool] = {}
+    orca_by_pair: dict[tuple[str, str], list[OrcaPool]] = defaultdict(list)
     for pool in orca_pools:
         if pool.address in EXCLUDED_ORCA_POOLS:
             continue
         pair = pair_key(pool.token_mint_a, pool.token_mint_b)
-        if SOL_MINT not in pair and USDC_MINT not in pair:
-            continue
-        current = best_orca_by_pair.get(pair)
-        if current is None or pool.tvl_usdc > current.tvl_usdc:
-            best_orca_by_pair[pair] = pool
+        orca_by_pair[pair].append(pool)
+    selected_orca_by_pair = {
+        pair: top_n_unique(
+            pools,
+            key_fn=lambda pool: pool.tvl_usdc,
+            id_fn=lambda pool: pool.address,
+            limit=max(1, top_orca_per_pair),
+        )
+        for pair, pools in orca_by_pair.items()
+    }
 
     ray_clmm_stubs_by_pair: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    best_ray_clmm_stub_by_pair: dict[tuple[str, str], dict] = {}
-    best_ray_simple_stub_by_pair: dict[tuple[str, str], dict] = {}
+    ray_simple_stubs_by_pair: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for item in ray_list:
         if item["id"] in EXCLUDED_RAYDIUM_POOLS:
             continue
         pair = pair_key(item["mintA"]["address"], item["mintB"]["address"])
-        if SOL_MINT not in pair and USDC_MINT not in pair:
-            continue
         tvl = float(item["tvl"])
         if tvl < min_ray_tvl:
             continue
         if item.get("type") == "Concentrated":
             ray_clmm_stubs_by_pair[pair].append(item)
-            current = best_ray_clmm_stub_by_pair.get(pair)
-            if current is None or tvl > float(current["tvl"]):
-                best_ray_clmm_stub_by_pair[pair] = item
         elif (
             include_raydium_simple
             and item.get("type") == "Standard"
             and supports_raydium_simple_route(item)
         ):
-            current = best_ray_simple_stub_by_pair.get(pair)
-            if current is None or tvl > float(current["tvl"]):
-                best_ray_simple_stub_by_pair[pair] = item
+            ray_simple_stubs_by_pair[pair].append(item)
+
+    selected_ray_clmm_by_pair = {
+        pair: top_n_unique(
+            stubs,
+            key_fn=lambda item: float(item["tvl"]),
+            id_fn=lambda item: item["id"],
+            limit=max(1, top_ray_clmm_per_pair),
+        )
+        for pair, stubs in ray_clmm_stubs_by_pair.items()
+    }
+    selected_ray_simple_by_pair = {
+        pair: top_n_unique(
+            stubs,
+            key_fn=lambda item: float(item["tvl"]),
+            id_fn=lambda item: item["id"],
+            limit=max(1, top_ray_simple_per_pair),
+        )
+        for pair, stubs in ray_simple_stubs_by_pair.items()
+    }
 
     candidate_pairs = sorted(
-        set(best_orca_by_pair)
-        | set(best_ray_clmm_stub_by_pair)
-        | set(best_ray_simple_stub_by_pair)
+        set(selected_orca_by_pair)
+        | set(selected_ray_clmm_by_pair)
+        | set(selected_ray_simple_by_pair)
     )
     ray_ids = set()
     for pair in candidate_pairs:
-        if pair in best_ray_clmm_stub_by_pair:
-            ray_ids.add(best_ray_clmm_stub_by_pair[pair]["id"])
-        if pair in best_ray_simple_stub_by_pair:
-            ray_ids.add(best_ray_simple_stub_by_pair[pair]["id"])
-    if include_intra_ray:
-        for pair, stubs in ray_clmm_stubs_by_pair.items():
-            unique_ids = []
-            seen = set()
-            for stub in sorted(stubs, key=lambda item: float(item["tvl"]), reverse=True):
-                if stub["id"] in seen:
-                    continue
-                seen.add(stub["id"])
-                unique_ids.append(stub["id"])
-            for pool_id in unique_ids[:2]:
-                ray_ids.add(pool_id)
+        for stub in selected_ray_clmm_by_pair.get(pair, []):
+            ray_ids.add(stub["id"])
+        for stub in selected_ray_simple_by_pair.get(pair, []):
+            ray_ids.add(stub["id"])
+        if include_intra_ray:
+            for pair, stubs in ray_clmm_stubs_by_pair.items():
+                for stub in top_n_unique(
+                    stubs,
+                    key_fn=lambda item: float(item["tvl"]),
+                    id_fn=lambda item: item["id"],
+                    limit=max(2, top_ray_clmm_per_pair),
+                ):
+                    ray_ids.add(stub["id"])
     ray_details = fetch_raydium_keys(sorted(ray_ids))
 
-    routes: list[str] = []
-    pair_count = 0
-    for pair in candidate_pairs:
+    def pools_for_pair(
+        pair: tuple[str, str],
+    ) -> list[OrcaPool | RayPool | RaySimplePool]:
         pools: list[OrcaPool | RayPool | RaySimplePool] = []
-        if pair in best_orca_by_pair:
-            pools.append(best_orca_by_pair[pair])
-        if pair in best_ray_clmm_stub_by_pair:
-            ray_detail = ray_details.get(best_ray_clmm_stub_by_pair[pair]["id"])
+        pools.extend(selected_orca_by_pair.get(pair, []))
+        for ray_stub in selected_ray_clmm_by_pair.get(pair, []):
+            ray_detail = ray_details.get(ray_stub["id"])
             if ray_detail is not None:
-                pools.append(build_raydium_clmm_pool(best_ray_clmm_stub_by_pair[pair], ray_detail))
-        if pair in best_ray_simple_stub_by_pair:
-            ray_detail = ray_details.get(best_ray_simple_stub_by_pair[pair]["id"])
+                pools.append(build_raydium_clmm_pool(ray_stub, ray_detail))
+        for ray_stub in selected_ray_simple_by_pair.get(pair, []):
+            ray_detail = ray_details.get(ray_stub["id"])
             if ray_detail is not None:
-                pools.append(build_raydium_simple_pool(best_ray_simple_stub_by_pair[pair], ray_detail))
-        if len(pools) < 2:
-            continue
-        base_mint, quote_mint = choose_base_quote(pair)
-        anchor_pool = pools[0]
-        if base_mint == anchor_pool.token_mint_a:
-            base_symbol = canonical_symbol(base_mint, anchor_pool.token_symbol_a)
-        else:
-            base_symbol = canonical_symbol(base_mint, anchor_pool.token_symbol_b)
-        quote_symbol = "usdc" if quote_mint == USDC_MINT else "sol"
-        for first_pool, second_pool in permutations(pools, 2):
-            routes.append(
-                render_route(
-                    base_symbol=base_symbol,
-                    quote_symbol=quote_symbol,
-                    base_mint=base_mint,
-                    quote_mint=quote_mint,
-                    first_pool=first_pool,
-                    second_pool=second_pool,
+                pools.append(build_raydium_simple_pool(ray_stub, ray_detail))
+        return pools
+
+    quote_priority = [USDC_MINT, SOL_MINT]
+    sol_quote_conversion_pool_ids: dict[str, str] = {
+        USDC_MINT: SOL_USDC_CONVERSION_POOL,
+    }
+    extra_quote_descriptions: list[str] = []
+    if include_extra_quotes:
+        extra_quote_candidates: list[tuple[int, float, str, str, str]] = []
+        for pair in candidate_pairs:
+            if SOL_MINT not in pair or USDC_MINT in pair:
+                continue
+            pools = pools_for_pair(pair)
+            if len(pools) < 2:
+                continue
+            quote_mint = pair[0] if pair[1] == SOL_MINT else pair[1]
+            best_pool = max(pools, key=pool_tvl)
+            pair_count = 0
+            for extra_pair in candidate_pairs:
+                if SOL_MINT in extra_pair or USDC_MINT in extra_pair or quote_mint not in extra_pair:
+                    continue
+                if len(pools_for_pair(extra_pair)) >= 2:
+                    pair_count += 1
+            if pair_count < extra_quote_min_pairs:
+                continue
+            conversion_tvl = pool_tvl(best_pool)
+            if conversion_tvl < extra_quote_min_conversion_tvl:
+                continue
+            quote_symbol = canonical_symbol(
+                quote_mint,
+                token_symbol_for_mint(best_pool, quote_mint),
+            )
+            extra_quote_candidates.append(
+                (
+                    pair_count,
+                    conversion_tvl,
+                    quote_mint,
+                    quote_symbol,
+                    pool_address(best_pool),
                 )
             )
+        extra_quote_candidates.sort(reverse=True)
+        for pair_count, conversion_tvl, quote_mint, quote_symbol, pool_id in extra_quote_candidates[
+            : max_extra_quotes
+        ]:
+            quote_priority.append(quote_mint)
+            sol_quote_conversion_pool_ids[quote_mint] = pool_id
+            extra_quote_descriptions.append(
+                f"{quote_symbol}:{pair_count}pairs/{int(conversion_tvl)}tvl"
+            )
+
+    routes_by_id: dict[str, str] = {}
+    pair_count = 0
+    for pair in candidate_pairs:
+        pools = pools_for_pair(pair)
+        if len(pools) < 2:
+            continue
+        try:
+            base_mint, quote_mint = choose_base_quote(pair, quote_priority)
+        except ValueError:
+            continue
+        anchor_pool = pools[0]
+        base_symbol = canonical_symbol(base_mint, token_symbol_for_mint(anchor_pool, base_mint))
+        quote_symbol = canonical_symbol(
+            quote_mint,
+            token_symbol_for_mint(anchor_pool, quote_mint),
+        )
+        quote_decimals = token_decimals_for_mint(anchor_pool, quote_mint)
+        sol_quote_conversion_pool_id = sol_quote_conversion_pool_ids.get(quote_mint)
+        for first_pool, second_pool in permutations(pools, 2):
+            rendered = render_route(
+                base_symbol=base_symbol,
+                quote_symbol=quote_symbol,
+                base_mint=base_mint,
+                quote_mint=quote_mint,
+                quote_decimals=quote_decimals,
+                sol_quote_conversion_pool_id=sol_quote_conversion_pool_id,
+                first_pool=first_pool,
+                second_pool=second_pool,
+            )
+            routes_by_id.setdefault(route_id_from_rendered(rendered), rendered)
         pair_count += 1
 
     if include_intra_ray:
         for pair, stubs in sorted(ray_clmm_stubs_by_pair.items()):
-            unique_stubs = []
-            seen = set()
-            for stub in sorted(stubs, key=lambda item: float(item["tvl"]), reverse=True):
-                if stub["id"] in seen:
-                    continue
-                seen.add(stub["id"])
-                unique_stubs.append(stub)
+            unique_stubs = top_n_unique(
+                stubs,
+                key_fn=lambda item: float(item["tvl"]),
+                id_fn=lambda item: item["id"],
+                limit=max(2, top_ray_clmm_per_pair),
+            )
             if len(unique_stubs) < 2:
                 continue
             pool_a = ray_details.get(unique_stubs[0]["id"])
@@ -755,32 +915,39 @@ def build_manifest(
                 continue
             ray_a = build_raydium_clmm_pool(unique_stubs[0], pool_a)
             ray_b = build_raydium_clmm_pool(unique_stubs[1], pool_b)
-            base_mint, quote_mint = choose_base_quote(pair)
-            if base_mint == ray_a.token_mint_a:
-                base_symbol = canonical_symbol(base_mint, ray_a.token_symbol_a)
-            else:
-                base_symbol = canonical_symbol(base_mint, ray_a.token_symbol_b)
-            quote_symbol = "usdc" if quote_mint == USDC_MINT else "sol"
-            routes.append(
-                render_raydium_only_route(
-                    base_symbol=base_symbol,
-                    quote_symbol=quote_symbol,
-                    base_mint=base_mint,
-                    quote_mint=quote_mint,
-                    first_pool=ray_a,
-                    second_pool=ray_b,
-                )
+            try:
+                base_mint, quote_mint = choose_base_quote(pair, quote_priority)
+            except ValueError:
+                continue
+            base_symbol = canonical_symbol(base_mint, token_symbol_for_mint(ray_a, base_mint))
+            quote_symbol = canonical_symbol(
+                quote_mint,
+                token_symbol_for_mint(ray_a, quote_mint),
             )
-            routes.append(
-                render_raydium_only_route(
-                    base_symbol=base_symbol,
-                    quote_symbol=quote_symbol,
-                    base_mint=base_mint,
-                    quote_mint=quote_mint,
-                    first_pool=ray_b,
-                    second_pool=ray_a,
-                )
+            quote_decimals = token_decimals_for_mint(ray_a, quote_mint)
+            sol_quote_conversion_pool_id = sol_quote_conversion_pool_ids.get(quote_mint)
+            rendered = render_raydium_only_route(
+                base_symbol=base_symbol,
+                quote_symbol=quote_symbol,
+                base_mint=base_mint,
+                quote_mint=quote_mint,
+                quote_decimals=quote_decimals,
+                sol_quote_conversion_pool_id=sol_quote_conversion_pool_id,
+                first_pool=ray_a,
+                second_pool=ray_b,
             )
+            routes_by_id.setdefault(route_id_from_rendered(rendered), rendered)
+            rendered = render_raydium_only_route(
+                base_symbol=base_symbol,
+                quote_symbol=quote_symbol,
+                base_mint=base_mint,
+                quote_mint=quote_mint,
+                quote_decimals=quote_decimals,
+                sol_quote_conversion_pool_id=sol_quote_conversion_pool_id,
+                first_pool=ray_b,
+                second_pool=ray_a,
+            )
+            routes_by_id.setdefault(route_id_from_rendered(rendered), rendered)
 
     header = (
         prefix
@@ -788,11 +955,17 @@ def build_manifest(
         + "# Auto-generated from official Orca and Raydium APIs on "
         + date.today().isoformat()
         + ".\n"
-        + f"# Supported pairs with at least two pools: {pair_count}. Routes: {len(routes)}.\n"
-        + f"# Selection: Orca/Raydium tvl >= {min_orca_tvl}/{min_ray_tvl}, quote mints limited to SOL/USDC.\n"
+        + f"# Supported pairs with at least two pools: {pair_count}. Routes: {len(routes_by_id)}.\n"
+        + f"# Selection: Orca/Raydium tvl >= {min_orca_tvl}/{min_ray_tvl}, quote priority = {', '.join(canonical_symbol(mint, mint) for mint in quote_priority[:2])}"
+        + (
+            f" + extra quotes [{', '.join(extra_quote_descriptions)}]"
+            if extra_quote_descriptions
+            else ""
+        )
+        + ".\n"
     )
-    output_path.write_text(header + "".join(routes) + "\n", encoding="utf-8")
-    return pair_count, len(routes)
+    output_path.write_text(header + "".join(routes_by_id.values()) + "\n", encoding="utf-8")
+    return pair_count, len(routes_by_id)
 
 
 def parse_args() -> argparse.Namespace:
@@ -823,6 +996,18 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="include Raydium hybrid AMM/OpenBook pools in generated routes",
     )
+    parser.add_argument("--top-orca-per-pair", type=int, default=1)
+    parser.add_argument("--top-ray-clmm-per-pair", type=int, default=1)
+    parser.add_argument("--top-ray-simple-per-pair", type=int, default=1)
+    parser.add_argument(
+        "--include-extra-quotes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="also generate routes quoted in non-SOL/non-USDC assets that have a tracked SOL/<quote> conversion pool",
+    )
+    parser.add_argument("--extra-quote-min-conversion-tvl", type=int, default=1_000_000)
+    parser.add_argument("--extra-quote-min-pairs", type=int, default=3)
+    parser.add_argument("--max-extra-quotes", type=int, default=10)
     return parser.parse_args()
 
 
@@ -837,6 +1022,13 @@ def main() -> int:
         max_ray_pages=args.max_ray_pages,
         include_intra_ray=args.include_intra_ray,
         include_raydium_simple=args.include_raydium_simple,
+        top_orca_per_pair=args.top_orca_per_pair,
+        top_ray_clmm_per_pair=args.top_ray_clmm_per_pair,
+        top_ray_simple_per_pair=args.top_ray_simple_per_pair,
+        include_extra_quotes=args.include_extra_quotes,
+        extra_quote_min_conversion_tvl=args.extra_quote_min_conversion_tvl,
+        extra_quote_min_pairs=args.extra_quote_min_pairs,
+        max_extra_quotes=args.max_extra_quotes,
     )
     print(f"generated {route_count} routes across {pair_count} pairs -> {args.output}")
     return 0

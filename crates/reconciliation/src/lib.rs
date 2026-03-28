@@ -459,6 +459,244 @@ mod tests {
         );
     }
 
+    #[test]
+    fn onchain_reconciler_computes_realized_pnl_from_token_balance_delta() {
+        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getSignatureStatuses" => json!({
+                    "result": {
+                        "value": [{
+                            "slot": 88,
+                            "err": null
+                        }]
+                    }
+                })
+                .to_string(),
+                "getTransaction" => json!({
+                    "result": {
+                        "meta": {
+                            "err": null,
+                            "preTokenBalances": [{
+                                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                                "owner": "wallet-owner",
+                                "uiTokenAmount": { "amount": "1000" }
+                            }],
+                            "postTokenBalances": [{
+                                "mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                                "owner": "wallet-owner",
+                                "uiTokenAmount": { "amount": "1125" }
+                            }]
+                        }
+                    }
+                })
+                .to_string(),
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let mut tracker = ExecutionTracker::default();
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "chain-sig",
+            10,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-1".into()),
+                endpoint: rpc_endpoint.clone(),
+                rejection: None,
+            },
+        );
+        assert!(tracker.set_profit_context(
+            &record.submission_id,
+            Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+            Some("wallet-owner".into()),
+            Some(125),
+            Some(25),
+        ));
+        let mut reconciler = OnChainReconciler::new(OnChainReconciliationConfig {
+            enabled: true,
+            rpc_http_endpoint: rpc_endpoint,
+            rpc_ws_endpoint: "mock://solana-ws".into(),
+            websocket_enabled: false,
+            websocket_timeout_ms: 5,
+            search_transaction_history: true,
+            max_pending_slots: 5,
+        });
+
+        let transitions = reconciler.tick(&mut tracker, 10);
+
+        assert_eq!(transitions.len(), 1);
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(updated.outcome, ExecutionOutcome::Included { slot: 88 });
+        assert_eq!(updated.realized_output_delta_quote_atoms, Some(125));
+        assert_eq!(updated.realized_pnl_quote_atoms, Some(100));
+    }
+
+    #[test]
+    fn onchain_reconciler_computes_realized_pnl_from_wsol_balance_delta() {
+        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getSignatureStatuses" => json!({
+                    "result": {
+                        "value": [{
+                            "slot": 91,
+                            "err": null
+                        }]
+                    }
+                })
+                .to_string(),
+                "getTransaction" => json!({
+                    "result": {
+                        "meta": {
+                            "err": null,
+                            "preTokenBalances": [{
+                                "mint": "So11111111111111111111111111111111111111112",
+                                "owner": "wallet-owner",
+                                "uiTokenAmount": { "amount": "1000000" }
+                            }],
+                            "postTokenBalances": [{
+                                "mint": "So11111111111111111111111111111111111111112",
+                                "owner": "wallet-owner",
+                                "uiTokenAmount": { "amount": "1000125" }
+                            }]
+                        }
+                    }
+                })
+                .to_string(),
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let mut tracker = ExecutionTracker::default();
+        let record = register_submission(
+            &mut tracker,
+            "route-sol",
+            "chain-sig-sol",
+            10,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-sol".into()),
+                endpoint: rpc_endpoint.clone(),
+                rejection: None,
+            },
+        );
+        assert!(tracker.set_profit_context(
+            &record.submission_id,
+            Some("So11111111111111111111111111111111111111112".into()),
+            Some("wallet-owner".into()),
+            Some(125),
+            Some(25),
+        ));
+        let mut reconciler = OnChainReconciler::new(OnChainReconciliationConfig {
+            enabled: true,
+            rpc_http_endpoint: rpc_endpoint,
+            rpc_ws_endpoint: "mock://solana-ws".into(),
+            websocket_enabled: false,
+            websocket_timeout_ms: 5,
+            search_transaction_history: true,
+            max_pending_slots: 5,
+        });
+
+        let transitions = reconciler.tick(&mut tracker, 10);
+
+        assert_eq!(transitions.len(), 1);
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(updated.outcome, ExecutionOutcome::Included { slot: 91 });
+        assert_eq!(updated.realized_output_delta_quote_atoms, Some(125));
+        assert_eq!(updated.realized_pnl_quote_atoms, Some(100));
+    }
+
+    #[test]
+    fn onchain_reconciler_computes_realized_pnl_from_native_sol_lamport_delta() {
+        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getSignatureStatuses" => json!({
+                    "result": {
+                        "value": [{
+                            "slot": 92,
+                            "err": null
+                        }]
+                    }
+                })
+                .to_string(),
+                "getTransaction" => json!({
+                    "result": {
+                        "meta": {
+                            "err": null,
+                            "preTokenBalances": [],
+                            "postTokenBalances": [],
+                            "preBalances": [1000000, 1],
+                            "postBalances": [1015000, 1]
+                        },
+                        "transaction": {
+                            "message": {
+                                "accountKeys": [
+                                    {
+                                        "pubkey": "wallet-owner",
+                                        "signer": true,
+                                        "writable": true
+                                    },
+                                    {
+                                        "pubkey": "other-account",
+                                        "signer": false,
+                                        "writable": false
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let mut tracker = ExecutionTracker::default();
+        let record = register_submission(
+            &mut tracker,
+            "route-sol-native",
+            "chain-sig-sol-native",
+            10,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-sol-native".into()),
+                endpoint: rpc_endpoint.clone(),
+                rejection: None,
+            },
+        );
+        assert!(tracker.set_profit_context(
+            &record.submission_id,
+            Some("So11111111111111111111111111111111111111112".into()),
+            Some("wallet-owner".into()),
+            Some(125),
+            Some(25),
+        ));
+        let mut reconciler = OnChainReconciler::new(OnChainReconciliationConfig {
+            enabled: true,
+            rpc_http_endpoint: rpc_endpoint,
+            rpc_ws_endpoint: "mock://solana-ws".into(),
+            websocket_enabled: false,
+            websocket_timeout_ms: 5,
+            search_transaction_history: true,
+            max_pending_slots: 5,
+        });
+
+        let transitions = reconciler.tick(&mut tracker, 10);
+
+        assert_eq!(transitions.len(), 1);
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(updated.outcome, ExecutionOutcome::Included { slot: 92 });
+        assert_eq!(updated.realized_output_delta_quote_atoms, None);
+        assert_eq!(updated.realized_pnl_quote_atoms, Some(15_000));
+    }
+
     fn spawn_mock_rpc_server<F>(handler: F) -> String
     where
         F: Fn(&str) -> String + Send + Sync + 'static,

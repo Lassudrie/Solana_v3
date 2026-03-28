@@ -106,12 +106,15 @@ Verifier le monitor HTTP:
 
 ```bash
 curl -sf http://127.0.0.1:8081/monitor/overview
+curl -sf http://127.0.0.1:8081/monitor/edge
 ```
 
 Verifier le resume bot:
 
 ```bash
 botctl status
+botctl edge --sort captured --limit 20
+botctl edge --sort realized --limit 20
 ```
 
 Si `ready=false`, le plus frequent est qu'un maillon live manque encore:

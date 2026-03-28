@@ -672,7 +672,8 @@ mod tests {
                     other_amount_threshold: 12,
                     current_tick_index: None,
                 },
-            ],
+            ]
+            .into(),
             instructions: Vec::new(),
             resolved_lookup_tables: Vec::new(),
             compiled_message_bytes: message,

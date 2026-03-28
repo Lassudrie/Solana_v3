@@ -25,7 +25,7 @@ mod tests {
     use strategy::{
         opportunity::{CandidateSelectionSource, OpportunityCandidate},
         quote::LegQuote,
-        route_registry::SwapSide,
+        route_registry::{RouteKind, SwapSide},
     };
 
     use crate::{
@@ -55,8 +55,9 @@ mod tests {
     fn candidate() -> OpportunityCandidate {
         OpportunityCandidate {
             route_id: RouteId("route-a".into()),
+            route_kind: RouteKind::TwoLeg,
             quoted_slot: 42,
-            leg_snapshot_slots: [42, 42],
+            leg_snapshot_slots: [42, 42].into(),
             sol_quote_conversion_snapshot_slot: None,
             trade_size: 10_000,
             selected_by: CandidateSelectionSource::Legacy,
@@ -71,6 +72,7 @@ mod tests {
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: 250,
+            intermediate_output_amounts: vec![10_120],
             leg_quotes: [
                 LegQuote {
                     venue: "orca".into(),
@@ -90,7 +92,8 @@ mod tests {
                     fee_paid: 5,
                     current_tick_index: None,
                 },
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -98,6 +101,7 @@ mod tests {
         let mut registry = ExecutionRegistry::default();
         registry.register(RouteExecutionConfig {
             route_id: RouteId("route-a".into()),
+            kind: RouteKind::TwoLeg,
             message_mode,
             lookup_tables: if with_lookup_table {
                 vec![LookupTableUsageConfig {
@@ -107,6 +111,7 @@ mod tests {
                 Vec::new()
             },
             default_compute_unit_limit: 300_000,
+            minimum_compute_unit_limit: RouteKind::TwoLeg.minimum_compute_unit_limit(),
             default_compute_unit_price_micro_lamports: 25_000,
             default_jito_tip_lamports: 5_000,
             max_quote_slot_lag: 4,
@@ -146,7 +151,8 @@ mod tests {
                     user_source_mint: None,
                     user_destination_mint: None,
                 }),
-            ],
+            ]
+            .into(),
         });
         registry
     }
@@ -186,16 +192,137 @@ mod tests {
         lookup_tables: Vec<LookupTableSnapshot>,
         head_slot: u64,
     ) -> DynamicBuildParameters {
+        dynamic_params_with_compute_limit(lookup_tables, head_slot, 300_000)
+    }
+
+    fn dynamic_params_with_compute_limit(
+        lookup_tables: Vec<LookupTableSnapshot>,
+        head_slot: u64,
+        compute_unit_limit: u32,
+    ) -> DynamicBuildParameters {
         DynamicBuildParameters {
             recent_blockhash: recent_blockhash(),
             recent_blockhash_slot: Some(head_slot),
             head_slot,
             fee_payer_pubkey: fee_payer_pubkey(),
-            compute_unit_limit: 300_000,
+            compute_unit_limit,
             compute_unit_price_micro_lamports: 25_000,
             jito_tip_lamports: 5_000,
             resolved_lookup_tables: lookup_tables,
         }
+    }
+
+    fn triangular_candidate() -> OpportunityCandidate {
+        OpportunityCandidate {
+            route_id: RouteId("route-tri".into()),
+            route_kind: RouteKind::Triangular,
+            quoted_slot: 42,
+            leg_snapshot_slots: [42, 42, 42].into(),
+            sol_quote_conversion_snapshot_slot: None,
+            trade_size: 10_000,
+            selected_by: CandidateSelectionSource::Legacy,
+            ranking_score_quote_atoms: 350,
+            expected_value_quote_atoms: 350,
+            p_land_bps: 10_000,
+            expected_shortfall_quote_atoms: 0,
+            active_execution_buffer_bps: None,
+            expected_net_output: 10_350,
+            minimum_acceptable_output: 10_150,
+            expected_gross_profit_quote_atoms: 350,
+            estimated_execution_cost_lamports: 0,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: 350,
+            intermediate_output_amounts: vec![10_120, 10_220],
+            leg_quotes: [
+                LegQuote {
+                    venue: "orca".into(),
+                    pool_id: PoolId("tri-pool-a".into()),
+                    side: SwapSide::BuyBase,
+                    input_amount: 10_000,
+                    output_amount: 10_120,
+                    fee_paid: 5,
+                    current_tick_index: None,
+                },
+                LegQuote {
+                    venue: "orca".into(),
+                    pool_id: PoolId("tri-pool-b".into()),
+                    side: SwapSide::SellBase,
+                    input_amount: 10_120,
+                    output_amount: 10_220,
+                    fee_paid: 5,
+                    current_tick_index: None,
+                },
+                LegQuote {
+                    venue: "orca".into(),
+                    pool_id: PoolId("tri-pool-c".into()),
+                    side: SwapSide::SellBase,
+                    input_amount: 10_220,
+                    output_amount: 10_350,
+                    fee_paid: 5,
+                    current_tick_index: None,
+                },
+            ]
+            .into(),
+        }
+    }
+
+    fn triangular_execution_registry() -> ExecutionRegistry {
+        let mut registry = ExecutionRegistry::default();
+        registry.register(RouteExecutionConfig {
+            route_id: RouteId("route-tri".into()),
+            kind: RouteKind::Triangular,
+            message_mode: MessageMode::V0OrLegacy,
+            lookup_tables: Vec::new(),
+            default_compute_unit_limit: 450_000,
+            minimum_compute_unit_limit: RouteKind::Triangular.minimum_compute_unit_limit(),
+            default_compute_unit_price_micro_lamports: 25_000,
+            default_jito_tip_lamports: 5_000,
+            max_quote_slot_lag: 4,
+            max_alt_slot_lag: 4,
+            legs: [
+                VenueExecutionConfig::OrcaSimplePool(OrcaSimplePoolConfig {
+                    program_id: test_pubkey("tri-orca-program"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    swap_account: test_pubkey("tri-orca-swap"),
+                    authority: test_pubkey("tri-orca-authority"),
+                    pool_source_token_account: test_pubkey("tri-orca-pool-source"),
+                    pool_destination_token_account: test_pubkey("tri-orca-pool-destination"),
+                    pool_mint: test_pubkey("tri-orca-pool-mint"),
+                    fee_account: test_pubkey("tri-orca-fee-account"),
+                    user_source_token_account: test_pubkey("tri-route-input-ata"),
+                    user_destination_token_account: test_pubkey("tri-route-mid-a-ata"),
+                    host_fee_account: None,
+                }),
+                VenueExecutionConfig::OrcaSimplePool(OrcaSimplePoolConfig {
+                    program_id: test_pubkey("tri-orca-program"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    swap_account: test_pubkey("tri-orca-swap"),
+                    authority: test_pubkey("tri-orca-authority"),
+                    pool_source_token_account: test_pubkey("tri-orca-pool-source"),
+                    pool_destination_token_account: test_pubkey("tri-orca-pool-destination"),
+                    pool_mint: test_pubkey("tri-orca-pool-mint"),
+                    fee_account: test_pubkey("tri-orca-fee-account"),
+                    user_source_token_account: test_pubkey("tri-route-mid-a-ata"),
+                    user_destination_token_account: test_pubkey("tri-route-mid-b-ata"),
+                    host_fee_account: None,
+                }),
+                VenueExecutionConfig::OrcaSimplePool(OrcaSimplePoolConfig {
+                    program_id: test_pubkey("tri-orca-program"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    swap_account: test_pubkey("tri-orca-swap"),
+                    authority: test_pubkey("tri-orca-authority"),
+                    pool_source_token_account: test_pubkey("tri-orca-pool-source"),
+                    pool_destination_token_account: test_pubkey("tri-orca-pool-destination"),
+                    pool_mint: test_pubkey("tri-orca-pool-mint"),
+                    fee_account: test_pubkey("tri-orca-fee-account"),
+                    user_source_token_account: test_pubkey("tri-route-mid-b-ata"),
+                    user_destination_token_account: test_pubkey("tri-route-output-ata"),
+                    host_fee_account: None,
+                }),
+            ]
+            .into(),
+        });
+        registry
     }
 
     #[test]
@@ -283,7 +410,7 @@ mod tests {
             AtomicArbTransactionBuilder::new(execution_registry(MessageMode::V0OrLegacy, false));
         let mut candidate = candidate();
         candidate.quoted_slot = 43;
-        candidate.leg_snapshot_slots = [38, 43];
+        candidate.leg_snapshot_slots = [36, 43].into();
 
         let result = builder.build(BuildRequest {
             candidate,
@@ -303,8 +430,8 @@ mod tests {
             AtomicArbTransactionBuilder::new(execution_registry(MessageMode::V0OrLegacy, false));
         let mut candidate = candidate();
         candidate.quoted_slot = 43;
-        candidate.leg_snapshot_slots = [43, 42];
-        candidate.sol_quote_conversion_snapshot_slot = Some(38);
+        candidate.leg_snapshot_slots = [43, 42].into();
+        candidate.sol_quote_conversion_snapshot_slot = Some(36);
 
         let result = builder.build(BuildRequest {
             candidate,
@@ -330,6 +457,40 @@ mod tests {
         assert_eq!(
             result.rejection,
             Some(BuildRejectionReason::MissingRouteExecution)
+        );
+    }
+
+    #[test]
+    fn builder_builds_triangular_route_in_leg_order() {
+        let builder = AtomicArbTransactionBuilder::new(triangular_execution_registry());
+        let result = builder.build(BuildRequest {
+            candidate: triangular_candidate(),
+            dynamic: dynamic_params_with_compute_limit(Vec::new(), 43, 450_000),
+        });
+
+        assert_eq!(result.status, BuildStatus::Built);
+        let envelope = result.envelope.expect("built triangular envelope");
+        assert_eq!(envelope.leg_plans.len(), 3);
+        assert_eq!(envelope.leg_plans[0].pool_id, PoolId("tri-pool-a".into()));
+        assert_eq!(envelope.leg_plans[1].pool_id, PoolId("tri-pool-b".into()));
+        assert_eq!(envelope.leg_plans[2].pool_id, PoolId("tri-pool-c".into()));
+    }
+
+    #[test]
+    fn builder_rejects_triangular_route_when_compute_limit_is_below_floor() {
+        let builder = AtomicArbTransactionBuilder::new(triangular_execution_registry());
+        let result = builder.build(BuildRequest {
+            candidate: triangular_candidate(),
+            dynamic: dynamic_params_with_compute_limit(Vec::new(), 43, 300_000),
+        });
+
+        assert_eq!(result.status, BuildStatus::Rejected);
+        assert_eq!(
+            result.rejection,
+            Some(BuildRejectionReason::ComputeUnitLimitTooLow {
+                requested: 300_000,
+                minimum: 420_000,
+            })
         );
     }
 }

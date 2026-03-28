@@ -5,6 +5,8 @@ Ce dossier stocke les documents de performance du bot:
 - analyses de latence;
 - analyses de debit et saturation;
 - mesures de landing rate et de reject mix;
+- mesures de capture d'edge attendu par route;
+- mesures de PnL realise et de ratio expected -> realized par route;
 - comptes rendus de regression avant/apres changement.
 
 ## Convention conseillee

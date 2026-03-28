@@ -8,6 +8,7 @@ pub enum FailureClass {
     ChainDropped,
     ChainExecutionFailed,
     ChainExecutionTooLittleOutput,
+    ChainExecutionAmountInAboveMaximum,
     Expired,
     Unknown,
 }

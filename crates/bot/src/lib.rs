@@ -20,9 +20,10 @@ pub use config::{BotConfig, ConfigError, MonitorServerConfig};
 pub use control::{RuntimeIssue, RuntimeMode, RuntimeStatus};
 pub use daemon::{BotDaemon, DaemonError, DaemonExit};
 pub use observer::{
-    MonitorOverview, MonitorSignalMetric, MonitorSignalSample, MonitorSignalsResponse,
-    MonitorSnapshot, MonitorTradeEvent, MonitorTradesResponse, ObserverHandle, PoolMonitorView,
-    RejectionEvent, RejectionsResponse, RouteMonitorView, RoutesResponse,
+    MonitorEdgeOverview, MonitorEdgeResponse, MonitorEdgeRouteView, MonitorOverview,
+    MonitorSignalMetric, MonitorSignalSample, MonitorSignalsResponse, MonitorSnapshot,
+    MonitorTradeEvent, MonitorTradesResponse, ObserverHandle, PoolMonitorView, RejectionEvent,
+    RejectionsResponse, RouteMonitorView, RoutesResponse,
 };
 pub use route_health::{
     PoolHealthState, PoolHealthTransition, RouteHealthRegistry, RouteHealthState,

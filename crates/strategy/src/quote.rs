@@ -1,12 +1,10 @@
-use crate::route_registry::SwapSide;
+use crate::route_registry::{RouteDefinition, RouteKind, RouteLegSequence, SwapSide};
 use domain::{
     LiquidityModel, PoolId, PoolSnapshot, PoolVenue,
     quote_models::{ConcentratedQuoteModel, DirectionalConcentratedQuoteModel},
 };
 use primitive_types::U256;
 use thiserror::Error;
-
-use crate::route_registry::RouteDefinition;
 
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
@@ -31,12 +29,23 @@ pub struct RouteQuote {
     pub estimated_execution_cost_lamports: u64,
     pub estimated_execution_cost_quote_atoms: u64,
     pub expected_net_profit_quote_atoms: i64,
-    pub leg_quotes: [LegQuote; 2],
+    pub leg_quotes: RouteLegSequence<LegQuote>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuoteExecutionAdjustments {
-    pub extra_leg_slippage_bps: [u16; 2],
+    pub extra_leg_slippage_bps: RouteLegSequence<u16>,
+}
+
+impl QuoteExecutionAdjustments {
+    pub fn zero(kind: RouteKind) -> Self {
+        Self {
+            extra_leg_slippage_bps: match kind {
+                RouteKind::TwoLeg => [0, 0].into(),
+                RouteKind::Triangular => [0, 0, 0].into(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -82,7 +91,7 @@ pub fn sol_lamports_to_quote_atoms(
 
 #[derive(Debug, Error)]
 pub enum QuoteError {
-    #[error("expected exactly 2 snapshots for the 2-leg template")]
+    #[error("snapshot count does not match the configured route shape")]
     InvalidRouteShape,
     #[error("arithmetic overflow during quote")]
     ArithmeticOverflow,
@@ -94,6 +103,8 @@ pub enum QuoteError {
     InvalidSnapshotLiquidity,
     #[error("pool quote model is not executable")]
     QuoteModelNotExecutable,
+    #[error("leg {leg_index} returned zero output")]
+    ZeroOutput { leg_index: usize },
     #[error("trade exceeds loaded concentrated-liquidity window")]
     ConcentratedWindowExceeded,
     #[error("unable to convert execution cost into quote atoms")]
@@ -126,7 +137,7 @@ pub trait QuoteEngine: Send + Sync {
     fn quote<'a>(
         &self,
         route: &RouteDefinition,
-        views: [PoolPricingView<'a>; 2],
+        views: &[PoolPricingView<'a>],
         quoted_slot: u64,
         input_amount: u64,
         adjustments: &QuoteExecutionAdjustments,
@@ -140,54 +151,60 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
     fn quote<'a>(
         &self,
         route: &RouteDefinition,
-        views: [PoolPricingView<'a>; 2],
+        views: &[PoolPricingView<'a>],
         quoted_slot: u64,
         input_amount: u64,
         adjustments: &QuoteExecutionAdjustments,
     ) -> Result<RouteQuote, QuoteError> {
-        let first = apply_additional_leg_slippage(
-            apply_route_price(route, &route.legs[0], input_amount, views[0])?,
-            adjustments.extra_leg_slippage_bps[0],
-        )?;
-        let second = apply_additional_leg_slippage(
-            apply_route_price(route, &route.legs[1], first.net_output, views[1])?,
-            adjustments.extra_leg_slippage_bps[1],
-        )?;
-        let expected_gross_profit = second
-            .net_output
+        if views.len() != route.legs.len()
+            || adjustments.extra_leg_slippage_bps.len() != route.legs.len()
+        {
+            return Err(QuoteError::InvalidRouteShape);
+        }
+
+        let mut next_input_amount = input_amount;
+        let mut final_gross_output_amount = 0u64;
+        let mut final_net_output_amount = 0u64;
+        let mut leg_quotes = Vec::with_capacity(route.legs.len());
+
+        for (index, (leg, view)) in route.legs.iter().zip(views.iter()).enumerate() {
+            let priced = apply_additional_leg_slippage(
+                apply_route_price(leg, next_input_amount, *view)?,
+                adjustments.extra_leg_slippage_bps[index],
+            )?;
+            if priced.net_output == 0 {
+                return Err(QuoteError::ZeroOutput { leg_index: index });
+            }
+            final_gross_output_amount = priced.gross_output;
+            final_net_output_amount = priced.net_output;
+            leg_quotes.push(LegQuote {
+                venue: leg.venue.clone(),
+                pool_id: leg.pool_id.clone(),
+                side: leg.side,
+                input_amount: next_input_amount,
+                output_amount: priced.net_output,
+                fee_paid: priced.fee_paid,
+                current_tick_index: view.snapshot.current_tick_index,
+            });
+            next_input_amount = priced.net_output;
+        }
+
+        let expected_gross_profit = final_net_output_amount
             .checked_sub(input_amount)
             .map(|profit| profit as i64)
-            .unwrap_or_else(|| -((input_amount - second.net_output) as i64));
+            .unwrap_or_else(|| -((input_amount - final_net_output_amount) as i64));
 
         Ok(RouteQuote {
             quoted_slot,
             input_amount,
-            gross_output_amount: second.gross_output,
-            net_output_amount: second.net_output,
+            gross_output_amount: final_gross_output_amount,
+            net_output_amount: final_net_output_amount,
             expected_gross_profit_quote_atoms: expected_gross_profit,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: expected_gross_profit,
-            leg_quotes: [
-                LegQuote {
-                    venue: route.legs[0].venue.clone(),
-                    pool_id: route.legs[0].pool_id.clone(),
-                    side: route.legs[0].side,
-                    input_amount,
-                    output_amount: first.net_output,
-                    fee_paid: first.fee_paid,
-                    current_tick_index: views[0].snapshot.current_tick_index,
-                },
-                LegQuote {
-                    venue: route.legs[1].venue.clone(),
-                    pool_id: route.legs[1].pool_id.clone(),
-                    side: route.legs[1].side,
-                    input_amount: first.net_output,
-                    output_amount: second.net_output,
-                    fee_paid: second.fee_paid,
-                    current_tick_index: views[1].snapshot.current_tick_index,
-                },
-            ],
+            leg_quotes: RouteLegSequence::from_vec(leg_quotes)
+                .map_err(|_| QuoteError::InvalidRouteShape)?,
         })
     }
 }
@@ -198,8 +215,7 @@ pub(crate) fn route_uses_sol_quote_conversion(
 ) -> bool {
     estimated_execution_cost_lamports > 0
         && route.input_mint == route.output_mint
-        && route.quote_mint.as_deref() == Some(route.input_mint.as_str())
-        && route.quote_mint.as_deref() != Some(SOL_MINT)
+        && route.input_mint != SOL_MINT
 }
 
 fn execution_cost_quote_atoms(
@@ -211,12 +227,10 @@ fn execution_cost_quote_atoms(
         return Ok(0);
     }
 
-    let Some(quote_mint) = route.quote_mint.as_deref() else {
-        return Err(QuoteError::ExecutionCostNotConvertible);
-    };
-    if route.input_mint != route.output_mint || route.input_mint != quote_mint {
+    if route.input_mint != route.output_mint {
         return Err(QuoteError::ExecutionCostNotConvertible);
     }
+    let quote_mint = route.input_mint.as_str();
     if quote_mint == SOL_MINT {
         return Ok(estimated_execution_cost_lamports);
     }
@@ -361,27 +375,18 @@ fn mul_div_u64(value: u64, numerator: u64, denominator: u64) -> Result<u64, Quot
 }
 
 fn apply_route_price(
-    route: &RouteDefinition,
     leg: &crate::route_registry::RouteLeg,
     input_amount: u64,
     view: PoolPricingView<'_>,
 ) -> Result<PricedAmount, QuoteError> {
     let snapshot = view.snapshot;
     let fee_bps = leg.fee_bps.unwrap_or(snapshot.fee_bps);
-    let Some(base_mint) = route.base_mint.as_deref() else {
-        return apply_price(input_amount, snapshot.price_bps, fee_bps, snapshot);
-    };
-    let Some(quote_mint) = route.quote_mint.as_deref() else {
-        return apply_price(input_amount, snapshot.price_bps, fee_bps, snapshot);
-    };
     if snapshot.token_mint_a.is_empty() || snapshot.token_mint_b.is_empty() {
         return apply_price(input_amount, snapshot.price_bps, fee_bps, snapshot);
     }
 
-    let (input_mint, output_mint) = match leg.side {
-        SwapSide::BuyBase => (quote_mint, base_mint),
-        SwapSide::SellBase => (base_mint, quote_mint),
-    };
+    let input_mint = leg.input_mint.as_str();
+    let output_mint = leg.output_mint.as_str();
 
     if snapshot.liquidity_model == state::types::LiquidityModel::ConstantProduct {
         if let Some((reserve_in, reserve_out)) =
@@ -1624,12 +1629,15 @@ mod tests {
 
     use crate::{
         quote::{
-            QuoteError, RouteQuote, SOL_MINT, amount_in_between_prices_u256,
+            LocalTwoLegQuoteEngine, PoolPricingView, QuoteEngine, QuoteError,
+            QuoteExecutionAdjustments, RouteQuote, SOL_MINT, amount_in_between_prices_u256,
             apply_concentrated_exact_input_update, apply_concentrated_price,
             compute_concentrated_swap_step, orca_sqrt_price_at_tick, orca_tick_from_sqrt_price,
             raydium_sqrt_price_at_tick, raydium_tick_from_sqrt_price,
         },
-        route_registry::{RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode, SwapSide},
+        route_registry::{
+            RouteDefinition, RouteKind, RouteLeg, RouteSizingPolicy, SizingMode, SwapSide,
+        },
     };
 
     fn route_definition(
@@ -1639,25 +1647,32 @@ mod tests {
     ) -> RouteDefinition {
         RouteDefinition {
             route_id: RouteId("route-a".into()),
+            kind: RouteKind::TwoLeg,
             input_mint: quote_mint.into(),
             output_mint: quote_mint.into(),
             base_mint: Some(base_mint.into()),
             quote_mint: Some(quote_mint.into()),
             sol_quote_conversion_pool_id: conversion_pool.map(|pool_id| PoolId(pool_id.into())),
+            min_profit_quote_atoms: None,
             legs: [
                 RouteLeg {
                     venue: "venue-a".into(),
                     pool_id: PoolId("pool-a".into()),
                     side: SwapSide::BuyBase,
+                    input_mint: quote_mint.into(),
+                    output_mint: base_mint.into(),
                     fee_bps: None,
                 },
                 RouteLeg {
                     venue: "venue-b".into(),
                     pool_id: PoolId("pool-b".into()),
                     side: SwapSide::SellBase,
+                    input_mint: base_mint.into(),
+                    output_mint: quote_mint.into(),
                     fee_bps: None,
                 },
-            ],
+            ]
+            .into(),
             max_quote_slot_lag: 32,
             min_trade_size: 1,
             default_trade_size: 1,
@@ -1667,6 +1682,60 @@ mod tests {
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
                 min_trade_floor_sol_lamports: 100_000_000,
+                base_landing_rate_bps: 8_500,
+                base_expected_shortfall_bps: 75,
+                max_expected_shortfall_bps: 500,
+            },
+            execution_protection: None,
+        }
+    }
+
+    fn triangular_route_definition() -> RouteDefinition {
+        RouteDefinition {
+            route_id: RouteId("tri-route".into()),
+            kind: RouteKind::Triangular,
+            input_mint: "USDC".into(),
+            output_mint: "USDC".into(),
+            base_mint: Some("SOL".into()),
+            quote_mint: Some("USDC".into()),
+            sol_quote_conversion_pool_id: Some(PoolId("pool-sol-usdc".into())),
+            min_profit_quote_atoms: Some(50),
+            legs: [
+                RouteLeg {
+                    venue: "orca".into(),
+                    pool_id: PoolId("pool-sol-usdc".into()),
+                    side: SwapSide::BuyBase,
+                    input_mint: "USDC".into(),
+                    output_mint: "SOL".into(),
+                    fee_bps: Some(0),
+                },
+                RouteLeg {
+                    venue: "raydium".into(),
+                    pool_id: PoolId("pool-sol-usdt".into()),
+                    side: SwapSide::SellBase,
+                    input_mint: "SOL".into(),
+                    output_mint: "USDT".into(),
+                    fee_bps: Some(0),
+                },
+                RouteLeg {
+                    venue: "orca".into(),
+                    pool_id: PoolId("pool-usdt-usdc".into()),
+                    side: SwapSide::SellBase,
+                    input_mint: "USDT".into(),
+                    output_mint: "USDC".into(),
+                    fee_bps: Some(0),
+                },
+            ]
+            .into(),
+            max_quote_slot_lag: 16,
+            min_trade_size: 1,
+            default_trade_size: 1_000,
+            max_trade_size: 10_000,
+            size_ladder: Vec::new(),
+            estimated_execution_cost_lamports: 0,
+            sizing: RouteSizingPolicy {
+                mode: SizingMode::Legacy,
+                min_trade_floor_sol_lamports: 0,
                 base_landing_rate_bps: 8_500,
                 base_expected_shortfall_bps: 75,
                 max_expected_shortfall_bps: 500,
@@ -1704,7 +1773,8 @@ mod tests {
                     fee_paid: 0,
                     current_tick_index: None,
                 },
-            ],
+            ]
+            .into(),
         }
     }
 
@@ -1728,6 +1798,36 @@ mod tests {
             repair_pending: false,
             liquidity_model: LiquidityModel::ConstantProduct,
             slippage_factor_bps: 10_000,
+            token_mint_a: token_mint_a.into(),
+            token_mint_b: token_mint_b.into(),
+            tick_spacing: 0,
+            current_tick_index: None,
+            last_update_slot: 1,
+            derived_at: SystemTime::now(),
+            freshness: FreshnessState::at(1, 1, 1),
+        }
+    }
+
+    fn linear_snapshot(
+        pool_id: &str,
+        token_mint_a: &str,
+        token_mint_b: &str,
+        price_bps: u64,
+    ) -> PoolSnapshot {
+        PoolSnapshot {
+            pool_id: PoolId(pool_id.into()),
+            price_bps,
+            fee_bps: 0,
+            reserve_depth: 10_000_000,
+            reserve_a: None,
+            reserve_b: None,
+            active_liquidity: 10_000_000,
+            sqrt_price_x64: None,
+            venue: Some(PoolVenue::OrcaSimplePool),
+            confidence: PoolConfidence::Executable,
+            repair_pending: false,
+            liquidity_model: LiquidityModel::Unknown,
+            slippage_factor_bps: 1,
             token_mint_a: token_mint_a.into(),
             token_mint_b: token_mint_b.into(),
             tick_spacing: 0,
@@ -1860,6 +1960,85 @@ mod tests {
         assert!(matches!(
             invalid,
             Err(QuoteError::ExecutionCostNotConvertible)
+        ));
+    }
+
+    #[test]
+    fn triangular_quote_chains_three_exact_input_legs() {
+        let route = triangular_route_definition();
+        let engine = LocalTwoLegQuoteEngine;
+        let pool_sol_usdc = linear_snapshot("pool-sol-usdc", "SOL", "USDC", 5_000);
+        let pool_sol_usdt = linear_snapshot("pool-sol-usdt", "SOL", "USDT", 20_000);
+        let pool_usdt_usdc = linear_snapshot("pool-usdt-usdc", "USDT", "USDC", 6_000);
+        let views = [
+            PoolPricingView {
+                snapshot: &pool_sol_usdc,
+                concentrated: None,
+            },
+            PoolPricingView {
+                snapshot: &pool_sol_usdt,
+                concentrated: None,
+            },
+            PoolPricingView {
+                snapshot: &pool_usdt_usdc,
+                concentrated: None,
+            },
+        ];
+
+        let quote = engine
+            .quote(
+                &route,
+                &views,
+                42,
+                1_000,
+                &QuoteExecutionAdjustments::zero(RouteKind::Triangular),
+            )
+            .expect("triangular route should quote successfully");
+
+        assert_eq!(quote.net_output_amount, 2_400);
+        assert_eq!(quote.expected_gross_profit_quote_atoms, 1_400);
+        assert_eq!(quote.leg_quotes[0].input_amount, 1_000);
+        assert_eq!(quote.leg_quotes[0].output_amount, 2_000);
+        assert_eq!(quote.leg_quotes[1].input_amount, 2_000);
+        assert_eq!(quote.leg_quotes[1].output_amount, 4_000);
+        assert_eq!(quote.leg_quotes[2].input_amount, 4_000);
+        assert_eq!(quote.leg_quotes[2].output_amount, 2_400);
+    }
+
+    #[test]
+    fn triangular_quote_rejects_when_any_leg_is_not_executable() {
+        let route = triangular_route_definition();
+        let engine = LocalTwoLegQuoteEngine;
+        let pool_sol_usdc = linear_snapshot("pool-sol-usdc", "SOL", "USDC", 5_000);
+        let pool_sol_usdt = linear_snapshot("pool-sol-usdt", "SOL", "USDT", 20_000);
+        let mut clmm_snapshot = concentrated_snapshot(Some(PoolVenue::OrcaWhirlpool));
+        clmm_snapshot.pool_id = PoolId("pool-usdt-usdc".into());
+        clmm_snapshot.token_mint_a = "USDT".into();
+        clmm_snapshot.token_mint_b = "USDC".into();
+        let views = [
+            PoolPricingView {
+                snapshot: &pool_sol_usdc,
+                concentrated: None,
+            },
+            PoolPricingView {
+                snapshot: &pool_sol_usdt,
+                concentrated: None,
+            },
+            PoolPricingView {
+                snapshot: &clmm_snapshot,
+                concentrated: None,
+            },
+        ];
+
+        assert!(matches!(
+            engine.quote(
+                &route,
+                &views,
+                42,
+                1_000,
+                &QuoteExecutionAdjustments::zero(RouteKind::Triangular),
+            ),
+            Err(QuoteError::QuoteModelNotExecutable)
         ));
     }
 

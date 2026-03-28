@@ -264,6 +264,7 @@ impl BotDaemon {
         }
         let route_health = std::sync::Arc::new(std::sync::Mutex::new(RouteHealthRegistry::new(
             config.runtime.live_set_health.clone(),
+            config.state.max_snapshot_slot_lag,
         )));
         let mut runtime = bootstrap_with_health(config.clone(), route_health.clone())?;
         let observer = ObserverHandle::spawn(
@@ -986,8 +987,8 @@ mod tests {
     use crate::config::{
         AccountDependencyConfig, BotConfig, EventSourceMode, MessageModeConfig,
         OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteClassConfig,
-        RouteConfig, RouteExecutionConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig,
-        SwapSideConfig,
+        RouteConfig, RouteExecutionConfig, RouteKindConfig, RouteLegConfig,
+        RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
     };
 
     use super::{BotDaemon, DaemonExit};
@@ -1142,7 +1143,7 @@ mod tests {
         let mut config = BotConfig::default();
         let keypair = Keypair::new_from_array([7; 32]);
         config.jito.endpoint = "mock://jito".into();
-        config.builder.compute_unit_limit = 1;
+        config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
         config.signing.validate_execution_accounts = false;
@@ -1155,12 +1156,14 @@ mod tests {
             definitions: vec![RouteConfig {
                 enabled: true,
                 route_class: RouteClassConfig::AmmFastPath,
+                kind: RouteKindConfig::TwoLeg,
                 route_id: "route-a".into(),
                 input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
                 output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
                 base_mint: Some("So11111111111111111111111111111111111111112".into()),
                 quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
                 sol_quote_conversion_pool_id: Some("pool-a".into()),
+                min_profit_quote_atoms: None,
                 min_trade_size: None,
                 default_trade_size: 10_000,
                 max_trade_size: 20_000,
@@ -1170,11 +1173,13 @@ mod tests {
                     ..Default::default()
                 },
                 execution_protection: Default::default(),
-                legs: [
+                legs: vec![
                     RouteLegConfig {
                         venue: "orca".into(),
                         pool_id: "pool-a".into(),
                         side: SwapSideConfig::BuyBase,
+                        input_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                        output_mint: Some("So11111111111111111111111111111111111111112".into()),
                         fee_bps: None,
                         execution: RouteLegExecutionConfig::OrcaSimplePool(
                             OrcaSimplePoolLegExecutionConfig {
@@ -1198,6 +1203,8 @@ mod tests {
                         venue: "raydium".into(),
                         pool_id: "pool-b".into(),
                         side: SwapSideConfig::SellBase,
+                        input_mint: Some("So11111111111111111111111111111111111111112".into()),
+                        output_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
                         fee_bps: None,
                         execution: RouteLegExecutionConfig::RaydiumSimplePool(
                             RaydiumSimplePoolLegExecutionConfig {
@@ -1242,6 +1249,7 @@ mod tests {
                     message_mode: MessageModeConfig::V0Required,
                     lookup_tables: Vec::new(),
                     default_compute_unit_limit: 300_000,
+                    minimum_compute_unit_limit: 0,
                     default_compute_unit_price_micro_lamports: 25_000,
                     default_jito_tip_lamports: 5_000,
                     max_quote_slot_lag: 4,
@@ -1264,12 +1272,14 @@ mod tests {
         RouteConfig {
             enabled: true,
             route_class: RouteClassConfig::AmmFastPath,
+            kind: RouteKindConfig::TwoLeg,
             route_id: route_id.into(),
             input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             base_mint: Some("So11111111111111111111111111111111111111112".into()),
             quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
             sol_quote_conversion_pool_id: Some(first_pool_id.into()),
+            min_profit_quote_atoms: None,
             min_trade_size: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
@@ -1279,11 +1289,13 @@ mod tests {
                 ..Default::default()
             },
             execution_protection: Default::default(),
-            legs: [
+            legs: vec![
                 RouteLegConfig {
                     venue: "orca".into(),
                     pool_id: first_pool_id.into(),
                     side: SwapSideConfig::BuyBase,
+                    input_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                    output_mint: Some("So11111111111111111111111111111111111111112".into()),
                     fee_bps: None,
                     execution: RouteLegExecutionConfig::OrcaSimplePool(
                         OrcaSimplePoolLegExecutionConfig {
@@ -1307,6 +1319,8 @@ mod tests {
                     venue: "raydium".into(),
                     pool_id: second_pool_id.into(),
                     side: SwapSideConfig::SellBase,
+                    input_mint: Some("So11111111111111111111111111111111111111112".into()),
+                    output_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
                     fee_bps: None,
                     execution: RouteLegExecutionConfig::RaydiumSimplePool(
                         RaydiumSimplePoolLegExecutionConfig {
@@ -1351,6 +1365,7 @@ mod tests {
                 message_mode: MessageModeConfig::V0Required,
                 lookup_tables: Vec::new(),
                 default_compute_unit_limit: 300_000,
+                minimum_compute_unit_limit: 0,
                 default_compute_unit_price_micro_lamports: 25_000,
                 default_jito_tip_lamports: 5_000,
                 max_quote_slot_lag: 4,

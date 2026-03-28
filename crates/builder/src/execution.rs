@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use domain::RouteId;
-use strategy::route_registry::SwapSide;
+use strategy::route_registry::{RouteKind, RouteLegSequence, SwapSide};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageMode {
@@ -17,14 +17,16 @@ pub struct LookupTableUsageConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteExecutionConfig {
     pub route_id: RouteId,
+    pub kind: RouteKind,
     pub message_mode: MessageMode,
     pub lookup_tables: Vec<LookupTableUsageConfig>,
     pub default_compute_unit_limit: u32,
+    pub minimum_compute_unit_limit: u32,
     pub default_compute_unit_price_micro_lamports: u64,
     pub default_jito_tip_lamports: u64,
     pub max_quote_slot_lag: u64,
     pub max_alt_slot_lag: u64,
-    pub legs: [VenueExecutionConfig; 2],
+    pub legs: RouteLegSequence<VenueExecutionConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,7 +47,7 @@ impl VenueExecutionConfig {
         }
     }
 
-    pub fn supports_exact_out_leg1(&self, side: SwapSide) -> bool {
+    pub fn supports_exact_out(&self, side: SwapSide) -> bool {
         match self {
             Self::OrcaSimplePool(_) => false,
             Self::OrcaWhirlpool(_) | Self::RaydiumClmm(_) => true,

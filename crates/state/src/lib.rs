@@ -184,7 +184,13 @@ impl StatePlane {
         let model = self.concentrated_quote_models.get(pool_id)?;
         if model.last_update_slot != snapshot_slot || model.write_version != snapshot_write_version
         {
-            return None;
+            let snapshot_matches_quote_inputs = snapshot.sqrt_price_x64
+                == Some(model.sqrt_price_x64)
+                && snapshot.current_tick_index == Some(model.current_tick_index)
+                && snapshot.tick_spacing == model.tick_spacing
+                && u128::from(snapshot.active_liquidity) == model.liquidity
+                && snapshot.last_update_slot >= model.last_update_slot;
+            return snapshot_matches_quote_inputs.then_some(model);
         }
         Some(model)
     }
@@ -207,7 +213,6 @@ impl StatePlane {
                     .map(|snapshot| {
                         snapshot.is_executable()
                             && self.pool_has_executable_quote_model(pool_id)
-                            && !snapshot.freshness.is_stale
                             && self.latest_slot.saturating_sub(snapshot.last_update_slot)
                                 <= max_quote_slot_lag
                     })
@@ -225,6 +230,13 @@ impl StatePlane {
             MarketEvent::PoolQuoteModelUpdate(update) => self.apply_pool_quote_model_update(update),
             MarketEvent::PoolInvalidation(invalidation) => {
                 Ok(Some(self.apply_pool_invalidation(invalidation)))
+            }
+            MarketEvent::DestabilizingTransaction(trigger) => {
+                self.latest_slot = self.latest_slot.max(trigger.slot);
+                Ok(Some(self.state_outcome(
+                    AccountUpdateStatus::Applied,
+                    vec![crate::types::PoolId(trigger.pool_id.clone())],
+                )))
             }
             MarketEvent::SlotBoundary(slot_boundary) => {
                 self.latest_slot = self.latest_slot.max(slot_boundary.slot);
@@ -1128,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_concentrated_quote_model_does_not_match_new_snapshot_version() {
+    fn concentrated_quote_model_is_reused_when_quote_inputs_match_new_snapshot_version() {
         let route_id = RouteId("route-clmm".into());
         let pool_a = PoolId("pool-a".into());
         let pool_b = PoolId("pool-b".into());
@@ -1152,9 +1164,9 @@ mod tests {
             .apply_event(&concentrated_snapshot_event(4, &pool_a, 11, 2))
             .unwrap();
 
-        assert!(!plane.pool_has_executable_quote_model(&pool_a));
-        assert!(plane.concentrated_quote_model(&pool_a).is_none());
-        assert_eq!(plane.tradable_route_count(), 0);
+        assert!(plane.pool_has_executable_quote_model(&pool_a));
+        assert!(plane.concentrated_quote_model(&pool_a).is_some());
+        assert_eq!(plane.tradable_route_count(), 1);
 
         plane
             .apply_event(&quote_model_event(5, &pool_a, 11, 2))

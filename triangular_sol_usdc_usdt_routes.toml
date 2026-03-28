@@ -1,0 +1,110 @@
+[routes]
+
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+kind = "triangular"
+route_id = "tri-sol-usdc-usdt-orca-czfq-ray-3nmf-orca-4fuu"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+min_profit_quote_atoms = 15000
+min_trade_size = 1000000
+default_trade_size = 2000000
+max_trade_size = 5000000
+size_ladder = [1000000, 2000000, 3000000, 5000000]
+account_dependencies = [
+  { account_key = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE", pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE", decoder_key = "orca-whirlpool-v1" },
+  { account_key = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF", pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF", decoder_key = "raydium-clmm-v1" },
+  { account_key = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4", pool_id = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4", decoder_key = "orca-whirlpool-v1" },
+]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+side = "buy_base"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "So11111111111111111111111111111111111111112"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP"
+tick_spacing = 4
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+side = "buy_base"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "Cqb16WaM7dDDP8koxYASDJLWgan4STDB1R3LiSH8r3GR"
+ex_bitmap_account = "2ncinnTcJxbZ1nUHavBVJ3Ap3R4CE7p2LJ6Jtpd1vLzd"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC"
+token_mint_1 = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_1 = "2n6fxuD6PA5NYgEnXXYMh2iWD1JBJ1LGf76kFJAayZmX"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+side = "sell_base"
+input_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+token_mint_a = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_a = "4oY1eVHJrt7ywuFoQnAZwto4qcQip1QhYMAhD11PU4QL"
+token_mint_b = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_b = "4dSG9tKHZR4CAictyEnH9XuGZyKapodWXq5xyg7uFwE9"
+tick_spacing = 1
+a_to_b = false
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
+default_compute_unit_price_micro_lamports = 15000
+default_jito_tip_lamports = 1500
+max_quote_slot_lag = 16
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8TM3cxoXfnNXU7XUjsAeyN8niu7dQMDf5ZB47nmrTcLD"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 3
+base_extra_buy_leg_slippage_bps = 35
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 125
+recovery_success_count = 3

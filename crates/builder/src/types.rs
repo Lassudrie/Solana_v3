@@ -1,6 +1,6 @@
 use domain::{LookupTableSnapshot, PoolId, RouteId};
 use strategy::opportunity::OpportunityCandidate;
-use strategy::route_registry::SwapSide;
+use strategy::route_registry::{RouteLegSequence, SwapSide};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicBuildParameters {
@@ -82,7 +82,7 @@ pub struct UnsignedTransactionEnvelope {
     pub blockhash_slot: Option<u64>,
     pub recent_blockhash: String,
     pub fee_payer_pubkey: String,
-    pub leg_plans: [AtomicLegPlan; 2],
+    pub leg_plans: RouteLegSequence<AtomicLegPlan>,
     pub instructions: Vec<InstructionTemplate>,
     pub resolved_lookup_tables: Vec<ResolvedAddressLookupTable>,
     pub compiled_message_bytes: Vec<u8>,
@@ -117,6 +117,14 @@ pub enum BuildRejectionReason {
     MessageCompilationFailed,
     MissingExecutionHint,
     UnsupportedVenue,
+    UnprofitableExecutionPlan {
+        guaranteed_output: u64,
+        minimum_output: u64,
+    },
+    ComputeUnitLimitTooLow {
+        requested: u32,
+        minimum: u32,
+    },
     TransactionTooLarge {
         serialized_bytes: usize,
         maximum: usize,

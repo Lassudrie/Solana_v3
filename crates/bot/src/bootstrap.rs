@@ -24,8 +24,8 @@ use strategy::{
     StrategyPlane,
     guards::GuardrailConfig,
     route_registry::{
-        ExecutionProtectionPolicy, RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode,
-        StrategySizingConfig, SwapSide,
+        ExecutionProtectionPolicy, RouteDefinition, RouteKind, RouteLeg, RouteLegSequence,
+        RouteSizingPolicy, RouteValidationError, SizingMode, StrategySizingConfig, SwapSide,
     },
 };
 use thiserror::Error;
@@ -33,8 +33,9 @@ use thiserror::Error;
 use crate::{
     account_batcher::{GetMultipleAccountsBatcher, RpcContext, decode_lookup_table},
     config::{
-        BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteLegExecutionConfig,
-        RuntimeProfileConfig, SigningConfig, SigningProviderKind, SwapSideConfig,
+        BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteKindConfig,
+        RouteLegExecutionConfig, RuntimeProfileConfig, SigningConfig, SigningProviderKind,
+        SwapSideConfig,
     },
     route_health::SharedRouteHealth,
     rpc::rpc_call,
@@ -117,7 +118,10 @@ struct ParsedTokenAccount {
 
 pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
     let route_health = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::route_health::RouteHealthRegistry::new(config.runtime.live_set_health.clone()),
+        crate::route_health::RouteHealthRegistry::new(
+            config.runtime.live_set_health.clone(),
+            config.state.max_snapshot_slot_lag,
+        ),
     ));
     bootstrap_with_health(config, route_health)
 }
@@ -149,6 +153,7 @@ pub fn bootstrap_with_health(
     let mut strategy = StrategyPlane::new(
         GuardrailConfig {
             min_profit_quote_atoms: config.strategy.min_profit_quote_atoms,
+            min_profit_bps: config.strategy.min_profit_bps,
             require_route_warm: config.strategy.require_route_warm,
             max_inflight_submissions: config.strategy.max_inflight_submissions,
             min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
@@ -156,6 +161,7 @@ pub fn bootstrap_with_health(
         },
         StrategySizingConfig {
             mode: map_sizing_mode(config.strategy.sizing.mode),
+            fixed_trade_size: config.strategy.sizing.fixed_trade_size,
             min_trade_floor_sol_lamports: config.strategy.sizing.min_trade_floor_sol_lamports,
             base_landing_rate_bps: config.strategy.sizing.base_landing_rate_bps,
             ewma_alpha_bps: config.strategy.sizing.ewma_alpha_bps,
@@ -192,24 +198,32 @@ pub fn bootstrap_with_health(
 
     let mut execution_registry = ExecutionRegistry::default();
     for route in active_routes {
-        let min_trade_size = resolve_min_trade_size(route)?;
         let sol_quote_conversion_pool_id =
             resolve_sol_quote_conversion_pool_id(route, &tracked_pool_pairs)?;
-        let route_id = RouteId(route.route_id.clone());
-        let mut pool_ids = route
+        let route_kind = map_route_kind(route.kind);
+        let route_definition = resolve_route_definition(
+            route,
+            route_kind,
+            &config.strategy.sizing,
+            &config.builder,
+            sol_quote_conversion_pool_id.clone(),
+        )?;
+        let route_execution = resolve_builder_route_execution(route, route_kind)?;
+        let route_id = route_definition.route_id.clone();
+        let mut pool_ids = route_definition
             .legs
             .iter()
-            .map(|leg| PoolId(leg.pool_id.clone()))
+            .map(|leg| leg.pool_id.clone())
             .collect::<Vec<_>>();
         if let Some(pool_id) = &sol_quote_conversion_pool_id {
             pool_ids.push(pool_id.clone());
         }
         let mut seen_pool_ids = HashSet::with_capacity(pool_ids.len());
         pool_ids.retain(|pool_id| seen_pool_ids.insert(pool_id.clone()));
-        if let Ok(mut health) = route_health.lock() {
-            health.register_route(route_id.clone(), &pool_ids);
-        }
         let max_quote_slot_lag = effective_max_quote_slot_lag(route);
+        if let Ok(mut health) = route_health.lock() {
+            health.register_route(route_id.clone(), &pool_ids, max_quote_slot_lag);
+        }
         state.register_route_with_execution_lag(route_id.clone(), pool_ids, max_quote_slot_lag);
         for dependency in &route.account_dependencies {
             state.register_account_dependency(
@@ -218,65 +232,8 @@ pub fn bootstrap_with_health(
                 dependency.decoder_key.clone(),
             );
         }
-        strategy.register_route(RouteDefinition {
-            route_id,
-            input_mint: route.input_mint.clone(),
-            output_mint: route.output_mint.clone(),
-            base_mint: route.base_mint.clone(),
-            quote_mint: route.quote_mint.clone(),
-            sol_quote_conversion_pool_id,
-            legs: [
-                RouteLeg {
-                    venue: route.legs[0].venue.clone(),
-                    pool_id: PoolId(route.legs[0].pool_id.clone()),
-                    side: map_swap_side(&route.legs[0].side),
-                    fee_bps: route.legs[0].fee_bps,
-                },
-                RouteLeg {
-                    venue: route.legs[1].venue.clone(),
-                    pool_id: PoolId(route.legs[1].pool_id.clone()),
-                    side: map_swap_side(&route.legs[1].side),
-                    fee_bps: route.legs[1].fee_bps,
-                },
-            ],
-            max_quote_slot_lag,
-            min_trade_size,
-            default_trade_size: route.default_trade_size,
-            max_trade_size: route.max_trade_size,
-            size_ladder: route.size_ladder.clone(),
-            estimated_execution_cost_lamports: estimate_execution_cost_lamports(
-                route,
-                &config.builder,
-                route.execution.default_compute_unit_limit,
-                route.execution.default_compute_unit_price_micro_lamports,
-                route.execution.default_jito_tip_lamports,
-            ),
-            sizing: resolve_route_sizing(&config.strategy.sizing, &route.sizing),
-            execution_protection: map_execution_protection(&route.execution_protection),
-        });
-        execution_registry.register(BuilderRouteExecutionConfig {
-            route_id: RouteId(route.route_id.clone()),
-            message_mode: map_message_mode(&route.execution.message_mode),
-            lookup_tables: route
-                .execution
-                .lookup_tables
-                .iter()
-                .map(|table| LookupTableUsageConfig {
-                    account_key: table.account_key.clone(),
-                })
-                .collect(),
-            default_compute_unit_limit: route.execution.default_compute_unit_limit,
-            default_compute_unit_price_micro_lamports: route
-                .execution
-                .default_compute_unit_price_micro_lamports,
-            default_jito_tip_lamports: route.execution.default_jito_tip_lamports,
-            max_quote_slot_lag,
-            max_alt_slot_lag: route.execution.max_alt_slot_lag,
-            legs: [
-                map_leg_execution(&route.legs[0].execution),
-                map_leg_execution(&route.legs[1].execution),
-            ],
-        });
+        strategy.register_route(route_definition);
+        execution_registry.register(route_execution);
     }
 
     let submit_mode = submit_mode_from_config(&config);
@@ -477,6 +434,13 @@ fn map_sizing_mode(mode: crate::config::SizingModeConfig) -> SizingMode {
     }
 }
 
+fn map_route_kind(kind: RouteKindConfig) -> RouteKind {
+    match kind {
+        RouteKindConfig::TwoLeg => RouteKind::TwoLeg,
+        RouteKindConfig::Triangular => RouteKind::Triangular,
+    }
+}
+
 fn resolve_route_sizing(
     global: &crate::config::StrategySizingConfig,
     route: &crate::config::RouteSizingConfig,
@@ -498,6 +462,228 @@ fn resolve_route_sizing(
         max_expected_shortfall_bps: route
             .max_expected_shortfall_bps
             .unwrap_or(global.max_expected_shortfall_bps),
+    }
+}
+
+fn resolve_route_definition(
+    route: &crate::config::RouteConfig,
+    route_kind: RouteKind,
+    strategy_sizing: &crate::config::StrategySizingConfig,
+    builder: &BuilderConfig,
+    sol_quote_conversion_pool_id: Option<PoolId>,
+) -> Result<RouteDefinition, BootstrapError> {
+    let min_trade_size = resolve_min_trade_size(route)?;
+    let legs = route
+        .legs
+        .iter()
+        .enumerate()
+        .map(|(index, leg)| {
+            let (input_mint, output_mint) = resolve_route_leg_mints(route, route_kind, leg, index)?;
+            validate_leg_execution_mints(route, index, &leg.execution, &input_mint, &output_mint)?;
+            Ok(RouteLeg {
+                venue: leg.venue.clone(),
+                pool_id: PoolId(leg.pool_id.clone()),
+                side: map_swap_side(&leg.side),
+                input_mint,
+                output_mint,
+                fee_bps: leg.fee_bps,
+            })
+        })
+        .collect::<Result<Vec<_>, BootstrapError>>()?;
+
+    let definition = RouteDefinition {
+        route_id: RouteId(route.route_id.clone()),
+        kind: route_kind,
+        input_mint: route.input_mint.clone(),
+        output_mint: route.output_mint.clone(),
+        base_mint: route.base_mint.clone(),
+        quote_mint: route.quote_mint.clone(),
+        sol_quote_conversion_pool_id,
+        min_profit_quote_atoms: route.min_profit_quote_atoms,
+        legs: RouteLegSequence::from_vec(legs)
+            .map_err(|error| route_validation_error(route, error))?,
+        max_quote_slot_lag: effective_max_quote_slot_lag(route),
+        min_trade_size,
+        default_trade_size: route.default_trade_size,
+        max_trade_size: route.max_trade_size,
+        size_ladder: route.size_ladder.clone(),
+        estimated_execution_cost_lamports: estimate_execution_cost_lamports(
+            route,
+            builder,
+            route.execution.default_compute_unit_limit,
+            route.execution.default_compute_unit_price_micro_lamports,
+            route.execution.default_jito_tip_lamports,
+        ),
+        sizing: resolve_route_sizing(strategy_sizing, &route.sizing),
+        execution_protection: map_execution_protection(&route.execution_protection),
+    };
+
+    definition
+        .validate()
+        .map_err(|error| route_validation_error(route, error))?;
+    Ok(definition)
+}
+
+fn resolve_builder_route_execution(
+    route: &crate::config::RouteConfig,
+    route_kind: RouteKind,
+) -> Result<BuilderRouteExecutionConfig, BootstrapError> {
+    let minimum_compute_unit_limit = route
+        .execution
+        .minimum_compute_unit_limit
+        .max(route_kind.minimum_compute_unit_limit());
+    if route.execution.default_compute_unit_limit < minimum_compute_unit_limit {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "execution.default_compute_unit_limit ({}) must be >= {} for {:?} routes",
+                route.execution.default_compute_unit_limit, minimum_compute_unit_limit, route_kind
+            ),
+        });
+    }
+    let execution_legs = route
+        .legs
+        .iter()
+        .map(|leg| map_leg_execution(&leg.execution))
+        .collect::<Vec<_>>();
+
+    Ok(BuilderRouteExecutionConfig {
+        route_id: RouteId(route.route_id.clone()),
+        kind: route_kind,
+        message_mode: map_message_mode(&route.execution.message_mode),
+        lookup_tables: route
+            .execution
+            .lookup_tables
+            .iter()
+            .map(|table| LookupTableUsageConfig {
+                account_key: table.account_key.clone(),
+            })
+            .collect(),
+        default_compute_unit_limit: route.execution.default_compute_unit_limit,
+        minimum_compute_unit_limit,
+        default_compute_unit_price_micro_lamports: route
+            .execution
+            .default_compute_unit_price_micro_lamports,
+        default_jito_tip_lamports: route.execution.default_jito_tip_lamports,
+        max_quote_slot_lag: effective_max_quote_slot_lag(route),
+        max_alt_slot_lag: route.execution.max_alt_slot_lag,
+        legs: RouteLegSequence::from_vec(execution_legs)
+            .map_err(|error| route_validation_error(route, error))?,
+    })
+}
+
+fn resolve_route_leg_mints(
+    route: &crate::config::RouteConfig,
+    route_kind: RouteKind,
+    leg: &crate::config::RouteLegConfig,
+    leg_index: usize,
+) -> Result<(String, String), BootstrapError> {
+    match (&leg.input_mint, &leg.output_mint) {
+        (Some(input_mint), Some(output_mint)) => Ok((input_mint.clone(), output_mint.clone())),
+        (None, None) if route_kind == RouteKind::TwoLeg => {
+            let base_mint = route.base_mint.clone().ok_or_else(|| BootstrapError::InvalidRouteConfig {
+                route_id: route.route_id.clone(),
+                detail: format!(
+                    "legs[{leg_index}] must define input_mint/output_mint when base_mint is absent"
+                ),
+            })?;
+            let quote_mint = route.quote_mint.clone().ok_or_else(|| BootstrapError::InvalidRouteConfig {
+                route_id: route.route_id.clone(),
+                detail: format!(
+                    "legs[{leg_index}] must define input_mint/output_mint when quote_mint is absent"
+                ),
+            })?;
+            Ok(match leg.side {
+                SwapSideConfig::BuyBase => (quote_mint, base_mint),
+                SwapSideConfig::SellBase => (base_mint, quote_mint),
+            })
+        }
+        (None, None) => Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "triangular routes require explicit legs[{leg_index}].input_mint and legs[{leg_index}].output_mint"
+            ),
+        }),
+        _ => Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "legs[{leg_index}] must define both input_mint and output_mint together"
+            ),
+        }),
+    }
+}
+
+fn validate_leg_execution_mints(
+    route: &crate::config::RouteConfig,
+    leg_index: usize,
+    execution: &RouteLegExecutionConfig,
+    input_mint: &str,
+    output_mint: &str,
+) -> Result<(), BootstrapError> {
+    let invalid = |detail: String| BootstrapError::InvalidRouteConfig {
+        route_id: route.route_id.clone(),
+        detail,
+    };
+
+    match execution {
+        RouteLegExecutionConfig::OrcaWhirlpool(config) => {
+            let expected_a_to_b =
+                if input_mint == config.token_mint_a && output_mint == config.token_mint_b {
+                    Some(true)
+                } else if input_mint == config.token_mint_b && output_mint == config.token_mint_a {
+                    Some(false)
+                } else {
+                    None
+                };
+            let Some(expected_a_to_b) = expected_a_to_b else {
+                return Err(invalid(format!(
+                    "legs[{leg_index}] mints {input_mint}->{output_mint} do not match whirlpool pair {}<->{}",
+                    config.token_mint_a, config.token_mint_b
+                )));
+            };
+            if config.a_to_b != expected_a_to_b {
+                return Err(invalid(format!(
+                    "legs[{leg_index}] direction {input_mint}->{output_mint} conflicts with orca_whirlpool.a_to_b={}",
+                    config.a_to_b
+                )));
+            }
+        }
+        RouteLegExecutionConfig::RaydiumClmm(config) => {
+            let expected_zero_for_one =
+                if input_mint == config.token_mint_0 && output_mint == config.token_mint_1 {
+                    Some(true)
+                } else if input_mint == config.token_mint_1 && output_mint == config.token_mint_0 {
+                    Some(false)
+                } else {
+                    None
+                };
+            let Some(expected_zero_for_one) = expected_zero_for_one else {
+                return Err(invalid(format!(
+                    "legs[{leg_index}] mints {input_mint}->{output_mint} do not match raydium_clmm pair {}<->{}",
+                    config.token_mint_0, config.token_mint_1
+                )));
+            };
+            if config.zero_for_one != expected_zero_for_one {
+                return Err(invalid(format!(
+                    "legs[{leg_index}] direction {input_mint}->{output_mint} conflicts with raydium_clmm.zero_for_one={}",
+                    config.zero_for_one
+                )));
+            }
+        }
+        RouteLegExecutionConfig::OrcaSimplePool(_)
+        | RouteLegExecutionConfig::RaydiumSimplePool(_) => {}
+    }
+
+    Ok(())
+}
+
+fn route_validation_error(
+    route: &crate::config::RouteConfig,
+    error: RouteValidationError,
+) -> BootstrapError {
+    BootstrapError::InvalidRouteConfig {
+        route_id: route.route_id.clone(),
+        detail: error.to_string(),
     }
 }
 
@@ -548,6 +734,17 @@ fn validate_runtime_route_config(route: &crate::config::RouteConfig) -> Result<(
 fn validate_route_leg_requirements(
     route: &crate::config::RouteConfig,
 ) -> Result<(), BootstrapError> {
+    let expected_legs = map_route_kind(route.kind).expected_leg_count();
+    if route.legs.len() != expected_legs {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "route kind {:?} requires {expected_legs} legs, got {}",
+                route.kind,
+                route.legs.len()
+            ),
+        });
+    }
     for (index, leg) in route.legs.iter().enumerate() {
         if matches!(&leg.execution, RouteLegExecutionConfig::RaydiumClmm(_))
             && leg.fee_bps.is_none()
@@ -556,6 +753,14 @@ fn validate_route_leg_requirements(
                 route_id: route.route_id.clone(),
                 detail: format!(
                     "legs[{index}].fee_bps is required for raydium_clmm legs because PoolState does not expose the trade fee and the decoder otherwise falls back to zero"
+                ),
+            });
+        }
+        if leg.input_mint.is_some() ^ leg.output_mint.is_some() {
+            return Err(BootstrapError::InvalidRouteConfig {
+                route_id: route.route_id.clone(),
+                detail: format!(
+                    "legs[{index}] must define both input_mint and output_mint together"
                 ),
             });
         }
@@ -605,13 +810,7 @@ fn route_string_is_invalid(value: &str) -> bool {
 }
 
 fn route_requires_explicit_sol_quote_conversion(route: &crate::config::RouteConfig) -> bool {
-    let Some(quote_mint) = route.quote_mint.as_deref() else {
-        return false;
-    };
-    route.base_mint.is_some()
-        && route.input_mint == route.output_mint
-        && route.input_mint == quote_mint
-        && quote_mint != SOL_MINT
+    route.input_mint == route.output_mint && route.input_mint != SOL_MINT
 }
 
 fn validate_execution_environment(
@@ -889,6 +1088,14 @@ fn route_runtime_mints(route: &crate::config::RouteConfig) -> Vec<String> {
     if let Some(mint) = &route.quote_mint {
         mints.insert(mint.clone());
     }
+    for leg in &route.legs {
+        if let Some(mint) = &leg.input_mint {
+            mints.insert(mint.clone());
+        }
+        if let Some(mint) = &leg.output_mint {
+            mints.insert(mint.clone());
+        }
+    }
     mints
         .into_iter()
         .filter(|mint| parse_pubkey(mint).is_ok())
@@ -1066,16 +1273,16 @@ fn tracked_pool_pair(
 ) -> (String, String) {
     match &leg.execution {
         RouteLegExecutionConfig::OrcaSimplePool(_)
-        | RouteLegExecutionConfig::RaydiumSimplePool(_) => (
-            route
-                .base_mint
-                .clone()
-                .unwrap_or_else(|| route.input_mint.clone()),
-            route
-                .quote_mint
-                .clone()
-                .unwrap_or_else(|| route.output_mint.clone()),
-        ),
+        | RouteLegExecutionConfig::RaydiumSimplePool(_) => {
+            let (input_mint, output_mint) =
+                resolve_route_leg_mints(route, map_route_kind(route.kind), leg, 0)
+                    .unwrap_or_else(|_| (route.input_mint.clone(), route.output_mint.clone()));
+            if matches!(leg.side, SwapSideConfig::BuyBase) {
+                (output_mint, input_mint)
+            } else {
+                (input_mint, output_mint)
+            }
+        }
         RouteLegExecutionConfig::OrcaWhirlpool(config) => {
             (config.token_mint_a.clone(), config.token_mint_b.clone())
         }
@@ -1166,10 +1373,7 @@ fn estimate_execution_cost_lamports(
     route_compute_unit_price_micro_lamports: u64,
     route_jito_tip_lamports: u64,
 ) -> u64 {
-    if route.base_mint.is_none()
-        || route.quote_mint.is_none()
-        || route.input_mint != route.output_mint
-    {
+    if route.input_mint != route.output_mint {
         return 0;
     }
 
@@ -1388,17 +1592,18 @@ mod tests {
     use strategy::{
         opportunity::{CandidateSelectionSource, OpportunityCandidate},
         quote::LegQuote,
+        route_registry::RouteLegSequence,
     };
 
     use super::{
         BootstrapError, bootstrap, effective_max_quote_slot_lag, map_leg_execution,
-        map_message_mode, map_swap_side, route_enabled_in_profile,
+        map_message_mode, map_route_kind, map_swap_side, route_enabled_in_profile,
     };
     use crate::config::{
         BotConfig, LookupTableConfig, MessageModeConfig, OrcaSimplePoolLegExecutionConfig,
         OrcaWhirlpoolLegExecutionConfig, RaydiumClmmLegExecutionConfig,
         RaydiumSimplePoolLegExecutionConfig, RouteClassConfig, RouteConfig, RouteExecutionConfig,
-        RouteLegConfig, RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
+        RouteKindConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
     };
 
     fn test_pubkey(label: &str) -> String {
@@ -1415,6 +1620,7 @@ mod tests {
             message_mode: MessageModeConfig::V0Required,
             lookup_tables: Vec::new(),
             default_compute_unit_limit: 300_000,
+            minimum_compute_unit_limit: 0,
             default_compute_unit_price_micro_lamports: 25_000,
             default_jito_tip_lamports: 5_000,
             max_quote_slot_lag: 4,
@@ -1426,23 +1632,27 @@ mod tests {
         RouteConfig {
             enabled: true,
             route_class: RouteClassConfig::AmmFastPath,
+            kind: RouteKindConfig::TwoLeg,
             route_id: "route-a".into(),
             input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
             base_mint: Some("So11111111111111111111111111111111111111112".into()),
             quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
             sol_quote_conversion_pool_id: Some("pool-a".into()),
+            min_profit_quote_atoms: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             min_trade_size: None,
             size_ladder: Vec::new(),
             sizing: Default::default(),
             execution_protection: Default::default(),
-            legs: [
+            legs: vec![
                 RouteLegConfig {
                     venue: "orca".into(),
                     pool_id: "pool-a".into(),
                     side: SwapSideConfig::BuyBase,
+                    input_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                    output_mint: Some("So11111111111111111111111111111111111111112".into()),
                     fee_bps: None,
                     execution: RouteLegExecutionConfig::OrcaSimplePool(
                         OrcaSimplePoolLegExecutionConfig {
@@ -1464,6 +1674,8 @@ mod tests {
                     venue: "raydium".into(),
                     pool_id: "pool-b".into(),
                     side: SwapSideConfig::SellBase,
+                    input_mint: Some("So11111111111111111111111111111111111111112".into()),
+                    output_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
                     fee_bps: None,
                     execution: RouteLegExecutionConfig::RaydiumSimplePool(
                         RaydiumSimplePoolLegExecutionConfig {
@@ -1495,6 +1707,69 @@ mod tests {
         }
     }
 
+    fn triangular_route_config() -> RouteConfig {
+        let mut route = valid_route_config();
+        route.kind = RouteKindConfig::Triangular;
+        route.route_id = "route-tri".into();
+        route.execution.default_compute_unit_limit = 450_000;
+        route.execution.minimum_compute_unit_limit = 420_000;
+
+        route.legs[1].pool_id = "pool-b-tri".into();
+        route.legs[1].input_mint = Some("So11111111111111111111111111111111111111112".into());
+        route.legs[1].output_mint = Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".into());
+        route.legs[1].execution =
+            RouteLegExecutionConfig::RaydiumSimplePool(RaydiumSimplePoolLegExecutionConfig {
+                program_id: test_pubkey("tri-raydium-program"),
+                token_program_id: test_pubkey("spl-token-program"),
+                amm_pool: test_pubkey("tri-raydium-amm-pool"),
+                amm_authority: test_pubkey("tri-raydium-amm-authority"),
+                amm_open_orders: test_pubkey("tri-raydium-open-orders"),
+                amm_coin_vault: test_pubkey("tri-raydium-coin-vault"),
+                amm_pc_vault: test_pubkey("tri-raydium-pc-vault"),
+                market_program: test_pubkey("tri-serum-program"),
+                market: test_pubkey("tri-serum-market"),
+                market_bids: test_pubkey("tri-serum-bids"),
+                market_asks: test_pubkey("tri-serum-asks"),
+                market_event_queue: test_pubkey("tri-serum-event-queue"),
+                market_coin_vault: test_pubkey("tri-serum-coin-vault"),
+                market_pc_vault: test_pubkey("tri-serum-pc-vault"),
+                market_vault_signer: test_pubkey("tri-serum-vault-signer"),
+                user_source_token_account: Some(test_pubkey("tri-route-mid-a-ata")),
+                user_destination_token_account: Some(test_pubkey("tri-route-mid-b-ata")),
+                user_source_mint: None,
+                user_destination_mint: None,
+            });
+        route.legs.push(RouteLegConfig {
+            venue: "orca".into(),
+            pool_id: "pool-c-tri".into(),
+            side: SwapSideConfig::SellBase,
+            input_mint: Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".into()),
+            output_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+            fee_bps: None,
+            execution: RouteLegExecutionConfig::OrcaSimplePool(OrcaSimplePoolLegExecutionConfig {
+                program_id: test_pubkey("tri-orca-program-c"),
+                token_program_id: test_pubkey("spl-token-program"),
+                swap_account: test_pubkey("tri-orca-swap-c"),
+                authority: test_pubkey("tri-orca-authority-c"),
+                pool_source_token_account: test_pubkey("tri-orca-pool-source-c"),
+                pool_destination_token_account: test_pubkey("tri-orca-pool-destination-c"),
+                pool_mint: test_pubkey("tri-orca-pool-mint-c"),
+                fee_account: test_pubkey("tri-orca-fee-account-c"),
+                user_source_token_account: test_pubkey("tri-route-mid-b-ata"),
+                user_destination_token_account: test_pubkey("tri-route-output-ata"),
+                host_fee_account: None,
+            }),
+        });
+        route
+            .account_dependencies
+            .push(crate::config::AccountDependencyConfig {
+                account_key: "acct-c".into(),
+                pool_id: "pool-c-tri".into(),
+                decoder_key: "pool-price-v1".into(),
+            });
+        route
+    }
+
     fn test_config(route: RouteConfig) -> BotConfig {
         let mut config = BotConfig::default();
         let (owner_pubkey, keypair_base58) = signing_material();
@@ -1511,38 +1786,44 @@ mod tests {
     }
 
     fn concentrated_route_config() -> RouteConfig {
+        let base_mint = test_pubkey("mint-base");
+        let quote_mint = "So11111111111111111111111111111111111111112".to_string();
         RouteConfig {
             enabled: true,
             route_class: RouteClassConfig::AmmFastPath,
+            kind: RouteKindConfig::TwoLeg,
             route_id: "route-clmm".into(),
-            input_mint: test_pubkey("mint-quote"),
-            output_mint: test_pubkey("mint-quote"),
-            base_mint: Some(test_pubkey("mint-base")),
-            quote_mint: Some(test_pubkey("mint-quote")),
-            sol_quote_conversion_pool_id: Some("pool-whirlpool".into()),
+            input_mint: quote_mint.clone(),
+            output_mint: quote_mint.clone(),
+            base_mint: Some(base_mint.clone()),
+            quote_mint: Some(quote_mint.clone()),
+            sol_quote_conversion_pool_id: None,
+            min_profit_quote_atoms: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             min_trade_size: None,
             size_ladder: Vec::new(),
             sizing: Default::default(),
             execution_protection: Default::default(),
-            legs: [
+            legs: vec![
                 RouteLegConfig {
                     venue: "orca_whirlpool".into(),
                     pool_id: "pool-whirlpool".into(),
                     side: SwapSideConfig::BuyBase,
+                    input_mint: Some(quote_mint.clone()),
+                    output_mint: Some(base_mint.clone()),
                     fee_bps: Some(30),
                     execution: RouteLegExecutionConfig::OrcaWhirlpool(
                         OrcaWhirlpoolLegExecutionConfig {
                             program_id: test_pubkey("orca-whirlpool-program"),
                             token_program_id: test_pubkey("spl-token-program"),
                             whirlpool: test_pubkey("whirlpool"),
-                            token_mint_a: test_pubkey("mint-base"),
+                            token_mint_a: base_mint.clone(),
                             token_vault_a: test_pubkey("vault-a"),
-                            token_mint_b: test_pubkey("mint-quote"),
+                            token_mint_b: quote_mint.clone(),
                             token_vault_b: test_pubkey("vault-b"),
                             tick_spacing: 64,
-                            a_to_b: true,
+                            a_to_b: false,
                         },
                     ),
                 },
@@ -1550,6 +1831,8 @@ mod tests {
                     venue: "raydium_clmm".into(),
                     pool_id: "pool-clmm".into(),
                     side: SwapSideConfig::SellBase,
+                    input_mint: Some(base_mint.clone()),
+                    output_mint: Some(quote_mint.clone()),
                     fee_bps: Some(30),
                     execution: RouteLegExecutionConfig::RaydiumClmm(
                         RaydiumClmmLegExecutionConfig {
@@ -1561,9 +1844,9 @@ mod tests {
                             amm_config: test_pubkey("amm-config"),
                             observation_state: test_pubkey("observation-state"),
                             ex_bitmap_account: Some(test_pubkey("ex-bitmap")),
-                            token_mint_0: test_pubkey("mint-base"),
+                            token_mint_0: base_mint.clone(),
                             token_vault_0: test_pubkey("vault-0"),
-                            token_mint_1: test_pubkey("mint-quote"),
+                            token_mint_1: quote_mint.clone(),
                             token_vault_1: test_pubkey("vault-1"),
                             tick_spacing: 64,
                             zero_for_one: true,
@@ -1738,6 +2021,7 @@ mod tests {
 
             registry.register(BuilderRouteExecutionConfig {
                 route_id: RouteId(route.route_id.clone()),
+                kind: map_route_kind(route.kind),
                 message_mode: map_message_mode(&route.execution.message_mode),
                 lookup_tables: route
                     .execution
@@ -1748,16 +2032,24 @@ mod tests {
                     })
                     .collect(),
                 default_compute_unit_limit: route.execution.default_compute_unit_limit,
+                minimum_compute_unit_limit: route
+                    .execution
+                    .minimum_compute_unit_limit
+                    .max(map_route_kind(route.kind).minimum_compute_unit_limit()),
                 default_compute_unit_price_micro_lamports: route
                     .execution
                     .default_compute_unit_price_micro_lamports,
                 default_jito_tip_lamports: route.execution.default_jito_tip_lamports,
                 max_quote_slot_lag: effective_max_quote_slot_lag(route),
                 max_alt_slot_lag: route.execution.max_alt_slot_lag,
-                legs: [
-                    map_leg_execution(&route.legs[0].execution),
-                    map_leg_execution(&route.legs[1].execution),
-                ],
+                legs: RouteLegSequence::from_vec(
+                    route
+                        .legs
+                        .iter()
+                        .map(|leg| map_leg_execution(&leg.execution))
+                        .collect(),
+                )
+                .expect("test route should have valid leg count"),
             });
         }
         registry
@@ -1822,18 +2114,40 @@ mod tests {
     }
 
     fn candidate_for_route(route: &RouteConfig) -> OpportunityCandidate {
-        let first_output = route
-            .default_trade_size
-            .saturating_add(route.default_trade_size / 20 + 1);
-        let second_output = first_output.saturating_add(route.default_trade_size / 20 + 1);
+        let mut input_amount = route.default_trade_size;
+        let mut leg_quotes = Vec::with_capacity(route.legs.len());
+        let mut intermediate_output_amounts =
+            Vec::with_capacity(route.legs.len().saturating_sub(1));
+
+        for (index, leg) in route.legs.iter().enumerate() {
+            let output_amount = input_amount.saturating_add(
+                route.default_trade_size / 20 + u64::try_from(index).unwrap_or(0) + 1,
+            );
+            leg_quotes.push(LegQuote {
+                venue: leg.venue.clone(),
+                pool_id: PoolId(leg.pool_id.clone()),
+                side: map_swap_side(&leg.side),
+                input_amount,
+                output_amount,
+                fee_paid: 0,
+                current_tick_index: current_tick_index_hint(&leg.execution),
+            });
+            input_amount = output_amount;
+            if index + 1 < route.legs.len() {
+                intermediate_output_amounts.push(output_amount);
+            }
+        }
+
         OpportunityCandidate {
             route_id: RouteId(route.route_id.clone()),
+            route_kind: map_route_kind(route.kind),
             quoted_slot: 42,
-            leg_snapshot_slots: [42, 42],
+            leg_snapshot_slots: RouteLegSequence::from_vec(vec![42; route.legs.len()])
+                .expect("test route should have valid leg count"),
             sol_quote_conversion_snapshot_slot: None,
             trade_size: route.default_trade_size,
             active_execution_buffer_bps: None,
-            expected_net_output: second_output,
+            expected_net_output: input_amount,
             minimum_acceptable_output: route.default_trade_size.saturating_add(1),
             expected_gross_profit_quote_atoms: 1,
             estimated_execution_cost_lamports: 0,
@@ -1844,26 +2158,9 @@ mod tests {
             expected_value_quote_atoms: 1,
             p_land_bps: 10_000,
             expected_shortfall_quote_atoms: 0,
-            leg_quotes: [
-                LegQuote {
-                    venue: route.legs[0].venue.clone(),
-                    pool_id: PoolId(route.legs[0].pool_id.clone()),
-                    side: map_swap_side(&route.legs[0].side),
-                    input_amount: route.default_trade_size,
-                    output_amount: first_output,
-                    fee_paid: 0,
-                    current_tick_index: current_tick_index_hint(&route.legs[0].execution),
-                },
-                LegQuote {
-                    venue: route.legs[1].venue.clone(),
-                    pool_id: PoolId(route.legs[1].pool_id.clone()),
-                    side: map_swap_side(&route.legs[1].side),
-                    input_amount: first_output,
-                    output_amount: second_output,
-                    fee_paid: 0,
-                    current_tick_index: current_tick_index_hint(&route.legs[1].execution),
-                },
-            ],
+            intermediate_output_amounts,
+            leg_quotes: RouteLegSequence::from_vec(leg_quotes)
+                .expect("test route should have valid leg count"),
         }
     }
 
@@ -1967,11 +2264,11 @@ mod tests {
 
     #[test]
     fn bootstrap_rejects_route_with_non_sol_quote_conversion_pool() {
-        let mut route = valid_route_config();
-        route.base_mint = Some("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB".into());
-        route.sol_quote_conversion_pool_id = Some("pool-a".into());
+        let mut config = test_config(valid_route_config());
+        config.routes.definitions[0].sol_quote_conversion_pool_id = Some("pool-whirlpool".into());
+        config.routes.definitions.push(concentrated_route_config());
 
-        let error = match bootstrap(test_config(route)) {
+        let error = match bootstrap(config) {
             Ok(_) => panic!("non SOL/quote pool should be rejected"),
             Err(error) => error,
         };
@@ -1980,6 +2277,28 @@ mod tests {
         };
         assert_eq!(route_id, "route-a");
         assert!(detail.contains("tracked SOL/"));
+    }
+
+    #[test]
+    fn bootstrap_accepts_valid_triangular_route_config() {
+        bootstrap(test_config(triangular_route_config()))
+            .expect("valid triangular route should bootstrap cleanly");
+    }
+
+    #[test]
+    fn bootstrap_rejects_triangular_route_with_broken_leg_chain() {
+        let mut route = triangular_route_config();
+        route.legs[1].output_mint = Some("DezXAZ8z7PnrnRJjz3Wm8PwVbQrc6f1an5d1Wb7B1pPB".into());
+
+        let error = match bootstrap(test_config(route)) {
+            Ok(_) => panic!("broken triangular chain should fail bootstrap"),
+            Err(error) => error,
+        };
+        let BootstrapError::InvalidRouteConfig { route_id, detail } = error else {
+            panic!("expected invalid route config error");
+        };
+        assert_eq!(route_id, "route-tri");
+        assert!(detail.contains("legs do not chain"));
     }
 
     #[test]

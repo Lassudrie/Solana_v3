@@ -52,6 +52,12 @@ pub struct ExecutionRecord {
     pub submitted_slot: Option<u64>,
     pub inclusion_status: InclusionStatus,
     pub outcome: ExecutionOutcome,
+    pub profit_mint: Option<String>,
+    pub wallet_owner_pubkey: Option<String>,
+    pub expected_pnl_quote_atoms: Option<i64>,
+    pub estimated_execution_cost_quote_atoms: Option<u64>,
+    pub realized_output_delta_quote_atoms: Option<i64>,
+    pub realized_pnl_quote_atoms: Option<i64>,
     pub failure_detail: Option<ExecutionFailureDetail>,
     pub submitted_at: SystemTime,
     pub last_updated_at: SystemTime,
@@ -109,6 +115,12 @@ impl ExecutionTracker {
             submitted_slot,
             inclusion_status,
             outcome,
+            profit_mint: None,
+            wallet_owner_pubkey: None,
+            expected_pnl_quote_atoms: None,
+            estimated_execution_cost_quote_atoms: None,
+            realized_output_delta_quote_atoms: None,
+            realized_pnl_quote_atoms: None,
             failure_detail: None,
             submitted_at,
             last_updated_at: submitted_at,
@@ -156,6 +168,40 @@ impl ExecutionTracker {
             return false;
         };
         record.failure_detail = Some(detail);
+        record.last_updated_at = SystemTime::now();
+        true
+    }
+
+    pub fn set_profit_context(
+        &mut self,
+        submission_id: &SubmissionId,
+        profit_mint: Option<String>,
+        wallet_owner_pubkey: Option<String>,
+        expected_pnl_quote_atoms: Option<i64>,
+        estimated_execution_cost_quote_atoms: Option<u64>,
+    ) -> bool {
+        let Some(record) = self.history.get_mut(submission_id) else {
+            return false;
+        };
+        record.profit_mint = profit_mint;
+        record.wallet_owner_pubkey = wallet_owner_pubkey;
+        record.expected_pnl_quote_atoms = expected_pnl_quote_atoms;
+        record.estimated_execution_cost_quote_atoms = estimated_execution_cost_quote_atoms;
+        record.last_updated_at = SystemTime::now();
+        true
+    }
+
+    pub fn set_realized_pnl(
+        &mut self,
+        submission_id: &SubmissionId,
+        realized_output_delta_quote_atoms: Option<i64>,
+        realized_pnl_quote_atoms: Option<i64>,
+    ) -> bool {
+        let Some(record) = self.history.get_mut(submission_id) else {
+            return false;
+        };
+        record.realized_output_delta_quote_atoms = realized_output_delta_quote_atoms;
+        record.realized_pnl_quote_atoms = realized_pnl_quote_atoms;
         record.last_updated_at = SystemTime::now();
         true
     }

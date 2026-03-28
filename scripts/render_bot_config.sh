@@ -121,18 +121,42 @@ function print_shredstream_table() {
     }
 }
 
+function print_strategy_overrides() {
+    print "min_profit_quote_atoms = 0"
+    print "min_profit_bps = 0"
+    print "sizing.mode = \"legacy\""
+    print "sizing.fixed_trade_size = true"
+    print "sizing.min_trade_floor_sol_lamports = 100000000"
+}
+
+function print_builder_overrides() {
+    print "compute_unit_price_micro_lamports = 1"
+    print "jito_tip_lamports = 1"
+}
+
 BEGIN {
     inserted_runtime_overrides = 0
     inserted_shredstream_table = 0
     in_signing = 0
     saw_signing = 0
+    in_strategy = 0
+    saw_strategy = 0
+    printed_strategy_overrides = 0
     in_runtime_monitor_server = 0
     printed_runtime_monitor_server_enabled = 0
+    in_builder = 0
+    printed_builder_overrides = 0
 }
 
 /^\[/ {
+    if (in_strategy && !printed_strategy_overrides) {
+        print_strategy_overrides()
+    }
     if (in_runtime_monitor_server && !printed_runtime_monitor_server_enabled) {
         print "enabled = true"
+    }
+    if (in_builder && !printed_builder_overrides) {
+        print_builder_overrides()
     }
 
     if (!inserted_runtime_overrides && $0 == "[state]") {
@@ -153,12 +177,31 @@ BEGIN {
         next
     }
 
+    in_strategy = ($0 == "[strategy]")
+    printed_strategy_sizing_mode = 0
+    if (in_strategy) {
+        saw_strategy = 1
+        print $0
+        print_strategy_overrides()
+        printed_strategy_overrides = 1
+        next
+    }
+
     in_runtime_monitor_server = ($0 == "[runtime.monitor_server]")
     printed_runtime_monitor_server_enabled = 0
     if (in_runtime_monitor_server) {
         print $0
         print "enabled = true"
         printed_runtime_monitor_server_enabled = 1
+        next
+    }
+
+    in_builder = ($0 == "[builder]")
+    printed_builder_overrides = 0
+    if (in_builder) {
+        print $0
+        print_builder_overrides()
+        printed_builder_overrides = 1
         next
     }
 
@@ -175,8 +218,24 @@ BEGIN {
         next
     }
 
+    if (in_strategy) {
+        if ($0 ~ /^(min_profit_quote_atoms|min_profit_bps|sizing\.mode|sizing\.fixed_trade_size|sizing\.min_trade_floor_sol_lamports)[[:space:]]*=/) {
+            next
+        }
+        print
+        next
+    }
+
     if (in_runtime_monitor_server) {
         if ($0 ~ /^enabled[[:space:]]*=/) {
+            next
+        }
+        print
+        next
+    }
+
+    if (in_builder) {
+        if ($0 ~ /^(compute_unit_price_micro_lamports|jito_tip_lamports)[[:space:]]*=/) {
             next
         }
         print
@@ -187,6 +246,12 @@ BEGIN {
 }
 
 END {
+    if (in_strategy && !printed_strategy_overrides) {
+        print_strategy_overrides()
+    }
+    if (in_builder && !printed_builder_overrides) {
+        print_builder_overrides()
+    }
     if (in_runtime_monitor_server && !printed_runtime_monitor_server_enabled) {
         print "enabled = true"
     }
@@ -195,6 +260,12 @@ END {
         print ""
         print "[signing]"
         print_signing_overrides()
+    }
+
+    if (!saw_strategy) {
+        print ""
+        print "[strategy]"
+        print_strategy_overrides()
     }
 
     if (!inserted_runtime_overrides) {

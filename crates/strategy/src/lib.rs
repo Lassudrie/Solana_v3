@@ -25,6 +25,7 @@ struct RouteExecutionProtectionState {
 pub(crate) struct RouteExecutionSizingState {
     pub landing_rate_bps: u16,
     pub expected_shortfall_bps: u16,
+    pub max_trade_size: u64,
 }
 
 #[derive(Debug)]
@@ -65,6 +66,7 @@ impl StrategyPlane {
             RouteExecutionSizingState {
                 landing_rate_bps: route.sizing.base_landing_rate_bps,
                 expected_shortfall_bps: route.sizing.base_expected_shortfall_bps,
+                max_trade_size: route.max_trade_size.max(1),
             },
         );
         self.registry.register(route);
@@ -145,12 +147,40 @@ impl StrategyPlane {
         if let Some(state) = self.execution_sizing.get_mut(route_id) {
             state.landing_rate_bps =
                 ewma_bps(state.landing_rate_bps, 10_000, self.sizing.ewma_alpha_bps);
+            state.max_trade_size = route.max_trade_size.max(1);
             state.expected_shortfall_bps = ewma_bps(
                 state.expected_shortfall_bps,
                 route.sizing.base_expected_shortfall_bps,
                 self.sizing.ewma_alpha_bps,
             );
         }
+    }
+
+    pub fn record_execution_amount_in_above_maximum(&mut self, route_id: &RouteId) {
+        let Some(route) = self.registry.get(route_id) else {
+            return;
+        };
+        if let (Some(policy), Some(state)) = (
+            route.execution_protection.as_ref(),
+            self.execution_protection.get_mut(route_id),
+        ) {
+            state.current_extra_buy_leg_slippage_bps = state
+                .current_extra_buy_leg_slippage_bps
+                .saturating_add(policy.failure_step_bps)
+                .min(policy.max_extra_buy_leg_slippage_bps);
+            state.consecutive_successes = 0;
+        }
+        let Some(state) = self.execution_sizing.get_mut(route_id) else {
+            return;
+        };
+        state.landing_rate_bps = ewma_bps(state.landing_rate_bps, 0, self.sizing.ewma_alpha_bps);
+        let minimum_trade_size = route.min_trade_size.max(1);
+        let route_max_trade_size = route.max_trade_size.max(1);
+        let capped_max_trade_size = (state.max_trade_size / 2).max(minimum_trade_size);
+        state.max_trade_size = state
+            .max_trade_size
+            .min(route_max_trade_size)
+            .min(capped_max_trade_size);
     }
 
     pub fn record_submit_rejected(&mut self, route_id: &RouteId) {
@@ -164,10 +194,64 @@ impl StrategyPlane {
         state.landing_rate_bps = ewma_bps(state.landing_rate_bps, 0, self.sizing.ewma_alpha_bps);
     }
 
+    pub fn record_realized_execution(
+        &mut self,
+        route_id: &RouteId,
+        expected_pnl_quote_atoms: Option<i64>,
+        realized_pnl_quote_atoms: Option<i64>,
+    ) {
+        let Some(route) = self.registry.get(route_id) else {
+            return;
+        };
+        let Some(state) = self.execution_sizing.get_mut(route_id) else {
+            return;
+        };
+        let (Some(expected), Some(realized)) = (expected_pnl_quote_atoms, realized_pnl_quote_atoms)
+        else {
+            return;
+        };
+        if expected <= 0 {
+            return;
+        }
+
+        let expected = i128::from(expected);
+        let realized = i128::from(realized);
+        let shortfall_quote_atoms = (expected - realized).max(0);
+        let shortfall_bps = shortfall_quote_atoms
+            .saturating_mul(10_000)
+            .checked_div(expected)
+            .unwrap_or_default()
+            .clamp(
+                i128::from(route.sizing.base_expected_shortfall_bps),
+                i128::from(route.sizing.max_expected_shortfall_bps),
+            ) as u16;
+        state.expected_shortfall_bps = ewma_bps(
+            state.expected_shortfall_bps,
+            shortfall_bps,
+            self.sizing.ewma_alpha_bps,
+        );
+
+        if realized <= 0 {
+            let minimum_trade_size = route.min_trade_size.max(1);
+            let route_max_trade_size = route.max_trade_size.max(1);
+            let capped_max_trade_size = (state.max_trade_size / 2).max(minimum_trade_size);
+            state.max_trade_size = state
+                .max_trade_size
+                .min(route_max_trade_size)
+                .min(capped_max_trade_size);
+        }
+    }
+
     pub fn active_execution_buffer_bps(&self, route_id: &RouteId) -> Option<u16> {
         self.execution_protection
             .get(route_id)
             .map(|state| state.current_extra_buy_leg_slippage_bps)
+    }
+
+    pub fn route_profit_mint(&self, route_id: &RouteId) -> Option<String> {
+        self.registry
+            .get(route_id)
+            .map(|route| route.output_mint.clone())
     }
 }
 
@@ -195,8 +279,8 @@ mod tests {
         opportunity::OpportunityDecision,
         reasons::RejectionReason,
         route_registry::{
-            ExecutionProtectionPolicy, RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode,
-            StrategySizingConfig, SwapSide,
+            ExecutionProtectionPolicy, RouteDefinition, RouteKind, RouteLeg, RouteSizingPolicy,
+            SizingMode, StrategySizingConfig, SwapSide,
         },
     };
     use state::StatePlane;
@@ -206,6 +290,7 @@ mod tests {
     fn sizing_config() -> StrategySizingConfig {
         StrategySizingConfig {
             mode: SizingMode::Legacy,
+            fixed_trade_size: false,
             min_trade_floor_sol_lamports: 0,
             base_landing_rate_bps: 8_500,
             ewma_alpha_bps: 2_000,
@@ -223,25 +308,32 @@ mod tests {
     fn route_definition() -> RouteDefinition {
         RouteDefinition {
             route_id: RouteId("route-a".into()),
+            kind: RouteKind::TwoLeg,
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
             base_mint: Some(SOL_MINT.into()),
             quote_mint: Some("USDC".into()),
             sol_quote_conversion_pool_id: Some(PoolId("pool-a".into())),
+            min_profit_quote_atoms: None,
             legs: [
                 RouteLeg {
                     venue: "venue-a".into(),
                     pool_id: PoolId("pool-a".into()),
                     side: SwapSide::BuyBase,
+                    input_mint: "USDC".into(),
+                    output_mint: SOL_MINT.into(),
                     fee_bps: None,
                 },
                 RouteLeg {
                     venue: "venue-b".into(),
                     pool_id: PoolId("pool-b".into()),
                     side: SwapSide::SellBase,
+                    input_mint: SOL_MINT.into(),
+                    output_mint: "USDC".into(),
                     fee_bps: None,
                 },
-            ],
+            ]
+            .into(),
             max_quote_slot_lag: 32,
             min_trade_size: 10_000,
             default_trade_size: 10_000,
@@ -351,6 +443,7 @@ mod tests {
         let mut strategy = StrategyPlane::new(
             GuardrailConfig {
                 min_profit_quote_atoms: 10,
+                min_profit_bps: 0,
                 require_route_warm: true,
                 max_inflight_submissions: 64,
                 min_wallet_balance_lamports: 1,
@@ -385,6 +478,7 @@ mod tests {
         let mut strategy = StrategyPlane::new(
             GuardrailConfig {
                 min_profit_quote_atoms: 10,
+                min_profit_bps: 0,
                 require_route_warm: true,
                 max_inflight_submissions: 64,
                 min_wallet_balance_lamports: 1,
@@ -422,6 +516,7 @@ mod tests {
         let mut strategy = StrategyPlane::new(
             GuardrailConfig {
                 min_profit_quote_atoms: 10,
+                min_profit_bps: 0,
                 require_route_warm: true,
                 max_inflight_submissions: 64,
                 min_wallet_balance_lamports: 1,
@@ -708,5 +803,65 @@ mod tests {
 
         strategy.record_execution_success(&route_id);
         assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(75));
+    }
+
+    #[test]
+    fn amount_in_above_maximum_steps_up_buffer_and_caps_trade_size() {
+        let route = protected_route_definition();
+        let route_id = route.route_id.clone();
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        strategy.register_route(route.clone());
+
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(50));
+
+        strategy.record_execution_amount_in_above_maximum(&route_id);
+
+        assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(75));
+
+        let sizing = strategy
+            .execution_sizing
+            .get(&route_id)
+            .copied()
+            .expect("route sizing state");
+        assert_eq!(sizing.max_trade_size, route.max_trade_size / 2);
+        assert!(sizing.landing_rate_bps < route.sizing.base_landing_rate_bps);
+    }
+
+    #[test]
+    fn realized_underperformance_increases_expected_shortfall() {
+        let route = route_definition();
+        let route_id = route.route_id.clone();
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        strategy.register_route(route.clone());
+
+        strategy.record_execution_success(&route_id);
+        strategy.record_realized_execution(&route_id, Some(100), Some(50));
+
+        let sizing = strategy
+            .execution_sizing
+            .get(&route_id)
+            .copied()
+            .expect("route sizing state");
+        assert_eq!(sizing.max_trade_size, route.max_trade_size);
+        assert!(sizing.expected_shortfall_bps > route.sizing.base_expected_shortfall_bps);
+    }
+
+    #[test]
+    fn realized_loss_reduces_route_max_trade_size() {
+        let route = route_definition();
+        let route_id = route.route_id.clone();
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        strategy.register_route(route.clone());
+
+        strategy.record_execution_success(&route_id);
+        strategy.record_realized_execution(&route_id, Some(100), Some(-10));
+
+        let sizing = strategy
+            .execution_sizing
+            .get(&route_id)
+            .copied()
+            .expect("route sizing state");
+        assert_eq!(sizing.max_trade_size, route.max_trade_size / 2);
+        assert!(sizing.expected_shortfall_bps > route.sizing.base_expected_shortfall_bps);
     }
 }

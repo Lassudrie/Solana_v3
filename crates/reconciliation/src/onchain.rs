@@ -16,8 +16,8 @@ use tungstenite::{
 use crate::{
     classifier::FailureClass,
     tracker::{
-        ExecutionFailureDetail, ExecutionRecord, ExecutionTracker, ExecutionTransition,
-        InclusionStatus,
+        ExecutionFailureDetail, ExecutionOutcome, ExecutionRecord, ExecutionTracker,
+        ExecutionTransition, InclusionStatus,
     },
 };
 
@@ -25,6 +25,14 @@ const MOCK_SCHEME: &str = "mock://";
 const JSON_RPC_VERSION: &str = "2.0";
 const SIGNATURE_STATUS_BATCH_LIMIT: usize = 256;
 const BUNDLE_STATUS_BATCH_LIMIT: usize = 5;
+const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TransactionObservation {
+    failure_detail: Option<ExecutionFailureDetail>,
+    realized_output_delta_quote_atoms: Option<i64>,
+    realized_pnl_quote_atoms: Option<i64>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconciliationConfig {
@@ -100,7 +108,9 @@ impl OnChainReconciler {
 
         if self.config.websocket_enabled {
             self.ws.ensure_subscriptions(&pending);
-            transitions.extend(self.ws.drain_notifications(tracker));
+            let ws_transitions = self.ws.drain_notifications(tracker);
+            self.hydrate_terminal_transitions(tracker, &ws_transitions);
+            transitions.extend(ws_transitions);
         }
 
         pending = tracker.pending_records();
@@ -108,8 +118,12 @@ impl OnChainReconciler {
             return transitions;
         }
 
-        transitions.extend(self.poll_transaction_statuses(tracker, &pending));
-        transitions.extend(self.poll_bundle_statuses(tracker, &pending));
+        let status_transitions = self.poll_transaction_statuses(tracker, &pending);
+        self.hydrate_terminal_transitions(tracker, &status_transitions);
+        transitions.extend(status_transitions);
+        let bundle_transitions = self.poll_bundle_statuses(tracker, &pending);
+        self.hydrate_terminal_transitions(tracker, &bundle_transitions);
+        transitions.extend(bundle_transitions);
         transitions
     }
 
@@ -267,9 +281,111 @@ impl OnChainReconciler {
             {
                 FailureClass::ChainExecutionTooLittleOutput
             }
+            Some(detail)
+                if detail.error_name.as_deref() == Some("AmountInAboveMaximum")
+                    || detail.custom_code == Some(6_037) =>
+            {
+                FailureClass::ChainExecutionAmountInAboveMaximum
+            }
             _ => FailureClass::ChainExecutionFailed,
         };
         (failure_class, detail)
+    }
+
+    fn hydrate_terminal_transitions(
+        &self,
+        tracker: &mut ExecutionTracker,
+        transitions: &[ExecutionTransition],
+    ) {
+        for transition in transitions {
+            let Some(record) = tracker.get(&transition.submission_id).cloned() else {
+                continue;
+            };
+            self.hydrate_terminal_record(tracker, &record);
+        }
+    }
+
+    fn hydrate_terminal_record(&self, tracker: &mut ExecutionTracker, record: &ExecutionRecord) {
+        if record.realized_pnl_quote_atoms.is_some() {
+            return;
+        }
+
+        match &record.outcome {
+            ExecutionOutcome::Pending => {}
+            ExecutionOutcome::Included { .. } => {
+                let observation = self.rpc.get_transaction_observation(
+                    &record.chain_signature,
+                    record.profit_mint.as_deref(),
+                    record.wallet_owner_pubkey.as_deref(),
+                );
+                if let Some(detail) = observation.failure_detail.clone()
+                    && record.failure_detail.is_none()
+                {
+                    let _ = tracker.set_failure_detail(&record.submission_id, detail);
+                }
+                if let Some(realized_pnl) = observation.realized_pnl_quote_atoms {
+                    let _ = tracker.set_realized_pnl(
+                        &record.submission_id,
+                        observation.realized_output_delta_quote_atoms,
+                        Some(realized_pnl),
+                    );
+                } else if let Some(delta) = observation.realized_output_delta_quote_atoms {
+                    let realized_pnl = subtract_execution_cost(
+                        delta,
+                        record
+                            .estimated_execution_cost_quote_atoms
+                            .unwrap_or_default(),
+                    );
+                    let _ = tracker.set_realized_pnl(
+                        &record.submission_id,
+                        Some(delta),
+                        Some(realized_pnl),
+                    );
+                }
+            }
+            ExecutionOutcome::Failed(class) => match class {
+                FailureClass::ChainExecutionFailed
+                | FailureClass::ChainExecutionTooLittleOutput
+                | FailureClass::ChainExecutionAmountInAboveMaximum
+                | FailureClass::Unknown => {
+                    let observation = self.rpc.get_transaction_observation(
+                        &record.chain_signature,
+                        record.profit_mint.as_deref(),
+                        record.wallet_owner_pubkey.as_deref(),
+                    );
+                    if let Some(detail) = observation.failure_detail.clone()
+                        && record.failure_detail.is_none()
+                    {
+                        let _ = tracker.set_failure_detail(&record.submission_id, detail);
+                    }
+                    if let Some(realized_pnl) = observation.realized_pnl_quote_atoms {
+                        let _ = tracker.set_realized_pnl(
+                            &record.submission_id,
+                            observation.realized_output_delta_quote_atoms,
+                            Some(realized_pnl),
+                        );
+                    } else {
+                        let delta = observation.realized_output_delta_quote_atoms.or(Some(0));
+                        let realized_pnl = delta.map(|delta| {
+                            subtract_execution_cost(
+                                delta,
+                                record
+                                    .estimated_execution_cost_quote_atoms
+                                    .unwrap_or_default(),
+                            )
+                        });
+                        let _ =
+                            tracker.set_realized_pnl(&record.submission_id, delta, realized_pnl);
+                    }
+                }
+                FailureClass::SubmitRejected
+                | FailureClass::TransportFailed
+                | FailureClass::ChainDropped
+                | FailureClass::Expired => {
+                    let _ = tracker.set_realized_pnl(&record.submission_id, Some(0), Some(0));
+                }
+            },
+        }
     }
 }
 
@@ -356,8 +472,18 @@ impl RpcStatusClient {
     }
 
     fn get_transaction_failure_detail(&self, signature: &str) -> Option<ExecutionFailureDetail> {
+        self.get_transaction_observation(signature, None, None)
+            .failure_detail
+    }
+
+    fn get_transaction_observation(
+        &self,
+        signature: &str,
+        profit_mint: Option<&str>,
+        wallet_owner_pubkey: Option<&str>,
+    ) -> TransactionObservation {
         if signature.is_empty() || self.is_mock(&self.endpoint) {
-            return None;
+            return TransactionObservation::default();
         }
 
         let response = self
@@ -377,13 +503,28 @@ impl RpcStatusClient {
                 ],
             }))
             .send()
-            .ok()?;
+            .ok();
+        let Some(response) = response else {
+            return TransactionObservation::default();
+        };
         if !response.status().is_success() {
-            return None;
+            return TransactionObservation::default();
         }
 
-        let body = response.json::<Value>().ok()?;
-        parse_transaction_failure_detail(&body)
+        let Ok(body) = response.json::<Value>() else {
+            return TransactionObservation::default();
+        };
+        let realized_quote = profit_mint
+            .zip(wallet_owner_pubkey)
+            .map(|(profit_mint, wallet_owner_pubkey)| {
+                parse_realized_quote_observation(&body, profit_mint, wallet_owner_pubkey)
+            })
+            .unwrap_or_default();
+        TransactionObservation {
+            failure_detail: parse_transaction_failure_detail(&body),
+            realized_output_delta_quote_atoms: realized_quote.realized_output_delta_quote_atoms,
+            realized_pnl_quote_atoms: realized_quote.realized_pnl_quote_atoms,
+        }
     }
 }
 
@@ -654,11 +795,15 @@ enum WsSignatureValue {
 
 fn classify_ws_failure(err: &Value) -> (FailureClass, Option<ExecutionFailureDetail>) {
     let custom_code = instruction_error_custom_code(err);
-    let error_name = (custom_code == Some(6_022)).then(|| "TooLittleOutputReceived".to_string());
-    let failure_class = if custom_code == Some(6_022) {
-        FailureClass::ChainExecutionTooLittleOutput
-    } else {
-        FailureClass::ChainExecutionFailed
+    let error_name = match custom_code {
+        Some(6_022) => Some("TooLittleOutputReceived".to_string()),
+        Some(6_037) => Some("AmountInAboveMaximum".to_string()),
+        _ => None,
+    };
+    let failure_class = match custom_code {
+        Some(6_022) => FailureClass::ChainExecutionTooLittleOutput,
+        Some(6_037) => FailureClass::ChainExecutionAmountInAboveMaximum,
+        _ => FailureClass::ChainExecutionFailed,
     };
     let detail = ExecutionFailureDetail {
         instruction_index: instruction_error_index(err),
@@ -693,8 +838,12 @@ fn parse_transaction_failure_detail(body: &Value) -> Option<ExecutionFailureDeta
     if custom_code.is_none() {
         custom_code = parse_custom_code_from_logs(&log_messages);
     }
-    if error_name.is_none() && custom_code == Some(6_022) {
-        error_name = Some("TooLittleOutputReceived".into());
+    if error_name.is_none() {
+        error_name = match custom_code {
+            Some(6_022) => Some("TooLittleOutputReceived".into()),
+            Some(6_037) => Some("AmountInAboveMaximum".into()),
+            _ => None,
+        };
     }
     let detail = ExecutionFailureDetail {
         instruction_index,
@@ -708,6 +857,143 @@ fn parse_transaction_failure_detail(body: &Value) -> Option<ExecutionFailureDeta
         || detail.custom_code.is_some()
         || detail.error_name.is_some())
     .then_some(detail)
+}
+
+fn parse_realized_output_delta_quote_atoms(
+    body: &Value,
+    profit_mint: &str,
+    wallet_owner_pubkey: &str,
+) -> Option<i64> {
+    if profit_mint.is_empty() || wallet_owner_pubkey.is_empty() {
+        return None;
+    }
+
+    let meta = body.get("result")?.get("meta")?;
+    let (pre_total, pre_found) = sum_owner_token_balance(
+        meta.get("preTokenBalances"),
+        profit_mint,
+        wallet_owner_pubkey,
+    );
+    let (post_total, post_found) = sum_owner_token_balance(
+        meta.get("postTokenBalances"),
+        profit_mint,
+        wallet_owner_pubkey,
+    );
+    if !pre_found && !post_found {
+        return None;
+    }
+
+    clamp_i128_to_i64(i128::from(post_total) - i128::from(pre_total))
+}
+
+fn parse_realized_quote_observation(
+    body: &Value,
+    profit_mint: &str,
+    wallet_owner_pubkey: &str,
+) -> TransactionObservation {
+    let realized_output_delta_quote_atoms =
+        parse_realized_output_delta_quote_atoms(body, profit_mint, wallet_owner_pubkey);
+    let realized_pnl_quote_atoms =
+        if realized_output_delta_quote_atoms.is_none() && profit_mint == SOL_MINT {
+            parse_owner_lamport_delta(body, wallet_owner_pubkey)
+        } else {
+            None
+        };
+
+    TransactionObservation {
+        realized_output_delta_quote_atoms,
+        realized_pnl_quote_atoms,
+        ..TransactionObservation::default()
+    }
+}
+
+fn sum_owner_token_balance(
+    balances: Option<&Value>,
+    profit_mint: &str,
+    wallet_owner_pubkey: &str,
+) -> (u64, bool) {
+    let mut total = 0u128;
+    let mut found = false;
+
+    for entry in balances
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("mint").and_then(Value::as_str) == Some(profit_mint))
+        .filter(|entry| entry.get("owner").and_then(Value::as_str) == Some(wallet_owner_pubkey))
+    {
+        let Some(amount) = entry
+            .get("uiTokenAmount")
+            .and_then(|amount| amount.get("amount"))
+            .and_then(Value::as_str)
+            .and_then(|amount| amount.parse::<u128>().ok())
+        else {
+            continue;
+        };
+        found = true;
+        total = total.saturating_add(amount);
+    }
+
+    (
+        total
+            .min(u128::from(u64::MAX))
+            .try_into()
+            .unwrap_or(u64::MAX),
+        found,
+    )
+}
+
+fn parse_owner_lamport_delta(body: &Value, wallet_owner_pubkey: &str) -> Option<i64> {
+    let account_keys = body
+        .get("result")?
+        .get("transaction")?
+        .get("message")?
+        .get("accountKeys")?
+        .as_array()?;
+    let owner_index = account_keys.iter().position(|entry| {
+        account_key_pubkey(entry)
+            .map(|pubkey| pubkey == wallet_owner_pubkey)
+            .unwrap_or(false)
+    })?;
+    let meta = body.get("result")?.get("meta")?;
+    let pre_balance = meta
+        .get("preBalances")?
+        .as_array()?
+        .get(owner_index)?
+        .as_u64()?;
+    let post_balance = meta
+        .get("postBalances")?
+        .as_array()?
+        .get(owner_index)?
+        .as_u64()?;
+    clamp_i128_to_i64(i128::from(post_balance) - i128::from(pre_balance))
+}
+
+fn account_key_pubkey(entry: &Value) -> Option<&str> {
+    entry
+        .as_str()
+        .or_else(|| entry.get("pubkey").and_then(Value::as_str))
+}
+
+fn subtract_execution_cost(
+    output_delta_quote_atoms: i64,
+    estimated_execution_cost_quote_atoms: u64,
+) -> i64 {
+    clamp_i128_to_i64(
+        i128::from(output_delta_quote_atoms)
+            .saturating_sub(i128::from(estimated_execution_cost_quote_atoms)),
+    )
+    .unwrap_or(if output_delta_quote_atoms.is_negative() {
+        i64::MIN
+    } else {
+        i64::MAX
+    })
+}
+
+fn clamp_i128_to_i64(value: i128) -> Option<i64> {
+    i64::try_from(value)
+        .ok()
+        .or_else(|| Some(value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64))
 }
 
 fn instruction_error_index(err: &Value) -> Option<u8> {
@@ -735,6 +1021,13 @@ fn parse_error_name(log_messages: &[String]) -> Option<String> {
                 .contains("too little output received")
         {
             return Some("TooLittleOutputReceived".into());
+        }
+        if message.contains("AmountInAboveMaximum")
+            || message
+                .to_ascii_lowercase()
+                .contains("amount in above maximum")
+        {
+            return Some("AmountInAboveMaximum".into());
         }
     }
     None
@@ -876,5 +1169,64 @@ mod tests {
             detail.error_name.as_deref(),
             Some("TooLittleOutputReceived")
         );
+    }
+
+    #[test]
+    fn websocket_processed_amount_in_above_maximum_is_terminal_and_captures_failure_detail() {
+        let mut tracker = ExecutionTracker::default();
+        let record = tracker.register_submission(
+            RouteId("route-a".into()),
+            "chain-sig".into(),
+            10,
+            Some(11),
+            Some(12),
+            UNIX_EPOCH,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-1".into()),
+                endpoint: "mock://jito".into(),
+                rejection: None,
+            },
+        );
+        let mut ws = SignatureWsClient::new("mock://solana-ws", Duration::from_millis(5));
+        ws.subscriptions.insert(7, record.submission_id.clone());
+        ws.tracked_submissions.insert(record.submission_id.clone());
+
+        let transition = ws
+            .handle_message(
+                Message::Text(
+                    json!({
+                        "method": "signatureNotification",
+                        "params": {
+                            "subscription": 7,
+                            "result": {
+                                "context": { "slot": 88 },
+                                "value": {
+                                    "err": { "InstructionError": [4, { "Custom": 6037 }] }
+                                }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ),
+                &mut tracker,
+            )
+            .expect("processed error should transition immediately");
+
+        assert_eq!(
+            transition.current_inclusion_status,
+            InclusionStatus::Failed(FailureClass::ChainExecutionAmountInAboveMaximum)
+        );
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(
+            updated.inclusion_status,
+            InclusionStatus::Failed(FailureClass::ChainExecutionAmountInAboveMaximum)
+        );
+        let detail = updated.failure_detail.as_ref().expect("failure detail");
+        assert_eq!(detail.instruction_index, Some(4));
+        assert_eq!(detail.custom_code, Some(6_037));
+        assert_eq!(detail.error_name.as_deref(), Some("AmountInAboveMaximum"));
     }
 }
