@@ -231,8 +231,9 @@ impl RouteHealthRegistry {
                 record.repair_in_flight = false;
                 record.consecutive_repair_failures =
                     record.consecutive_repair_failures.saturating_add(1);
-                if record.consecutive_repair_failures
-                    >= self.config.pool_quarantine_after_repair_failures
+                if self.config.pool_quarantine_after_repair_failures > 0
+                    && record.consecutive_repair_failures
+                        >= self.config.pool_quarantine_after_repair_failures
                 {
                     record.enter_quarantine(
                         observed_slot,
@@ -826,6 +827,26 @@ mod tests {
             registry.pool_view("pool-a", 21).unwrap().health_state,
             PoolHealthState::Disabled
         );
+    }
+
+    #[test]
+    fn repair_failures_do_not_quarantine_pool_when_disabled() {
+        let mut config = LiveSetHealthConfig::default();
+        config.pool_quarantine_after_repair_failures = 0;
+        let mut registry = RouteHealthRegistry::new(config, 2);
+        registry.register_route(
+            RouteId("route-a".into()),
+            &[state::types::PoolId("pool-a".into())],
+            2,
+        );
+
+        registry.on_repair_transition("pool-a", PoolHealthTransition::RepairFailed, 10);
+        registry.on_repair_transition("pool-a", PoolHealthTransition::RepairFailed, 11);
+
+        let view = registry.pool_view("pool-a", 11).unwrap();
+        assert_eq!(view.health_state, PoolHealthState::RepairPending);
+        assert!(view.quarantined_until_slot.is_none());
+        assert!(view.disable_reason.is_none());
     }
 
     #[test]

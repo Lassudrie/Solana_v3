@@ -1072,7 +1072,7 @@ impl Default for LiveSetHealthConfig {
         Self {
             enabled: true,
             pool_quarantine_after_refresh_failures: 0,
-            pool_quarantine_after_repair_failures: 3,
+            pool_quarantine_after_repair_failures: 0,
             pool_quarantine_slots: 512,
             pool_disable_after_quarantine_count: 3,
             pool_disable_window_slots: 4_096,

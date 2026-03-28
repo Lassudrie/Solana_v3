@@ -4,6 +4,7 @@ use builder::{
     OrcaSimplePoolConfig, OrcaWhirlpoolConfig, RaydiumClmmConfig, RaydiumSimplePoolConfig,
     RouteExecutionConfig as BuilderRouteExecutionConfig, VenueExecutionConfig,
 };
+use domain::{AccountUpdate, EventSourceKind, NormalizedEvent};
 use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -87,6 +88,7 @@ struct RequiredTokenAccount {
 
 #[derive(Debug, Deserialize)]
 struct RpcMultipleAccountsResponse {
+    context: RpcContext,
     value: Vec<Option<RpcAccountInfo>>,
 }
 
@@ -108,10 +110,18 @@ struct RpcBalanceResponse {
     value: u64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RpcAccountInfo {
     owner: String,
+    #[serde(default)]
+    lamports: u64,
     data: (String, String),
+}
+
+#[derive(Debug)]
+struct FetchedAccounts {
+    slot: u64,
+    accounts: HashMap<String, Option<RpcAccountInfo>>,
 }
 
 #[derive(Debug)]
@@ -207,6 +217,7 @@ pub fn bootstrap_with_health(
         .iter()
         .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
         .collect::<Vec<_>>();
+    let startup_account_keys = collect_startup_account_dependency_keys(&active_routes);
     validate_submit_config(&config, &active_routes)?;
     let lookup_table_keys = collect_lookup_table_keys(&active_routes);
     for route in &active_routes {
@@ -257,6 +268,12 @@ pub fn bootstrap_with_health(
         }
         strategy.register_route(route_definition);
         execution_registry.register(route_execution);
+    }
+
+    if let Err(error) =
+        seed_state_from_live_accounts(&config, &startup_account_keys, &mut state, &route_health)
+    {
+        eprintln!("bootstrap: failed to seed state warmup from live accounts: {error}");
     }
 
     let submit_mode = submit_mode_from_config(&config);
@@ -383,6 +400,16 @@ fn collect_lookup_table_keys(routes: &[&crate::config::RouteConfig]) -> Vec<Stri
     unique.into_iter().collect()
 }
 
+fn collect_startup_account_dependency_keys(routes: &[&crate::config::RouteConfig]) -> Vec<String> {
+    let mut unique = BTreeSet::new();
+    for route in routes {
+        for dependency in &route.account_dependencies {
+            unique.insert(dependency.account_key.clone());
+        }
+    }
+    unique.into_iter().collect()
+}
+
 fn bootstrap_rpc_http_client() -> Result<Client, String> {
     Client::builder()
         .connect_timeout(Duration::from_millis(300))
@@ -460,6 +487,7 @@ fn fetch_live_source_token_balances_seed(
         };
         let parsed = parse_token_account(&RpcAccountInfo {
             owner: account.owner,
+            lamports: account.lamports,
             data: account.data,
         })?;
         balances.insert(account_key.clone(), parsed.amount);
@@ -468,6 +496,67 @@ fn fetch_live_source_token_balances_seed(
         balances,
         slot: Some(fetched.slot),
     })
+}
+
+fn seed_state_from_live_accounts(
+    config: &BotConfig,
+    account_keys: &[String],
+    state: &mut StatePlane,
+    route_health: &SharedRouteHealth,
+) -> Result<(), String> {
+    let endpoint = config.reconciliation.rpc_http_endpoint.trim();
+    if account_keys.is_empty() || endpoint.is_empty() || endpoint.starts_with(MOCK_SCHEME) {
+        return Ok(());
+    }
+
+    let fetched = fetch_accounts_with_context(endpoint, account_keys)?;
+    let mut sequence = 1u64;
+    let mut impacted_pools = BTreeSet::new();
+
+    for account_key in account_keys {
+        let Some(Some(account)) = fetched.accounts.get(account_key) else {
+            continue;
+        };
+        let data = decode_account_data(account)?;
+        let outcome = state
+            .apply_event(&NormalizedEvent::account_update(
+                EventSourceKind::Replay,
+                sequence,
+                fetched.slot,
+                AccountUpdate {
+                    pubkey: account_key.clone(),
+                    owner: account.owner.clone(),
+                    lamports: account.lamports,
+                    data,
+                    slot: fetched.slot,
+                    write_version: 0,
+                },
+            ))
+            .map_err(|error| error.to_string())?;
+        sequence = sequence.saturating_add(1);
+        if let Some(outcome) = outcome {
+            impacted_pools.extend(outcome.impacted_pools);
+        }
+    }
+
+    if impacted_pools.is_empty() {
+        return Ok(());
+    }
+
+    if let Ok(mut health) = route_health.lock() {
+        for pool_id in impacted_pools {
+            let Some(snapshot) = state.pool_snapshot(&pool_id) else {
+                continue;
+            };
+            health.on_pool_snapshot(
+                snapshot,
+                state.pool_has_executable_quote_model(&pool_id),
+                state.latest_slot(),
+            );
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn route_enabled_in_profile(
@@ -1354,12 +1443,20 @@ fn fetch_accounts(
     endpoint: &str,
     account_keys: &[String],
 ) -> Result<HashMap<String, Option<RpcAccountInfo>>, String> {
+    fetch_accounts_with_context(endpoint, account_keys).map(|fetched| fetched.accounts)
+}
+
+fn fetch_accounts_with_context(
+    endpoint: &str,
+    account_keys: &[String],
+) -> Result<FetchedAccounts, String> {
     let http = Client::builder()
         .connect_timeout(Duration::from_millis(300))
         .timeout(Duration::from_millis(1_000))
         .build()
         .map_err(|error| error.to_string())?;
     let mut accounts = HashMap::with_capacity(account_keys.len());
+    let mut slot = 0u64;
     for chunk in account_keys.chunks(100) {
         let response = rpc_call::<RpcMultipleAccountsResponse>(
             &http,
@@ -1371,11 +1468,25 @@ fn fetch_accounts(
             ]),
         )
         .map_err(|error| error.to_string())?;
+        slot = slot.max(response.context.slot);
         for (account_key, account) in chunk.iter().zip(response.value.into_iter()) {
             accounts.insert(account_key.clone(), account);
         }
     }
-    Ok(accounts)
+    Ok(FetchedAccounts { slot, accounts })
+}
+
+fn decode_account_data(account: &RpcAccountInfo) -> Result<Vec<u8>, String> {
+    if account.data.1 != "base64" {
+        return Err(format!(
+            "unsupported account encoding for {}: {}",
+            account.owner, account.data.1
+        ));
+    }
+
+    base64::engine::general_purpose::STANDARD
+        .decode(account.data.0.as_bytes())
+        .map_err(|error| error.to_string())
 }
 
 fn validate_required_token_account(
@@ -2113,10 +2224,31 @@ mod tests {
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
+    fn pool_price_account_data(price_bps: u64, fee_bps: u16, reserve_depth: u64) -> String {
+        let mut bytes = Vec::with_capacity(18);
+        bytes.extend_from_slice(&price_bps.to_le_bytes());
+        bytes.extend_from_slice(&fee_bps.to_le_bytes());
+        bytes.extend_from_slice(&reserve_depth.to_le_bytes());
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
     fn rpc_token_account(owner_program: &str, mint: &str, owner: &str) -> Value {
         json!({
             "owner": owner_program,
             "data": [token_account_data(mint, owner), "base64"]
+        })
+    }
+
+    fn rpc_pool_price_account(
+        owner_program: &str,
+        price_bps: u64,
+        fee_bps: u16,
+        reserve_depth: u64,
+    ) -> Value {
+        json!({
+            "owner": owner_program,
+            "lamports": 1,
+            "data": [pool_price_account_data(price_bps, fee_bps, reserve_depth), "base64"]
         })
     }
 
@@ -2714,6 +2846,71 @@ mod tests {
             seeded_slot - 1
         );
         assert_eq!(execution.lookup_tables[0].fetched_slot, seeded_slot);
+    }
+
+    #[test]
+    fn bootstrap_warms_routes_from_rpc_account_dependencies() {
+        let mut route = valid_route_config();
+        route.account_dependencies = vec![
+            crate::config::AccountDependencyConfig {
+                account_key: "acct-pool-a".into(),
+                pool_id: "pool-a".into(),
+                decoder_key: "pool-price-v1".into(),
+            },
+            crate::config::AccountDependencyConfig {
+                account_key: "acct-pool-b".into(),
+                pool_id: "pool-b".into(),
+                decoder_key: "pool-price-v1".into(),
+            },
+        ];
+
+        let mut config = test_config(route);
+        config.signing.validate_execution_accounts = false;
+        config.signing.bootstrap_balance_lamports = 0;
+        config.signing.wallet_ready = false;
+        let owner = config.signing.owner_pubkey.clone();
+        let seeded_slot = 88u64;
+        config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getLatestBlockhash" => mock_latest_blockhash_response(seeded_slot).to_string(),
+                "getBalance" => mock_balance_response(seeded_slot, 123_456).to_string(),
+                "getMultipleAccounts" => {
+                    let keys = payload["params"][0].as_array().expect("account keys");
+                    let values = keys
+                        .iter()
+                        .map(|key| match key.as_str().expect("account key") {
+                            "acct-pool-a" => {
+                                rpc_pool_price_account(&test_pubkey("pool-owner"), 10_000, 5, 1_000)
+                            }
+                            "acct-pool-b" => {
+                                rpc_pool_price_account(&test_pubkey("pool-owner"), 10_005, 7, 2_000)
+                            }
+                            key if key == test_pubkey("route-input-ata") => rpc_token_account(
+                                &test_pubkey("spl-token-program"),
+                                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                                &owner,
+                            ),
+                            _ => Value::Null,
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "result": {
+                            "context": { "slot": seeded_slot },
+                            "value": values
+                        }
+                    })
+                    .to_string()
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let runtime = bootstrap(config).expect("bootstrap should seed state warmup");
+
+        assert_eq!(runtime.route_count(), 1);
+        assert_eq!(runtime.ready_route_count(), 1);
+        assert_eq!(runtime.latest_slot(), seeded_slot);
     }
 
     #[test]
