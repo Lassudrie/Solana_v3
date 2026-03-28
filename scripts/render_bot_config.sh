@@ -137,16 +137,26 @@ BEGIN {
     in_strategy = 0
     saw_strategy = 0
     printed_strategy_overrides = 0
+    in_runtime_event_source = 0
+    printed_runtime_event_source_mode = 0
     in_runtime_monitor_server = 0
     printed_runtime_monitor_server_enabled = 0
+    in_shredstream_table = 0
+    printed_shredstream_grpc_endpoint = 0
 }
 
 /^\[/ {
     if (in_strategy && !printed_strategy_overrides) {
         print_strategy_overrides()
     }
+    if (in_runtime_event_source && !printed_runtime_event_source_mode) {
+        print "mode = \"shredstream\""
+    }
     if (in_runtime_monitor_server && !printed_runtime_monitor_server_enabled) {
         print "enabled = true"
+    }
+    if (in_shredstream_table && !printed_shredstream_grpc_endpoint) {
+        print "grpc_endpoint = \"" grpc_endpoint "\""
     }
 
     if (!inserted_runtime_overrides && $0 == "[state]") {
@@ -177,12 +187,30 @@ BEGIN {
         next
     }
 
+    in_runtime_event_source = ($0 == "[runtime.event_source]")
+    printed_runtime_event_source_mode = 0
+    if (in_runtime_event_source) {
+        print $0
+        print "mode = \"shredstream\""
+        printed_runtime_event_source_mode = 1
+        next
+    }
+
     in_runtime_monitor_server = ($0 == "[runtime.monitor_server]")
     printed_runtime_monitor_server_enabled = 0
     if (in_runtime_monitor_server) {
         print $0
         print "enabled = true"
         printed_runtime_monitor_server_enabled = 1
+        next
+    }
+
+    in_shredstream_table = ($0 == "[shredstream]")
+    printed_shredstream_grpc_endpoint = 0
+    if (in_shredstream_table) {
+        print $0
+        print "grpc_endpoint = \"" grpc_endpoint "\""
+        printed_shredstream_grpc_endpoint = 1
         next
     }
 
@@ -207,8 +235,24 @@ BEGIN {
         next
     }
 
+    if (in_runtime_event_source) {
+        if ($0 ~ /^mode[[:space:]]*=/) {
+            next
+        }
+        print
+        next
+    }
+
     if (in_runtime_monitor_server) {
         if ($0 ~ /^enabled[[:space:]]*=/) {
+            next
+        }
+        print
+        next
+    }
+
+    if (in_shredstream_table) {
+        if ($0 ~ /^(grpc_endpoint|endpoint)[[:space:]]*=/) {
             next
         }
         print
@@ -222,8 +266,14 @@ END {
     if (in_strategy && !printed_strategy_overrides) {
         print_strategy_overrides()
     }
+    if (in_runtime_event_source && !printed_runtime_event_source_mode) {
+        print "mode = \"shredstream\""
+    }
     if (in_runtime_monitor_server && !printed_runtime_monitor_server_enabled) {
         print "enabled = true"
+    }
+    if (in_shredstream_table && !printed_shredstream_grpc_endpoint) {
+        print "grpc_endpoint = \"" grpc_endpoint "\""
     }
 
     if (!saw_signing) {

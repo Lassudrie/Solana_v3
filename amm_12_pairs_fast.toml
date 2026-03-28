@@ -1,6 +1,9 @@
 [runtime]
 profile = "ultra_fast"
 
+[runtime.event_source]
+mode = "shredstream"
+
 [runtime.control]
 idle_sleep_millis = 0
 max_events_per_tick = 8192

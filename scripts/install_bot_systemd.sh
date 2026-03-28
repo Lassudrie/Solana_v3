@@ -147,12 +147,12 @@ install_bot_dropins() {
         after+=("agave-rpc.service")
     fi
 
-    if systemctl list-unit-files yellowstone-shredstream-bridge.service --no-legend 2>/dev/null | grep -Fq "yellowstone-shredstream-bridge.service"; then
-        wants+=("yellowstone-shredstream-bridge.service")
-        after+=("yellowstone-shredstream-bridge.service")
-    elif systemctl list-unit-files jito-shredstream-proxy.service --no-legend 2>/dev/null | grep -Fq "jito-shredstream-proxy.service"; then
+    if systemctl list-unit-files jito-shredstream-proxy.service --no-legend 2>/dev/null | grep -Fq "jito-shredstream-proxy.service"; then
         wants+=("jito-shredstream-proxy.service")
         after+=("jito-shredstream-proxy.service")
+    elif systemctl list-unit-files yellowstone-shredstream-bridge.service --no-legend 2>/dev/null | grep -Fq "yellowstone-shredstream-bridge.service"; then
+        wants+=("yellowstone-shredstream-bridge.service")
+        after+=("yellowstone-shredstream-bridge.service")
     fi
 
     if [[ ${#wants[@]} -eq 0 ]]; then
@@ -306,7 +306,7 @@ Installed:
 Next checks:
   1. ensure $signer_keypair_path contains the hot-wallet keypair readable by $service_user
   2. review $bot_config_path for the final route set and wallet constraints
-  3. verify local RPC 127.0.0.1:8899, WebSocket 127.0.0.1:8900, and shredstream gRPC $grpc_endpoint
+  3. verify local RPC 127.0.0.1:8899, WebSocket 127.0.0.1:8900, and a live Shredstream provider on $grpc_endpoint
   4. start services with:
        systemctl restart solana-signerd.service
        systemctl restart solana-bot.service

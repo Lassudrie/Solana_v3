@@ -250,6 +250,13 @@ Par defaut, le script installe :
 
 ## Clarification Shredstream cote bot
 
+Mode operatoire recommande hors bring-up Yellowstone local :
+
+- provider Shredstream externe directement sur `127.0.0.1:50051`
+- RPC local Agave sur `127.0.0.1:8899/8900`
+
+Dans ce mode, `Yellowstone` n'est pas requis pour le bot. Cette section est utile si vous devez convertir un flux local Yellowstone vers le service `ShredstreamProxy` attendu par le bot.
+
 Le bot live utilise :
 
 - `[runtime.event_source] mode = "shredstream"`
@@ -275,23 +282,27 @@ Le repo fournit maintenant le squelette du serveur gRPC correspondant :
 - expose deja `SubscribeEntries` et `SendHeartbeat`
 - n'est pas encore branche a un producteur amont d'`Entry`
 
-Cela signifie qu'il faut encore un composant supplementaire entre Yellowstone et le bot si votre stack n'expose que `127.0.0.1:10000`.
+Cela signifie :
+
+- si votre provider live expose deja `127.0.0.1:50051`, le bot peut s'y abonner directement
+- si votre stack n'expose que Yellowstone sur `127.0.0.1:10000`, il faut encore un composant supplementaire entre Yellowstone et le bot
 
 Checklist simple :
 
+- `50051` en ecoute avec un provider Shredstream reel : le bot peut se connecter en mode live
 - `10000` seul en ecoute : Yellowstone est present, mais le bot ne peut pas encore consommer le flux live
-- `50051` en ecoute avec le service `ShredstreamProxy` : le bot peut se connecter en mode live
 
 ## Configuration bot recommandee
 
-Les manifests fast du repo pointent deja le RPC local :
+Les manifests fast du repo pointent deja le RPC local et activent deja la source live :
 
+- `runtime.event_source.mode = "shredstream"`
 - `reconciliation.rpc_http_endpoint = "http://127.0.0.1:8899"`
 - `reconciliation.rpc_ws_endpoint = "ws://127.0.0.1:8900"`
 
 Si `rpc_submit.endpoint` est vide, le bot reutilise automatiquement `reconciliation.rpc_http_endpoint`.
 
-Pour un lancement live minimal, utiliser une config derivee du manifest fast avec au moins :
+Pour un lancement live minimal, utiliser un manifest fast du repo ou une config derivee contenant au moins :
 
 ```toml
 [runtime]
@@ -324,7 +335,7 @@ Exemple de lancement :
 ```bash
 tmux new-session -d -s bot
 tmux new-window -d -t bot -n bot \
-  'cd /root/bot/Solana_v3 && exec env BOT_CONFIG=/tmp/bot-live-yellowstone.toml target/release/bot'
+  'cd /root/bot/Solana_v3 && exec env BOT_CONFIG=/tmp/bot-live-shredstream.toml target/release/bot'
 ```
 
 Verification :
@@ -377,9 +388,9 @@ Rappel :
 
 Verifier dans l'ordre :
 
-1. `10000` ecoute bien
-2. `50051` ecoute bien
-3. le proxy expose `ShredstreamProxy.SubscribeEntries`
+1. `50051` ecoute bien
+2. le provider expose `ShredstreamProxy.SubscribeEntries`
+3. si vous passez par Yellowstone local, `10000` ecoute bien et le bridge vers `50051` tourne
 4. la config bot pointe bien vers `shredstream.grpc_endpoint = "http://127.0.0.1:50051"`
 5. `runtime.event_source.mode = "shredstream"`
 
@@ -399,8 +410,8 @@ Un etat local cohérent pour le bot est :
 
 - Agave RPC HTTP sur `127.0.0.1:8899`
 - Agave RPC WebSocket sur `127.0.0.1:8900`
-- Yellowstone gRPC sur `127.0.0.1:10000`
-- ShredstreamProxy pour le bot sur `127.0.0.1:50051`
+- provider Shredstream pour le bot sur `127.0.0.1:50051`
+- Yellowstone gRPC sur `127.0.0.1:10000` uniquement si vous utilisez un bridge local
 - bot monitor sur `127.0.0.1:8081`
 
 Si un de ces maillons manque, le bot peut demarrer mais il ne sera pas operable en live.

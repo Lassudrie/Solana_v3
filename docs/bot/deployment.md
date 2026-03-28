@@ -12,7 +12,8 @@ Le deployement vise une machine Linux avec `systemd`, typiquement Ubuntu 24.04.
 ## Prerequis
 
 - un noeud Agave RPC local et le flux live deja prepares
-- la procedure Yellowstone/Shredstream du repo deja suivie quand vous visez le mode live
+- un provider Shredstream operable sur `127.0.0.1:50051`
+- la procedure Yellowstone/Shredstream du repo deja suivie uniquement si vous exposez ce `50051` via un bridge local Yellowstone
 - une hot wallet disponible sur la machine cible
 - un toolchain Rust capable de builder le workspace, sauf si vous reutilisez deja `target/release`
 
@@ -21,6 +22,13 @@ Reference infrastructure locale:
 - RPC HTTP: `127.0.0.1:8899`
 - RPC WebSocket: `127.0.0.1:8900`
 - Shredstream gRPC cote bot: `127.0.0.1:50051`
+
+Chemin operatoire recommande:
+
+- provider Shredstream externe sur `127.0.0.1:50051`
+- RPC local Agave sur `127.0.0.1:8899/8900`
+
+`Yellowstone` est optionnel dans ce mode. Il n'est utile que si vous choisissez d'exposer localement un bridge vers `50051`.
 
 Attention: le binaire `shredstream_proxy` present dans ce repo reste un scaffold. Il expose le service gRPC attendu par le bot, mais il n'est pas branche a un producteur amont d'`Entry`. Pour un deployement live, il faut donc un vrai fournisseur Shredstream operable sur `50051`, pas seulement le scaffold.
 
@@ -39,7 +47,7 @@ Par defaut, le script:
 - cree l'utilisateur systeme `solbot`
 - rend une config derivee de `sol_usdc_routes_amm_fast.toml` vers `/etc/solana-bot/bot.toml`
 - installe les unites dans `/etc/systemd/system`
-- ajoute automatiquement un drop-in `systemd` pour chaîner `solana-bot.service` apres `agave-rpc.service` et `jito-shredstream-proxy.service` quand ces services existent deja
+- ajoute automatiquement un drop-in `systemd` pour chaîner `solana-bot.service` apres `agave-rpc.service` et, si present, `jito-shredstream-proxy.service` en priorite ou `yellowstone-shredstream-bridge.service` en fallback
 - active les services sans les demarrer
 
 Options utiles:
@@ -54,7 +62,12 @@ Options utiles:
 
 ## Ce que le renderer de config applique
 
-Le script `scripts/render_bot_config.sh` transforme le manifest de routes en config de deployement en ajoutant ou forcant:
+Les manifests fast du repo sont maintenant directement live-ready:
+
+- `[runtime.event_source] mode = "shredstream"`
+- `[shredstream] grpc_endpoint = "http://127.0.0.1:50051"`
+
+Le script `scripts/render_bot_config.sh` transforme ensuite le manifest de routes en config de deployement en forcant:
 
 - `signing.provider = "secure_unix"`
 - `signing.owner_pubkey = ""`
@@ -88,6 +101,7 @@ Points a relire avant premier start:
 - le jeu de routes actif
 - les protections de taille et de frais
 - `validate_execution_accounts = true` par defaut pour bloquer les comptes runtime invalides; ne le forcer a `false` qu'en debug court
+- `runtime.event_source.mode = "shredstream"`
 - l'endpoint `shredstream.grpc_endpoint`
 
 Si vous activez la persistance d'audit, ajoutez explicitement:

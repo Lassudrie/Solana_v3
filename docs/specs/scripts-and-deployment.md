@@ -58,6 +58,8 @@ Le script injecte ou force plusieurs overrides de déploiement:
 - `signing.provider = "secure_unix"`
 - socket du signer
 - source d'évènements live `shredstream`
+- forçage de `runtime.event_source.mode = "shredstream"` même si la section existe deja
+- forçage de `shredstream.grpc_endpoint` vers l'endpoint fourni au script
 - activation du monitor
 - paramètres builder/strategy sûrs pour le runtime déployé
 
