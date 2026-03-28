@@ -1153,7 +1153,7 @@ impl Default for RuntimeParallelismConfig {
         Self {
             transport_mode: TransportModeConfig::Inproc,
             state_shard_count: 16,
-            route_eval_worker_count: 8,
+            route_eval_worker_count: 1,
             trigger_queue_capacity: 4_096,
             state_update_mode: StateUpdateModeConfig::LatestOnly,
         }
@@ -1333,7 +1333,7 @@ account_batch_parallel_rpc_requests = 4
             SingleTransactionSubmitPolicyConfig::JitoOnly
         );
         assert_eq!(config.runtime.control.idle_sleep_millis, 0);
-        assert_eq!(config.runtime.control.max_events_per_tick, 512);
+        assert_eq!(config.runtime.control.max_events_per_tick, 256);
         assert_eq!(config.reconciliation.poll_interval_millis, 25);
         assert_eq!(config.reconciliation.account_batch_parallel_rpc_requests, 1);
         assert_eq!(config.jito.request_timeout_ms, 250);

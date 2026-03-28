@@ -13,9 +13,11 @@ Ce dossier stocke les documents de performance du bot:
 
 - `YYYY-MM-DD-latency-analysis-<env>.md`
 - `YYYY-MM-DD-throughput-analysis-<env>.md`
+- `YYYY-MM-DD-reject-investigation-playbook.md`
 - `YYYY-MM-DD-regression-note-<scope>.md`
 
 ## Point de depart
 
 - [`latency-analysis-template.md`](./latency-analysis-template.md) : template d'analyse de latence avec detail par etape.
 - [`2026-03-26-latency-analysis-static.md`](./2026-03-26-latency-analysis-static.md) : analyse statique actuelle de la latence du pipeline.
+- [`2026-03-28-reject-investigation-playbook.md`](./2026-03-28-reject-investigation-playbook.md) : playbook operatoire pour analyser le reject mix, la concentration par route et la profitabilite nette avant floor.

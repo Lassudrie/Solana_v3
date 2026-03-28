@@ -119,7 +119,7 @@ function print_runtime_overrides(printed_any) {
         print ""
         print "[runtime.control]"
         print "idle_sleep_millis = 0"
-        print "max_events_per_tick = 512"
+        print "max_events_per_tick = 256"
         printed_any = 1
     }
     return printed_any
@@ -174,7 +174,7 @@ BEGIN {
         print "idle_sleep_millis = 0"
     }
     if (in_runtime_control && !printed_runtime_control_max_events_per_tick) {
-        print "max_events_per_tick = 512"
+        print "max_events_per_tick = 256"
     }
     if (in_shredstream_table && !printed_shredstream_grpc_endpoint) {
         print "grpc_endpoint = \"" grpc_endpoint "\""
@@ -232,7 +232,7 @@ BEGIN {
     if (in_runtime_control) {
         print $0
         print "idle_sleep_millis = 0"
-        print "max_events_per_tick = 512"
+        print "max_events_per_tick = 256"
         printed_runtime_control_idle_sleep_millis = 1
         printed_runtime_control_max_events_per_tick = 1
         next
@@ -317,7 +317,7 @@ END {
         print "idle_sleep_millis = 0"
     }
     if (in_runtime_control && !printed_runtime_control_max_events_per_tick) {
-        print "max_events_per_tick = 512"
+        print "max_events_per_tick = 256"
     }
     if (in_shredstream_table && !printed_shredstream_grpc_endpoint) {
         print "grpc_endpoint = \"" grpc_endpoint "\""

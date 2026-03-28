@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::SystemTime;
 
@@ -18,9 +18,12 @@ pub(crate) struct IngressRouter {
     state_update_mode: StateUpdateModeConfig,
     account_to_pool: HashMap<String, String>,
     state_shards: Vec<StateShard>,
+    state_pool_queues: HashMap<String, BTreeMap<(u64, u64), StatePoolQueueEntry>>,
+    state_key_locations: HashMap<String, StateQueueLocation>,
     trigger_queue: VecDeque<TriggerQueueEntry>,
     broadcast_queue: VecDeque<NormalizedEvent>,
     next_state_shard: usize,
+    next_state_order: u64,
 }
 
 impl IngressRouter {
@@ -33,9 +36,12 @@ impl IngressRouter {
             state_update_mode: parallelism.state_update_mode,
             account_to_pool,
             state_shards: (0..shard_count).map(|_| StateShard::default()).collect(),
+            state_pool_queues: HashMap::new(),
+            state_key_locations: HashMap::new(),
             trigger_queue: VecDeque::with_capacity(parallelism.trigger_queue_capacity.max(64)),
             broadcast_queue: VecDeque::new(),
             next_state_shard: 0,
+            next_state_order: 0,
         }
     }
 
@@ -51,12 +57,28 @@ impl IngressRouter {
                 event.latency.state_published_at = Some(now);
                 let (state_key, pool_key) = self.state_key(&event);
                 let shard_index = self.shard_index(&pool_key);
-                if self.state_shards[shard_index].insert(
+                let event_sequence = event.source.sequence;
+                let state_key_for_queue = state_key.clone();
+                let (stored, coalesced) = self.state_shards[shard_index].insert(
                     state_key,
-                    StateMailboxEntry { pool_key, event },
+                    StateMailboxEntry {
+                        key: state_key_for_queue.clone(),
+                        event,
+                    },
                     self.state_update_mode,
-                ) {
+                );
+                if coalesced {
                     coalesced_updates = 1;
+                }
+                if stored || coalesced {
+                    self.replace_state_pool_entry(
+                        pool_key,
+                        StatePoolQueueEntry {
+                            shard_index,
+                            state_key: state_key_for_queue,
+                            sequence: event_sequence,
+                        },
+                    );
                 }
             }
             EventLane::Trigger => {
@@ -117,29 +139,88 @@ impl IngressRouter {
         trigger: &mut TriggerQueueEntry,
     ) -> Option<NormalizedEvent> {
         let pool_id = trigger_pool_id(&trigger.event)?;
-        let mut best: Option<(usize, String, u64)> = None;
-
-        for (shard_index, shard) in self.state_shards.iter().enumerate() {
-            for (key, entry) in &shard.mailboxes {
-                if entry.pool_key != pool_id
-                    || entry.event.source.sequence >= trigger.event.source.sequence
-                {
-                    continue;
-                }
-                let candidate = (shard_index, key.clone(), entry.event.source.sequence);
-                if best.as_ref().is_none_or(|best| candidate.2 < best.2) {
-                    best = Some(candidate);
-                }
-            }
-        }
-
-        let (shard_index, key, _) = best?;
+        let state_event = self.pop_ready_state_for_pool(pool_id, trigger.event.source.sequence)?;
         if trigger.first_blocked_at.is_none() {
             trigger.first_blocked_at = Some(SystemTime::now());
         }
-        self.state_shards[shard_index]
-            .take(&key)
-            .map(|entry| entry.event)
+        Some(state_event)
+    }
+
+    fn pop_ready_state_for_pool(
+        &mut self,
+        pool_id: &str,
+        before_sequence: u64,
+    ) -> Option<NormalizedEvent> {
+        loop {
+            let state_entry = {
+                let state_queue = self.state_pool_queues.get_mut(pool_id)?;
+                let Some((&(sequence, _), _)) = state_queue.first_key_value() else {
+                    break;
+                };
+                if sequence >= before_sequence {
+                    return None;
+                }
+                state_queue
+                    .pop_first()
+                    .map(|(_, entry)| entry)
+                    .expect("pool queue front must exist")
+            };
+
+            self.state_key_locations.remove(&state_entry.state_key);
+            if let Some(entry) = self.state_shards[state_entry.shard_index].take(&state_entry.state_key)
+            {
+                self.cleanup_state_pool_queue_if_empty(pool_id);
+                return Some(entry.event);
+            }
+
+            self.cleanup_state_pool_queue_if_empty(pool_id);
+        }
+        self.cleanup_state_pool_queue_if_empty(pool_id);
+        None
+    }
+
+    fn replace_state_pool_entry(&mut self, pool_key: String, entry: StatePoolQueueEntry) {
+        self.remove_state_pool_entry(&entry.state_key);
+        let order = self.next_state_order;
+        self.next_state_order = self.next_state_order.wrapping_add(1);
+        self.state_pool_queues
+            .entry(pool_key.clone())
+            .or_default()
+            .insert((entry.sequence, order), entry.clone());
+        self.state_key_locations.insert(
+            entry.state_key.clone(),
+            StateQueueLocation {
+                pool_key,
+                sequence: entry.sequence,
+                order,
+            },
+        );
+    }
+
+    fn remove_state_pool_entry(&mut self, state_key: &str) {
+        let Some(location) = self.state_key_locations.remove(state_key) else {
+            return;
+        };
+
+        let mut remove_pool_queue = false;
+        if let Some(state_queue) = self.state_pool_queues.get_mut(&location.pool_key) {
+            state_queue.remove(&(location.sequence, location.order));
+            remove_pool_queue = state_queue.is_empty();
+        }
+
+        if remove_pool_queue {
+            self.state_pool_queues.remove(&location.pool_key);
+        }
+    }
+
+    fn cleanup_state_pool_queue_if_empty(&mut self, pool_id: &str) {
+        let is_empty = self
+            .state_pool_queues
+            .get(pool_id)
+            .is_none_or(BTreeMap::is_empty);
+        if is_empty {
+            self.state_pool_queues.remove(pool_id);
+        }
     }
 
     fn pop_next_state(&mut self) -> Option<NormalizedEvent> {
@@ -151,6 +232,7 @@ impl IngressRouter {
             let shard_index = self.next_state_shard % self.state_shards.len();
             self.next_state_shard = (shard_index + 1) % self.state_shards.len();
             if let Some(entry) = self.state_shards[shard_index].pop_next() {
+                self.remove_state_pool_entry(&entry.key);
                 return Some(entry.event);
             }
         }
@@ -180,10 +262,10 @@ impl IngressRouter {
                 let pool_key = update.pool_id.clone();
                 (format!("state:{pool_key}:invalidation"), pool_key)
             }
-            other => (
-                format!("state:{}", fallback_key(other)),
-                fallback_key(other),
-            ),
+            other => {
+                let fallback = fallback_key(other);
+                (format!("state:{fallback}"), fallback)
+            }
         }
     }
 
@@ -265,6 +347,31 @@ mod tests {
         )
     }
 
+    fn snapshot_event_for_pool(pool_id: &str, sequence: u64) -> NormalizedEvent {
+        let mut event = snapshot_event(sequence);
+        if let MarketEvent::PoolSnapshotUpdate(update) = &mut event.payload {
+            update.pool_id = pool_id.into();
+        }
+        event
+    }
+
+    fn trigger_event(sequence: u64, pool_id: &str) -> NormalizedEvent {
+        NormalizedEvent::with_payload(
+            EventSourceKind::ShredStream,
+            sequence,
+            100,
+            MarketEvent::DestabilizingTransaction(domain::DestabilizingTransaction {
+                pool_id: pool_id.into(),
+                venue: PoolVenue::OrcaWhirlpool,
+                slot: 100,
+                signature: None,
+                input_amount: 10_000,
+                estimated_price_impact_bps: 0,
+                trigger_threshold_bps: 0,
+            }),
+        )
+    }
+
     #[test]
     fn latest_only_keeps_snapshot_and_quote_model_for_same_pool() {
         let mut parallelism = RuntimeParallelismConfig::default();
@@ -309,6 +416,66 @@ mod tests {
         ));
         assert!(matches!(second.payload, domain::MarketEvent::Heartbeat(_)));
     }
+
+    #[test]
+    fn trigger_unblocks_only_for_matching_pool_state() {
+        let mut router = IngressRouter::new(&RuntimeParallelismConfig::default(), Default::default());
+
+        router.route(snapshot_event_for_pool("pool-a", 1));
+        router.route(snapshot_event_for_pool("pool-b", 2));
+        router.route(trigger_event(3, "pool-a"));
+
+        let event = router.pop_next().expect("state event for matching pool");
+
+        match event.payload {
+            domain::MarketEvent::PoolSnapshotUpdate(snapshot) => {
+                assert_eq!(snapshot.pool_id, "pool-a");
+            }
+            _ => panic!("expected pool snapshot event for matching pool"),
+        }
+    }
+
+    #[test]
+    fn latest_state_is_selected_for_trigger_blocking_with_stale_entries() {
+        let mut parallelism = RuntimeParallelismConfig::default();
+        parallelism.state_shard_count = 1;
+        let mut router = IngressRouter::new(&parallelism, Default::default());
+
+        let first_snapshot_stats = router.route(snapshot_event_for_pool("pool-a", 1));
+        let coalesce_snapshot_stats = router.route(snapshot_event_for_pool("pool-a", 2));
+        router.route(trigger_event(3, "pool-a"));
+
+        assert_eq!(first_snapshot_stats.coalesced_updates, 0);
+        assert_eq!(coalesce_snapshot_stats.coalesced_updates, 1);
+
+        let event = router.pop_next().expect("state event");
+
+        match event.payload {
+            domain::MarketEvent::PoolSnapshotUpdate(snapshot) => {
+                assert_eq!(snapshot.slot, 100);
+                assert_eq!(snapshot.write_version, 1);
+                assert_eq!(snapshot.pool_id, "pool-a");
+            }
+            _ => panic!("expected latest pool snapshot"),
+        }
+        assert_eq!(event.latency.lane, domain::EventLane::StateOnly);
+        assert_eq!(event.source.sequence, 2);
+    }
+
+    #[test]
+    fn trigger_is_not_blocked_by_future_state_updates() {
+        let mut router = IngressRouter::new(&RuntimeParallelismConfig::default(), Default::default());
+
+        router.route(snapshot_event_for_pool("pool-a", 10));
+        router.route(trigger_event(5, "pool-a"));
+
+        let event = router.pop_next().expect("trigger event");
+        assert!(matches!(
+            event.payload,
+            domain::MarketEvent::DestabilizingTransaction(_)
+        ));
+        assert!(event.latency.trigger_blocked_at.is_none());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -323,21 +490,21 @@ impl StateShard {
         key: String,
         entry: StateMailboxEntry,
         state_update_mode: StateUpdateModeConfig,
-    ) -> bool {
+    ) -> (bool, bool) {
         match self.mailboxes.get_mut(&key) {
             Some(existing) => {
                 if state_update_mode == StateUpdateModeConfig::LatestOnly
                     && existing.event.source.sequence <= entry.event.source.sequence
                 {
                     *existing = entry;
-                    return true;
+                    return (true, true);
                 }
-                false
+                (false, false)
             }
             None => {
                 self.order.push_back(key.clone());
                 self.mailboxes.insert(key, entry);
-                false
+                (true, false)
             }
         }
     }
@@ -362,8 +529,22 @@ impl StateShard {
 
 #[derive(Debug)]
 struct StateMailboxEntry {
-    pool_key: String,
+    key: String,
     event: NormalizedEvent,
+}
+
+#[derive(Debug, Clone)]
+struct StatePoolQueueEntry {
+    shard_index: usize,
+    state_key: String,
+    sequence: u64,
+}
+
+#[derive(Debug)]
+struct StateQueueLocation {
+    pool_key: String,
+    sequence: u64,
+    order: u64,
 }
 
 #[derive(Debug)]

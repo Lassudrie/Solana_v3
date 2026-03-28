@@ -3,7 +3,7 @@ profile = "ultra_fast"
 
 [runtime.control]
 idle_sleep_millis = 0
-max_events_per_tick = 8192
+max_events_per_tick = 256
 
 [runtime.refresh]
 enabled = true

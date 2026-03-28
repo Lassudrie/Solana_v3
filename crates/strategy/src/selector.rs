@@ -18,7 +18,6 @@ use crate::{
 use domain::{ExecutionSnapshot, PoolSnapshot, RouteId};
 use state::StatePlane;
 use std::collections::{BTreeSet, HashMap};
-use std::thread;
 
 const DEFAULT_SIZE_LADDER: [u64; 6] =
     [250_000, 500_000, 1_000_000, 2_000_000, 3_000_000, 5_000_000];
@@ -83,7 +82,7 @@ where
         sizing_config: &StrategySizingConfig,
         route_execution_buffers: &HashMap<RouteId, u16>,
         route_execution_sizing: &HashMap<RouteId, RouteExecutionSizingState>,
-        route_eval_worker_count: usize,
+        _route_eval_worker_count: usize,
     ) -> SelectionOutcome {
         if impacted_routes.is_empty() {
             return SelectionOutcome {
@@ -98,42 +97,16 @@ where
             };
         }
 
-        let worker_count = route_eval_worker_count.max(1).min(impacted_routes.len());
-        let batches = if worker_count <= 1 {
-            vec![self.evaluate_chunk(
-                registry,
-                state,
-                execution_state,
-                impacted_routes,
-                inflight_submissions,
-                sizing_config,
-                route_execution_buffers,
-                route_execution_sizing,
-            )]
-        } else {
-            let chunk_size = impacted_routes.len().div_ceil(worker_count);
-            thread::scope(|scope| {
-                let mut handles = Vec::with_capacity(worker_count);
-                for routes in impacted_routes.chunks(chunk_size) {
-                    handles.push(scope.spawn(move || {
-                        self.evaluate_chunk(
-                            registry,
-                            state,
-                            execution_state,
-                            routes,
-                            inflight_submissions,
-                            sizing_config,
-                            route_execution_buffers,
-                            route_execution_sizing,
-                        )
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|handle| handle.join().expect("route evaluation worker panicked"))
-                    .collect::<Vec<_>>()
-            })
-        };
+        let batches = vec![self.evaluate_chunk(
+            registry,
+            state,
+            execution_state,
+            impacted_routes,
+            inflight_submissions,
+            sizing_config,
+            route_execution_buffers,
+            route_execution_sizing,
+        )];
 
         let mut decisions = Vec::with_capacity(impacted_routes.len());
         let mut live_candidates = Vec::new();

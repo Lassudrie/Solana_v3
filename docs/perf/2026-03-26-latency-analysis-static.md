@@ -87,7 +87,7 @@ La boucle daemon consomme les evenements **en serie** et limite le travail par t
 Les defaults importants sont dans [`config.rs`](../../crates/bot/src/config.rs):
 
 - profil standard: `idle_sleep_millis = 1`, `max_events_per_tick = 128`
-- profil `ultra_fast`: `idle_sleep_millis = 0`, `max_events_per_tick = 512`
+- profil `ultra_fast`: `idle_sleep_millis = 0`, `max_events_per_tick = 256`
 
 Conclusion:
 

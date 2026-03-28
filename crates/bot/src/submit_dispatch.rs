@@ -1,14 +1,14 @@
 use std::{
     collections::VecDeque,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread,
     time::{Duration, Instant, SystemTime},
 };
 
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use submit::{
     SubmissionId, SubmitAttemptOutcome, SubmitError, SubmitMode, SubmitRejectionReason,
     SubmitRequest, SubmitResult, SubmitRetryPolicy, SubmitStatus, Submitter,
@@ -104,18 +104,19 @@ impl SubmitDispatcher {
         worker_count: usize,
         queue_capacity: usize,
         congestion_threshold_pct: u8,
-    ) -> Result<Self, std::io::Error> {
+        ) -> Result<Self, std::io::Error> {
         let worker_count = worker_count.max(1);
         let pending_count = Arc::new(AtomicUsize::new(0));
         let retry_policy = submitter.retry_policy();
-        let (sender, receiver) = mpsc::channel();
-        let (worker_sender, worker_receiver) = mpsc::channel();
-        let (completion_sender, completion_receiver) = mpsc::channel();
-        let shared_worker_receiver = Arc::new(Mutex::new(worker_receiver));
+        let capacity = worker_count.saturating_add(queue_capacity);
+        let (sender, receiver) = crossbeam_channel::bounded::<CoordinatorMessage>(capacity);
+        let (worker_sender, worker_receiver) = crossbeam_channel::bounded::<PendingSubmission>(queue_capacity);
+        let (completion_sender, completion_receiver) =
+            crossbeam_channel::unbounded::<CompletedSubmission>();
 
         for index in 0..worker_count {
             let submitter = Arc::clone(&submitter);
-            let worker_receiver = Arc::clone(&shared_worker_receiver);
+            let worker_receiver = worker_receiver.clone();
             let sender = sender.clone();
             thread::Builder::new()
                 .name(format!("bot-submit-worker-{index}"))
@@ -188,13 +189,20 @@ impl SubmitDispatcher {
             attempt_index: 0,
             sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
         };
-        match self.sender.send(CoordinatorMessage::Enqueue(pending)) {
+        match self.sender.try_send(CoordinatorMessage::Enqueue(pending)) {
             Ok(()) => Ok(()),
-            Err(mpsc::SendError(CoordinatorMessage::Enqueue(pending))) => {
+            Err(TrySendError::Full(CoordinatorMessage::Enqueue(pending))) => {
+                release_pending_slot(&self.pending_count);
+                Err(EnqueueError::Full(pending.report))
+            }
+            Err(TrySendError::Disconnected(CoordinatorMessage::Enqueue(pending))) => {
                 release_pending_slot(&self.pending_count);
                 Err(EnqueueError::Disconnected(pending.report))
             }
-            Err(mpsc::SendError(CoordinatorMessage::AttemptFinished(_))) => unreachable!(),
+            Err(TrySendError::Full(CoordinatorMessage::AttemptFinished(_)))
+            | Err(TrySendError::Disconnected(CoordinatorMessage::AttemptFinished(_))) => {
+                unreachable!("submit enqueue only sends CoordinatorMessage::Enqueue")
+            }
         }
     }
 
@@ -258,15 +266,11 @@ impl SubmitDispatcher {
 
 fn submit_worker_loop(
     submitter: Arc<dyn Submitter>,
-    receiver: Arc<Mutex<Receiver<PendingSubmission>>>,
+    receiver: Receiver<PendingSubmission>,
     sender: Sender<CoordinatorMessage>,
 ) {
     loop {
-        let pending = {
-            let guard = receiver.lock().expect("submit dispatcher receiver lock");
-            guard.recv()
-        };
-        let Ok(pending) = pending else {
+        let Ok(pending) = receiver.recv() else {
             break;
         };
 

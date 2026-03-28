@@ -2,12 +2,12 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread,
     time::Duration,
 };
 
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use builder::{BuildRejectionReason, BuildResult, BuildStatus};
 
 use crate::runtime::{BuildSignCompletion, BuildSignPipeline, HotPathReport, PreparedExecution};
@@ -44,13 +44,14 @@ impl BuildSignDispatcher {
     ) -> Result<Self, std::io::Error> {
         let worker_count = worker_count.max(1);
         let pending_count = Arc::new(AtomicUsize::new(0));
-        let (sender, receiver) = mpsc::channel::<PreparedExecution>();
-        let (completion_sender, completion_receiver) = mpsc::channel::<BuildSignCompletion>();
-        let shared_receiver = Arc::new(std::sync::Mutex::new(receiver));
+        let capacity = queue_capacity.saturating_add(worker_count);
+        let (sender, receiver) = crossbeam_channel::bounded::<PreparedExecution>(capacity);
+        let (completion_sender, completion_receiver) =
+            crossbeam_channel::unbounded::<BuildSignCompletion>();
 
         for index in 0..worker_count {
             let pipeline = pipeline.clone();
-            let receiver = Arc::clone(&shared_receiver);
+            let receiver = receiver.clone();
             let completion_sender = completion_sender.clone();
             let pending_count = Arc::clone(&pending_count);
             thread::Builder::new()
@@ -95,9 +96,13 @@ impl BuildSignDispatcher {
         if !self.try_reserve_capacity() {
             return Err(EnqueueError::Full(task));
         }
-        match self.sender.send(task) {
+        match self.sender.try_send(task) {
             Ok(()) => Ok(()),
-            Err(mpsc::SendError(task)) => {
+            Err(TrySendError::Full(task)) => {
+                release_pending_slot(&self.pending_count);
+                Err(EnqueueError::Full(task))
+            }
+            Err(TrySendError::Disconnected(task)) => {
                 release_pending_slot(&self.pending_count);
                 Err(EnqueueError::Disconnected(task))
             }
@@ -156,16 +161,12 @@ impl BuildSignDispatcher {
 
 fn build_sign_worker_loop(
     pipeline: BuildSignPipeline,
-    receiver: Arc<std::sync::Mutex<Receiver<PreparedExecution>>>,
+    receiver: Receiver<PreparedExecution>,
     completion_sender: Sender<BuildSignCompletion>,
     pending_count: Arc<AtomicUsize>,
 ) {
     loop {
-        let task = {
-            let receiver = receiver.lock().expect("build/sign receiver");
-            receiver.recv()
-        };
-        let Ok(task) = task else {
+        let Ok(task) = receiver.recv() else {
             break;
         };
         let completion = pipeline.execute(task);

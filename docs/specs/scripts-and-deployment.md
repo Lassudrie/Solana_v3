@@ -59,7 +59,7 @@ Le script injecte ou force plusieurs overrides de déploiement:
 - socket du signer
 - source d'évènements live `shredstream`
 - forçage de `runtime.event_source.mode = "shredstream"` même si la section existe deja
-- forçage de `runtime.control.idle_sleep_millis = 0` et `runtime.control.max_events_per_tick = 512`
+- forçage de `runtime.control.idle_sleep_millis = 0` et `runtime.control.max_events_per_tick = 256`
 - forçage de `shredstream.grpc_endpoint` vers l'endpoint fourni au script
 - activation du monitor
 - paramètres builder/strategy sûrs pour le runtime déployé

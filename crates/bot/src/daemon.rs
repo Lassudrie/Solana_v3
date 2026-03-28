@@ -396,18 +396,7 @@ impl BotDaemon {
             let refresh_snapshot = self.refresher.drain_snapshot();
             let refresh_failure_status = self.refresh_failure_status(&refresh_snapshot.failures);
             self.runtime.apply_async_refresh(refresh_snapshot);
-            self.drain_build_sign_completions();
-            self.drain_submit_completions();
-            self.drain_reconciliation_updates();
-            self.reconcile_if_due();
             let kill_switch_active = self.refresh_kill_switch();
-            if let Some((issue, detail)) = refresh_failure_status {
-                self.refresh_status(Some(RuntimeMode::Degraded), Some(issue), Some(detail));
-            } else if kill_switch_active {
-                self.refresh_status(None, Some(RuntimeIssue::KillSwitchActive), None);
-            } else {
-                self.refresh_status(None, None, None);
-            }
 
             let mut ingested_events;
             match self.source.wait_next(idle_wait) {
@@ -416,10 +405,9 @@ impl BotDaemon {
                     ingested_events = true;
                 }
                 Ok(None) => {
-                    self.drain_ingress(max_events_per_tick);
-                    continue;
+                    ingested_events = false;
                 }
-                Err(IngestError::Exhausted { .. }) => {
+                Err(error) if matches!(error, IngestError::Exhausted { .. }) => {
                     self.flush_ingress();
                     self.flush_build_sign_dispatcher();
                     self.flush_submit_dispatcher();
@@ -467,7 +455,19 @@ impl BotDaemon {
 
             if ingested_events {
                 self.drain_ingress(max_events_per_tick);
+            } else if self.ingress.has_pending() {
+                self.drain_ingress(max_events_per_tick);
             }
+
+            if let Some((issue, detail)) = refresh_failure_status {
+                self.refresh_status(Some(RuntimeMode::Degraded), Some(issue), Some(detail));
+            } else if kill_switch_active {
+                self.refresh_status(None, Some(RuntimeIssue::KillSwitchActive), None);
+            } else {
+                self.refresh_status(None, None, None);
+            }
+
+            self.reconcile_if_due();
             self.drain_build_sign_completions();
             self.drain_submit_completions();
             self.drain_reconciliation_updates();
