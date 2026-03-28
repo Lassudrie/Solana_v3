@@ -110,6 +110,14 @@ def route_kind(route: dict[str, Any]) -> str:
     return route.get("kind", "two_leg")
 
 
+def route_leg_pool_ids(route: dict[str, Any]) -> set[str]:
+    return {leg["pool_id"] for leg in route.get("legs", [])}
+
+
+def route_conversion_pool_id(route: dict[str, Any]) -> str | None:
+    return route.get("sol_quote_conversion_pool_id") or None
+
+
 def route_max_quote_slot_lag(route: dict[str, Any]) -> int:
     execution = route.get("execution") or {}
     return int(execution.get("max_quote_slot_lag") or 0)
@@ -250,6 +258,61 @@ def route_score(
     return score
 
 
+def close_selected_route_dependencies(
+    selected: list[dict[str, Any]],
+    scored_routes: list[tuple[float, dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    selected_ids = {route["route_id"] for route in selected}
+    selected_pool_ids = set().union(*(route_leg_pool_ids(route) for route in selected))
+    pool_to_ranked_routes: dict[str, list[dict[str, Any]]] = {}
+    for _, route in sorted(
+        scored_routes,
+        key=lambda item: (item[0], item[1]["route_id"]),
+        reverse=True,
+    ):
+        for pool_id in route_leg_pool_ids(route):
+            pool_to_ranked_routes.setdefault(pool_id, []).append(route)
+
+    added_route_ids: list[str] = []
+    unresolved_pools: set[str] = set()
+
+    while True:
+        missing_pools = {
+            pool_id
+            for route in selected
+            for pool_id in [route_conversion_pool_id(route)]
+            if pool_id and pool_id not in selected_pool_ids
+        }
+        if not missing_pools:
+            break
+
+        progress = False
+        for pool_id in sorted(missing_pools):
+            ranked_routes = pool_to_ranked_routes.get(pool_id, [])
+            for route in ranked_routes:
+                route_id = route["route_id"]
+                if route_id in selected_ids:
+                    continue
+                selected.append(route)
+                selected_ids.add(route_id)
+                selected_pool_ids.update(route_leg_pool_ids(route))
+                added_route_ids.append(route_id)
+                progress = True
+                break
+            else:
+                unresolved_pools.add(pool_id)
+
+        if not progress:
+            break
+
+    remaining_unresolved = sorted(
+        pool_id
+        for pool_id in unresolved_pools
+        if pool_id not in selected_pool_ids
+    )
+    return selected, added_route_ids, remaining_unresolved
+
+
 def select_routes(
     config_routes: list[dict[str, Any]],
     route_items: list[dict[str, Any]],
@@ -336,6 +399,11 @@ def select_routes(
         selected.append(route)
         selected_ids.add(route["route_id"])
 
+    selected, dependency_route_ids, unresolved_dependency_pools = close_selected_route_dependencies(
+        selected,
+        scored_routes,
+    )
+
     report = {
         "selected_count": len(selected),
         "selected_by_kind": Counter(route_kind(route) for route in selected),
@@ -350,6 +418,9 @@ def select_routes(
         "depth_span_log10": round(depth_span, 4),
         "target_size_log10": round(target_size, 4),
         "size_span_log10": round(size_span, 4),
+        "dependency_route_count": len(dependency_route_ids),
+        "dependency_route_ids": dependency_route_ids,
+        "unresolved_dependency_pools": unresolved_dependency_pools,
     }
     return [route["route_id"] for route in selected], report
 

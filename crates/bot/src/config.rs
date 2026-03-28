@@ -939,6 +939,7 @@ impl Default for RuntimeConfig {
 #[serde(default)]
 pub struct LiveSetHealthConfig {
     pub enabled: bool,
+    pub pool_quarantine_after_refresh_failures: u32,
     pub pool_quarantine_after_repair_failures: u32,
     pub pool_quarantine_slots: u64,
     pub pool_disable_after_quarantine_count: u32,
@@ -952,6 +953,7 @@ impl Default for LiveSetHealthConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            pool_quarantine_after_refresh_failures: 0,
             pool_quarantine_after_repair_failures: 3,
             pool_quarantine_slots: 512,
             pool_disable_after_quarantine_count: 3,
@@ -1226,6 +1228,36 @@ mod tests {
         assert_eq!(config.runtime.refresh.alt_refresh_millis, 250);
         assert_eq!(config.runtime.refresh.wallet_refresh_millis, 500);
         assert_eq!(config.submit.queue_capacity, 16);
+    }
+
+    #[test]
+    fn loads_live_set_health_refresh_quarantine_overrides() {
+        let path = temp_path("bot-config-live-set-health", "toml");
+        let source = r#"
+[runtime.live_set_health]
+pool_quarantine_after_refresh_failures = 4
+pool_quarantine_after_repair_failures = 2
+pool_quarantine_slots = 1024
+"#;
+
+        fs::write(&path, source).unwrap();
+        let loaded = BotConfig::from_path(&path).unwrap();
+
+        assert_eq!(
+            loaded
+                .runtime
+                .live_set_health
+                .pool_quarantine_after_refresh_failures,
+            4
+        );
+        assert_eq!(
+            loaded
+                .runtime
+                .live_set_health
+                .pool_quarantine_after_repair_failures,
+            2
+        );
+        assert_eq!(loaded.runtime.live_set_health.pool_quarantine_slots, 1024);
     }
 
     #[test]

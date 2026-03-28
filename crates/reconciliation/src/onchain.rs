@@ -274,21 +274,11 @@ impl OnChainReconciler {
         chain_signature: &str,
     ) -> (FailureClass, Option<ExecutionFailureDetail>) {
         let detail = self.rpc.get_transaction_failure_detail(chain_signature);
-        let failure_class = match &detail {
-            Some(detail)
-                if detail.error_name.as_deref() == Some("TooLittleOutputReceived")
-                    || detail.custom_code == Some(6_022) =>
-            {
-                FailureClass::ChainExecutionTooLittleOutput
-            }
-            Some(detail)
-                if detail.error_name.as_deref() == Some("AmountInAboveMaximum")
-                    || detail.custom_code == Some(6_037) =>
-            {
-                FailureClass::ChainExecutionAmountInAboveMaximum
-            }
-            _ => FailureClass::ChainExecutionFailed,
-        };
+        let failure_class = detail
+            .as_ref()
+            .map_or(FailureClass::ChainExecutionFailed, |detail| {
+                failure_class_for_error(detail.error_name.as_deref(), detail.custom_code)
+            });
         (failure_class, detail)
     }
 
@@ -795,16 +785,8 @@ enum WsSignatureValue {
 
 fn classify_ws_failure(err: &Value) -> (FailureClass, Option<ExecutionFailureDetail>) {
     let custom_code = instruction_error_custom_code(err);
-    let error_name = match custom_code {
-        Some(6_022) => Some("TooLittleOutputReceived".to_string()),
-        Some(6_037) => Some("AmountInAboveMaximum".to_string()),
-        _ => None,
-    };
-    let failure_class = match custom_code {
-        Some(6_022) => FailureClass::ChainExecutionTooLittleOutput,
-        Some(6_037) => FailureClass::ChainExecutionAmountInAboveMaximum,
-        _ => FailureClass::ChainExecutionFailed,
-    };
+    let error_name = error_name_for_custom_code(custom_code);
+    let failure_class = failure_class_for_error(error_name.as_deref(), custom_code);
     let detail = ExecutionFailureDetail {
         instruction_index: instruction_error_index(err),
         program_id: None,
@@ -839,11 +821,7 @@ fn parse_transaction_failure_detail(body: &Value) -> Option<ExecutionFailureDeta
         custom_code = parse_custom_code_from_logs(&log_messages);
     }
     if error_name.is_none() {
-        error_name = match custom_code {
-            Some(6_022) => Some("TooLittleOutputReceived".into()),
-            Some(6_037) => Some("AmountInAboveMaximum".into()),
-            _ => None,
-        };
+        error_name = error_name_for_custom_code(custom_code);
     }
     let detail = ExecutionFailureDetail {
         instruction_index,
@@ -1013,19 +991,44 @@ fn instruction_error_custom_code(err: &Value) -> Option<u32> {
         .and_then(|code| u32::try_from(code).ok())
 }
 
+fn error_name_for_custom_code(custom_code: Option<u32>) -> Option<String> {
+    match custom_code {
+        Some(6_022) => Some("TooLittleOutputReceived".to_string()),
+        Some(6_036) => Some("AmountOutBelowMinimum".to_string()),
+        Some(6_037) => Some("AmountInAboveMaximum".to_string()),
+        _ => None,
+    }
+}
+
+fn failure_class_for_error(error_name: Option<&str>, custom_code: Option<u32>) -> FailureClass {
+    if matches!(
+        error_name,
+        Some("TooLittleOutputReceived" | "AmountOutBelowMinimum")
+    ) || matches!(custom_code, Some(6_022 | 6_036))
+    {
+        FailureClass::ChainExecutionTooLittleOutput
+    } else if error_name == Some("AmountInAboveMaximum") || custom_code == Some(6_037) {
+        FailureClass::ChainExecutionAmountInAboveMaximum
+    } else {
+        FailureClass::ChainExecutionFailed
+    }
+}
+
 fn parse_error_name(log_messages: &[String]) -> Option<String> {
     for message in log_messages {
+        let lower_message = message.to_ascii_lowercase();
         if message.contains("TooLittleOutputReceived")
-            || message
-                .to_ascii_lowercase()
-                .contains("too little output received")
+            || lower_message.contains("too little output received")
         {
             return Some("TooLittleOutputReceived".into());
         }
+        if message.contains("AmountOutBelowMinimum")
+            || lower_message.contains("amount out below minimum")
+        {
+            return Some("AmountOutBelowMinimum".into());
+        }
         if message.contains("AmountInAboveMaximum")
-            || message
-                .to_ascii_lowercase()
-                .contains("amount in above maximum")
+            || lower_message.contains("amount in above maximum")
         {
             return Some("AmountInAboveMaximum".into());
         }
@@ -1169,6 +1172,65 @@ mod tests {
             detail.error_name.as_deref(),
             Some("TooLittleOutputReceived")
         );
+    }
+
+    #[test]
+    fn websocket_processed_amount_out_below_minimum_maps_to_too_little_output() {
+        let mut tracker = ExecutionTracker::default();
+        let record = tracker.register_submission(
+            RouteId("route-a".into()),
+            "chain-sig".into(),
+            10,
+            Some(11),
+            Some(12),
+            UNIX_EPOCH,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-1".into()),
+                endpoint: "mock://jito".into(),
+                rejection: None,
+            },
+        );
+        let mut ws = SignatureWsClient::new("mock://solana-ws", Duration::from_millis(5));
+        ws.subscriptions.insert(7, record.submission_id.clone());
+        ws.tracked_submissions.insert(record.submission_id.clone());
+
+        let transition = ws
+            .handle_message(
+                Message::Text(
+                    json!({
+                        "method": "signatureNotification",
+                        "params": {
+                            "subscription": 7,
+                            "result": {
+                                "context": { "slot": 88 },
+                                "value": {
+                                    "err": { "InstructionError": [5, { "Custom": 6036 }] }
+                                }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ),
+                &mut tracker,
+            )
+            .expect("processed error should transition immediately");
+
+        assert_eq!(
+            transition.current_inclusion_status,
+            InclusionStatus::Failed(FailureClass::ChainExecutionTooLittleOutput)
+        );
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(
+            updated.inclusion_status,
+            InclusionStatus::Failed(FailureClass::ChainExecutionTooLittleOutput)
+        );
+        let detail = updated.failure_detail.as_ref().expect("failure detail");
+        assert_eq!(detail.instruction_index, Some(5));
+        assert_eq!(detail.custom_code, Some(6_036));
+        assert_eq!(detail.error_name.as_deref(), Some("AmountOutBelowMinimum"));
     }
 
     #[test]

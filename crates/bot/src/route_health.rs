@@ -199,6 +199,17 @@ impl RouteHealthRegistry {
                 record.refresh_in_flight = false;
                 record.consecutive_refresh_failures =
                     record.consecutive_refresh_failures.saturating_add(1);
+                if self.config.pool_quarantine_after_refresh_failures > 0
+                    && record.consecutive_refresh_failures
+                        >= self.config.pool_quarantine_after_refresh_failures
+                {
+                    record.enter_quarantine(
+                        observed_slot,
+                        self.config.pool_quarantine_slots,
+                        self.config.pool_disable_after_quarantine_count,
+                        self.config.pool_disable_window_slots,
+                    );
+                }
             }
             PoolHealthTransition::RefreshSucceeded => {
                 record.reset_on_executable_recovery(observed_slot);
@@ -618,6 +629,8 @@ impl PoolHealthRecord {
         disable_after_quarantine_count: u32,
         disable_window_slots: u64,
     ) {
+        self.refresh_pending = false;
+        self.refresh_in_flight = false;
         self.repair_pending = false;
         self.repair_in_flight = false;
         self.quarantined_until_slot = Some(observed_slot.saturating_add(quarantine_slots));
@@ -780,6 +793,29 @@ mod tests {
             registry.pool_view("pool-a", 21).unwrap().health_state,
             PoolHealthState::Disabled
         );
+    }
+
+    #[test]
+    fn refresh_failures_can_quarantine_pool_when_enabled() {
+        let mut config = LiveSetHealthConfig::default();
+        config.pool_quarantine_after_refresh_failures = 2;
+        let mut registry = RouteHealthRegistry::new(config, 2);
+        registry.register_route(
+            RouteId("route-a".into()),
+            &[state::types::PoolId("pool-a".into())],
+            2,
+        );
+
+        registry.on_repair_transition("pool-a", PoolHealthTransition::RefreshFailed, 10);
+        assert_eq!(
+            registry.pool_view("pool-a", 10).unwrap().health_state,
+            PoolHealthState::ExecutableRefreshPending
+        );
+
+        registry.on_repair_transition("pool-a", PoolHealthTransition::RefreshFailed, 11);
+        let view = registry.pool_view("pool-a", 11).unwrap();
+        assert_eq!(view.health_state, PoolHealthState::Quarantined);
+        assert!(view.quarantined_until_slot.is_some());
     }
 
     #[test]

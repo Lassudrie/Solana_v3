@@ -460,6 +460,93 @@ mod tests {
     }
 
     #[test]
+    fn onchain_reconciler_classifies_amount_out_below_minimum_as_too_little_output() {
+        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getSignatureStatuses" => json!({
+                    "result": {
+                        "value": [{
+                            "slot": 88,
+                            "err": { "InstructionError": [5, { "Custom": 6036 }] }
+                        }]
+                    }
+                })
+                .to_string(),
+                "getTransaction" => json!({
+                    "result": {
+                        "meta": {
+                            "err": { "InstructionError": [5, { "Custom": 6036 }] },
+                            "logMessages": [
+                                "Program log: AnchorError occurred. Error Code: AmountOutBelowMinimum. Error Number: 6036. Error Message: Amount out below minimum threshold."
+                            ]
+                        },
+                        "transaction": {
+                            "message": {
+                                "instructions": [
+                                    { "programId": "ComputeBudget111111111111111111111111111111" },
+                                    { "programId": "ComputeBudget111111111111111111111111111111" },
+                                    { "programId": "ATokenGPvbdGVxr1sWUhQjphn7x7ZsZfXg2f7Qp7i7m" },
+                                    { "programId": "ATokenGPvbdGVxr1sWUhQjphn7x7ZsZfXg2f7Qp7i7m" },
+                                    { "programId": "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK" },
+                                    { "programId": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc" }
+                                ]
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let mut tracker = ExecutionTracker::default();
+        let record = register_submission(
+            &mut tracker,
+            "route-a",
+            "chain-sig",
+            10,
+            SubmitMode::SingleTransaction,
+            SubmitResult {
+                status: SubmitStatus::Accepted,
+                submission_id: SubmissionId("submission-1".into()),
+                endpoint: rpc_endpoint.clone(),
+                rejection: None,
+            },
+        );
+        let mut reconciler = OnChainReconciler::new(OnChainReconciliationConfig {
+            enabled: true,
+            rpc_http_endpoint: rpc_endpoint,
+            rpc_ws_endpoint: "mock://solana-ws".into(),
+            websocket_enabled: false,
+            websocket_timeout_ms: 5,
+            search_transaction_history: true,
+            max_pending_slots: 5,
+        });
+
+        let transitions = reconciler.tick(&mut tracker, 10);
+
+        assert_eq!(transitions.len(), 1);
+        let updated = tracker.get(&record.submission_id).expect("record kept");
+        assert_eq!(
+            updated.inclusion_status,
+            InclusionStatus::Failed(super::FailureClass::ChainExecutionTooLittleOutput)
+        );
+        assert_eq!(
+            updated.outcome,
+            ExecutionOutcome::Failed(super::FailureClass::ChainExecutionTooLittleOutput)
+        );
+        let detail = updated.failure_detail.as_ref().expect("failure detail");
+        assert_eq!(detail.instruction_index, Some(5));
+        assert_eq!(
+            detail.program_id.as_deref(),
+            Some("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")
+        );
+        assert_eq!(detail.custom_code, Some(6_036));
+        assert_eq!(detail.error_name.as_deref(), Some("AmountOutBelowMinimum"));
+    }
+
+    #[test]
     fn onchain_reconciler_computes_realized_pnl_from_token_balance_delta() {
         let rpc_endpoint = spawn_mock_rpc_server(|body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
