@@ -1157,6 +1157,14 @@ default_jito_tip_lamports = 5000
         );
         assert!(loaded.rpc_submit.enabled);
         assert_eq!(
+            loaded.reconciliation.rpc_http_endpoint,
+            "http://127.0.0.1:8899"
+        );
+        assert_eq!(
+            loaded.reconciliation.rpc_ws_endpoint,
+            "ws://127.0.0.1:8900"
+        );
+        assert_eq!(
             loaded.shredstream.reducers.orca_simple_pool,
             ReducerRolloutMode::Active
         );
@@ -1165,6 +1173,26 @@ default_jito_tip_lamports = 5000
             "3KD9WKqrrErCsRp7oFoJ58RLqrNJfz8jS3Do8oJ3Gzx1"
         );
         assert_eq!(loaded.routes.definitions.len(), 8);
+    }
+
+    #[test]
+    fn loads_12_pairs_fast_manifest_with_local_reconciliation_endpoints() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("amm_12_pairs_fast.toml");
+        let loaded = BotConfig::from_path(path).unwrap();
+
+        assert_eq!(loaded.runtime.profile, RuntimeProfileConfig::UltraFast);
+        assert_eq!(
+            loaded.reconciliation.rpc_http_endpoint,
+            "http://127.0.0.1:8899"
+        );
+        assert_eq!(
+            loaded.reconciliation.rpc_ws_endpoint,
+            "ws://127.0.0.1:8900"
+        );
+        assert!(loaded.rpc_submit.enabled);
     }
 
     fn temp_path(prefix: &str, extension: &str) -> PathBuf {

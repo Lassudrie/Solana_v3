@@ -115,3 +115,27 @@ fn request_url(endpoint: &str, mode: SubmitMode) -> String {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::rpc_submit_endpoint;
+    use crate::config::BotConfig;
+
+    #[test]
+    fn falls_back_to_reconciliation_rpc_endpoint_when_rpc_submit_endpoint_is_empty() {
+        let mut config = BotConfig::default();
+        config.reconciliation.rpc_http_endpoint = "http://127.0.0.1:8899".into();
+        config.rpc_submit.endpoint.clear();
+
+        assert_eq!(rpc_submit_endpoint(&config), "http://127.0.0.1:8899");
+    }
+
+    #[test]
+    fn prefers_explicit_rpc_submit_endpoint_over_reconciliation_endpoint() {
+        let mut config = BotConfig::default();
+        config.reconciliation.rpc_http_endpoint = "http://127.0.0.1:8899".into();
+        config.rpc_submit.endpoint = "http://127.0.0.1:18899".into();
+
+        assert_eq!(rpc_submit_endpoint(&config), "http://127.0.0.1:18899");
+    }
+}

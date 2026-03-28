@@ -12,6 +12,10 @@ compute_unit_limit = 300000
 compute_unit_price_micro_lamports = 10000
 jito_tip_lamports = 1000
 
+[reconciliation]
+rpc_http_endpoint = "http://127.0.0.1:8899"
+rpc_ws_endpoint = "ws://127.0.0.1:8900"
+
 [shredstream.reducers]
 raydium_simple_pool = "active"
 raydium_clmm = "active"

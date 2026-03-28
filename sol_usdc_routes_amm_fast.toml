@@ -7,6 +7,10 @@ max_snapshot_slot_lag = 256
 [strategy]
 max_snapshot_slot_lag = 256
 
+[reconciliation]
+rpc_http_endpoint = "http://127.0.0.1:8899"
+rpc_ws_endpoint = "ws://127.0.0.1:8900"
+
 [shredstream.reducers]
 raydium_simple_pool = "active"
 raydium_clmm = "active"
