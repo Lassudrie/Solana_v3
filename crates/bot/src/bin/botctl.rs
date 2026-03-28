@@ -919,21 +919,26 @@ fn print_trade_table(items: Vec<MonitorTradeEvent>) {
     print_table(
         [
             "route",
+            "size",
             "submit",
             "outcome",
             "buffer_bps",
             "failure",
+            "code",
             "expected_pnl",
             "realized_pnl",
             "src_submit_ns",
             "src_term_ns",
             "tip",
+            "quoted",
             "submit_slot",
+            "terminal",
             "submission_id",
         ],
         items.into_iter().map(|item| {
             [
                 item.route_id,
+                display_optional_u64(item.trade_size),
                 item.submit_status,
                 item.outcome,
                 item.active_execution_buffer_bps
@@ -941,7 +946,9 @@ fn print_trade_table(items: Vec<MonitorTradeEvent>) {
                     .unwrap_or_else(|| "-".into()),
                 item.failure_error_name
                     .clone()
-                    .or_else(|| item.failure_custom_code.map(|value| value.to_string()))
+                    .unwrap_or_else(|| "-".into()),
+                item.failure_custom_code
+                    .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".into()),
                 item.expected_pnl_quote_atoms
                     .map(|value| value.to_string())
@@ -954,7 +961,9 @@ fn print_trade_table(items: Vec<MonitorTradeEvent>) {
                 item.jito_tip_lamports
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "-".into()),
+                item.quoted_slot.to_string(),
                 display_optional_u64(item.submitted_slot),
+                display_optional_u64(item.terminal_slot),
                 item.submission_id,
             ]
         }),
@@ -1488,6 +1497,7 @@ fn render_trades_body(frame: &mut Frame, area: Rect, app: &App) {
     let rows = items.iter().map(|item| {
         Row::new(vec![
             item.route_id.clone(),
+            display_optional_u64(item.trade_size),
             item.submit_status.clone(),
             item.outcome.clone(),
             item.expected_pnl_quote_atoms
@@ -1501,7 +1511,9 @@ fn render_trades_body(frame: &mut Frame, area: Rect, app: &App) {
             item.jito_tip_lamports
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into()),
+            item.quoted_slot.to_string(),
             display_optional_u64(item.submitted_slot),
+            display_optional_u64(item.terminal_slot),
             item.submission_id.clone(),
         ])
     });
@@ -1510,6 +1522,7 @@ fn render_trades_body(frame: &mut Frame, area: Rect, app: &App) {
         [
             Constraint::Length(16),
             Constraint::Length(10),
+            Constraint::Length(10),
             Constraint::Length(16),
             Constraint::Length(14),
             Constraint::Length(14),
@@ -1517,12 +1530,15 @@ fn render_trades_body(frame: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(14),
             Constraint::Length(10),
             Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
             Constraint::Min(18),
         ],
     )
     .header(
         Row::new([
             "route",
+            "size",
             "submit",
             "outcome",
             "expected",
@@ -1530,7 +1546,9 @@ fn render_trades_body(frame: &mut Frame, area: Rect, app: &App) {
             "src->submit",
             "src->term",
             "tip",
-            "slot",
+            "quoted",
+            "submit",
+            "term",
             "submission",
         ])
         .style(Style::default().fg(Color::Yellow)),
@@ -1678,11 +1696,24 @@ fn detail_lines(app: &App) -> Vec<Line<'static>> {
                             .unwrap_or_else(|| "N/A".into())
                     )),
                     Line::from(format!(
-                        "tip={} endpoint={}",
+                        "size={} tip={} endpoint={}",
+                        item.trade_size
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".into()),
                         item.jito_tip_lamports
                             .map(|value| value.to_string())
                             .unwrap_or_else(|| "-".into()),
                         item.endpoint
+                    )),
+                    Line::from(format!(
+                        "quoted_slot={} submitted_slot={} terminal_slot={}",
+                        item.quoted_slot,
+                        item.submitted_slot
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        item.terminal_slot
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".into())
                     )),
                     Line::from(format!(
                         "buffer_bps={} failure={} code={}",
@@ -1883,15 +1914,22 @@ mod tests {
                 samples: vec![
                     bot::observer::MonitorSignalSample {
                         seq: 1,
+                        lane: "trigger".into(),
                         source: "shred".into(),
                         source_sequence: 1,
                         observed_slot: 10,
                         source_received_at_unix_millis: 0,
                         normalized_at_unix_millis: 0,
+                        router_received_at_unix_millis: 0,
+                        state_published_at_unix_millis: None,
                         source_latency_nanos: Some(1),
                         ingest_nanos: 1,
                         queue_wait_nanos: 1,
+                        state_mailbox_age_nanos: None,
+                        trigger_queue_wait_nanos: None,
+                        trigger_barrier_wait_nanos: None,
                         state_apply_nanos: 1,
+                        route_eval_nanos: Some(1),
                         select_nanos: Some(1),
                         build_nanos: Some(1),
                         sign_nanos: Some(1),
@@ -1900,15 +1938,22 @@ mod tests {
                     },
                     bot::observer::MonitorSignalSample {
                         seq: 2,
+                        lane: "trigger".into(),
                         source: "shred".into(),
                         source_sequence: 2,
                         observed_slot: 11,
                         source_received_at_unix_millis: 0,
                         normalized_at_unix_millis: 0,
+                        router_received_at_unix_millis: 0,
+                        state_published_at_unix_millis: None,
                         source_latency_nanos: Some(1),
                         ingest_nanos: 1,
                         queue_wait_nanos: 1,
+                        state_mailbox_age_nanos: None,
+                        trigger_queue_wait_nanos: None,
+                        trigger_barrier_wait_nanos: None,
                         state_apply_nanos: 1,
+                        route_eval_nanos: Some(1),
                         select_nanos: Some(1),
                         build_nanos: Some(1),
                         sign_nanos: Some(1),
@@ -1937,6 +1982,7 @@ mod tests {
                     route_id: "route-1".into(),
                     route_kind: "two_leg".into(),
                     leg_count: 2,
+                    trade_size: Some(10_000),
                     submission_id: "sub-1".into(),
                     signature: "sig-1".into(),
                     submit_status: "pending".into(),
@@ -1960,6 +2006,15 @@ mod tests {
                     realized_pnl_quote_atoms: None,
                     jito_tip_lamports: Some(1),
                     active_execution_buffer_bps: Some(50),
+                    source_input_balance: Some(10_000),
+                    oldest_snapshot_slot: Some(10),
+                    quote_state_age_slots: Some(0),
+                    leg_ticks_crossed: vec![0, 0],
+                    leg_amount_modes: vec!["exact_input".into(), "min_output".into()],
+                    leg_specified_amounts: vec![10_000, 10_100],
+                    leg_threshold_amounts: vec![10_100, 10_200],
+                    submit_leader: Some("leader-1".into()),
+                    failure_bucket: None,
                     failure_program_id: None,
                     failure_instruction_index: None,
                     failure_custom_code: None,
@@ -1968,6 +2023,7 @@ mod tests {
                     quoted_slot: 10,
                     blockhash_slot: Some(11),
                     submitted_slot: Some(12),
+                    terminal_slot: None,
                     submitted_at_unix_millis: 0,
                     updated_at_unix_millis: 0,
                     source_to_submit_nanos: Some(1),

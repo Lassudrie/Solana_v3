@@ -455,6 +455,7 @@ fn normalized_event(
         current
     });
     let source = source.map(Into::into).unwrap_or(default_kind);
+    let lane = crate::events::lane_for_payload(&payload);
 
     NormalizedEvent {
         payload,
@@ -467,6 +468,10 @@ fn normalized_event(
             source_received_at: now,
             normalized_at: now,
             source_latency: None,
+            router_received_at: now,
+            state_published_at: None,
+            trigger_blocked_at: None,
+            lane,
         },
     }
 }
@@ -575,6 +580,15 @@ mod tests {
                 source_received_at: SystemTime::now(),
                 normalized_at: SystemTime::now(),
                 source_latency: None,
+                router_received_at: SystemTime::now(),
+                state_published_at: None,
+                trigger_blocked_at: None,
+                lane: crate::events::lane_for_payload(&MarketEvent::Heartbeat(
+                    crate::events::Heartbeat {
+                        slot: 9,
+                        note: "test",
+                    },
+                )),
             },
         });
         assert!(source.poll_next().unwrap().is_some());

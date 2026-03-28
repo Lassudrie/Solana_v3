@@ -78,8 +78,12 @@ base_mint = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
 quote_mint = "So11111111111111111111111111111111111111112"
 min_trade_size = 2500000
 default_trade_size = 10000000
-max_trade_size = 100000000
-size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+max_trade_size = 50000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000]
+
+[routes.definitions.sizing]
+base_expected_shortfall_bps = 150
+max_expected_shortfall_bps = 750
 
 [[routes.definitions.legs]]
 venue = "orca_whirlpool"
@@ -137,7 +141,7 @@ message_mode = "v0_required"
 default_compute_unit_limit = 300000
 default_compute_unit_price_micro_lamports = 10000
 default_jito_tip_lamports = 1000
-max_quote_slot_lag = 32
+max_quote_slot_lag = 16
 max_alt_slot_lag = 32
 
 [[routes.definitions.execution.lookup_tables]]
@@ -148,9 +152,9 @@ account_key = "GLCebDVLcqNf8s3sRSE9SQUAiUFaCu1icjvSvdoFRW3W"
 
 [routes.definitions.execution_protection]
 enabled = true
-tight_max_quote_slot_lag = 24
+tight_max_quote_slot_lag = 16
 base_extra_buy_leg_slippage_bps = 25
-failure_step_bps = 25
+failure_step_bps = 50
 max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
 [[routes.definitions]]
@@ -163,8 +167,12 @@ base_mint = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
 quote_mint = "So11111111111111111111111111111111111111112"
 min_trade_size = 2500000
 default_trade_size = 10000000
-max_trade_size = 100000000
-size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+max_trade_size = 50000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000]
+
+[routes.definitions.sizing]
+base_expected_shortfall_bps = 150
+max_expected_shortfall_bps = 750
 
 [[routes.definitions.legs]]
 venue = "raydium_clmm"
@@ -222,7 +230,7 @@ message_mode = "v0_required"
 default_compute_unit_limit = 300000
 default_compute_unit_price_micro_lamports = 10000
 default_jito_tip_lamports = 1000
-max_quote_slot_lag = 32
+max_quote_slot_lag = 16
 max_alt_slot_lag = 32
 
 [[routes.definitions.execution.lookup_tables]]
@@ -233,9 +241,9 @@ account_key = "rNFfT7TYkjcXPhudX7rXARZkqkDyRnJNsSnh3FMeXJY"
 
 [routes.definitions.execution_protection]
 enabled = true
-tight_max_quote_slot_lag = 24
+tight_max_quote_slot_lag = 16
 base_extra_buy_leg_slippage_bps = 25
-failure_step_bps = 25
+failure_step_bps = 50
 max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
 [[routes.definitions]]

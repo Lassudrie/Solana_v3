@@ -1,6 +1,7 @@
 [routes]
 
 [[routes.definitions]]
+route_class = "clmm_slow_path"
 route_id = "sol-usdc-orca004-ray004"
 input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -73,6 +74,7 @@ max_alt_slot_lag = 32
 account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
 
 [[routes.definitions]]
+route_class = "clmm_slow_path"
 route_id = "sol-usdc-ray004-orca004"
 input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -145,6 +147,7 @@ max_alt_slot_lag = 32
 account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
 
 [[routes.definitions]]
+route_class = "clmm_slow_path"
 route_id = "sol-usdc-orca004-ray002"
 input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -217,6 +220,7 @@ max_alt_slot_lag = 32
 account_key = "8TM3cxoXfnNXU7XUjsAeyN8niu7dQMDf5ZB47nmrTcLD"
 
 [[routes.definitions]]
+route_class = "clmm_slow_path"
 route_id = "sol-usdc-ray002-orca004"
 input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"

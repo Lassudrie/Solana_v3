@@ -26,6 +26,7 @@ use crate::{
         ResolvedAddressLookupTable, SwapAmountMode, UnsignedTransactionEnvelope,
     },
 };
+use domain::RouteId;
 use strategy::opportunity::OpportunityCandidate;
 use strategy::route_registry::RouteLegSequence;
 
@@ -35,9 +36,12 @@ const DEFAULT_JITO_TIP_ACCOUNT: &str = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhv
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+const NATIVE_MINT_ID: &str = "So11111111111111111111111111111111111111112";
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
 const RAYDIUM_SWAP_BASE_OUT_TAG: u8 = 11;
+const TOKEN_CLOSE_ACCOUNT_TAG: u8 = 9;
+const TOKEN_SYNC_NATIVE_TAG: u8 = 17;
 const SIGNATURE_BYTES: usize = 64;
 const MAX_SERIALIZED_TRANSACTION_BYTES: usize = 1_232;
 #[allow(deprecated)]
@@ -66,6 +70,19 @@ impl AtomicArbTransactionBuilder {
             template: AtomicTwoLegTemplate::default(),
             execution_registry,
         }
+    }
+
+    pub fn effective_compute_unit_limit(&self, route_id: &RouteId, requested: u32) -> u32 {
+        self.execution_registry
+            .get(route_id)
+            .map(|route| {
+                if requested == 0 {
+                    route.default_compute_unit_limit
+                } else {
+                    requested.max(route.default_compute_unit_limit)
+                }
+            })
+            .unwrap_or(requested)
     }
 }
 
@@ -147,10 +164,18 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
                 compute_budget_set_compute_unit_price(compute_unit_price_micro_lamports),
             ),
         ];
-        match associated_token_setup_instructions(route_execution, fee_payer) {
-            Ok(setup_instructions) => labeled_instructions.extend(setup_instructions),
-            Err(reason) => return rejected(reason),
-        }
+        let associated_token_setup =
+            match associated_token_setup_instructions(route_execution, fee_payer) {
+                Ok(instructions) => instructions,
+                Err(reason) => return rejected(reason),
+            };
+        labeled_instructions.extend(associated_token_setup);
+        let (native_setup_instructions, native_cleanup_instructions) =
+            match native_account_runtime_instructions(route_execution, fee_payer, &leg_plans) {
+                Ok(instructions) => instructions,
+                Err(reason) => return rejected(reason),
+            };
+        labeled_instructions.extend(native_setup_instructions);
         for (index, (execution, leg_plan)) in route_execution
             .legs
             .iter()
@@ -166,6 +191,7 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
                 instruction,
             ));
         }
+        labeled_instructions.extend(native_cleanup_instructions);
         if jito_tip_lamports > 0 {
             let tip_account = parse_static_pubkey(DEFAULT_JITO_TIP_ACCOUNT);
             labeled_instructions.push(LabeledInstruction::new(
@@ -337,21 +363,7 @@ fn verify_profitable_execution_plan(
         return Err(BuildRejectionReason::UnsupportedRouteShape);
     }
 
-    let buffered_input_allowance = candidate
-        .leg_quotes
-        .as_slice()
-        .first()
-        .zip(leg_plans.as_slice().first())
-        .filter(|(_, first_plan)| first_plan.amount_mode == SwapAmountMode::ExactOut)
-        .map(|(first_quote, first_plan)| {
-            first_plan
-                .other_amount_threshold
-                .saturating_sub(first_quote.input_amount)
-        })
-        .unwrap_or(0);
-    let minimum_output = candidate
-        .minimum_acceptable_output
-        .saturating_add(buffered_input_allowance);
+    let minimum_output = candidate.minimum_acceptable_output;
 
     if final_leg.other_amount_threshold < minimum_output {
         return Err(BuildRejectionReason::UnprofitableExecutionPlan {
@@ -449,6 +461,22 @@ fn associated_token_setup_instructions(
                     &config.token_program_id,
                 )?;
             }
+            VenueExecutionConfig::RaydiumSimplePool(config) => {
+                register_optional_associated_token_account_setup(
+                    &mut seen,
+                    &mut instructions,
+                    fee_payer,
+                    config.user_source_mint.as_deref(),
+                    &config.token_program_id,
+                )?;
+                register_optional_associated_token_account_setup(
+                    &mut seen,
+                    &mut instructions,
+                    fee_payer,
+                    config.user_destination_mint.as_deref(),
+                    &config.token_program_id,
+                )?;
+            }
             VenueExecutionConfig::RaydiumClmm(config) => {
                 register_associated_token_account_setup(
                     &mut seen,
@@ -465,8 +493,7 @@ fn associated_token_setup_instructions(
                     &config.token_program_id,
                 )?;
             }
-            VenueExecutionConfig::OrcaSimplePool(_)
-            | VenueExecutionConfig::RaydiumSimplePool(_) => {}
+            VenueExecutionConfig::OrcaSimplePool(_) => {}
         }
     }
 
@@ -491,6 +518,143 @@ fn register_associated_token_account_setup(
         create_associated_token_account_idempotent(fee_payer, mint_pubkey, token_program_pubkey),
     ));
     Ok(())
+}
+
+fn register_optional_associated_token_account_setup(
+    seen: &mut BTreeSet<(String, String)>,
+    instructions: &mut Vec<LabeledInstruction>,
+    fee_payer: Pubkey,
+    mint: Option<&str>,
+    token_program: &str,
+) -> Result<(), BuildRejectionReason> {
+    let Some(mint) = mint else {
+        return Ok(());
+    };
+    register_associated_token_account_setup(seen, instructions, fee_payer, mint, token_program)
+}
+
+fn native_account_runtime_instructions(
+    route_execution: &RouteExecutionConfig,
+    fee_payer: Pubkey,
+    leg_plans: &RouteLegSequence<AtomicLegPlan>,
+) -> Result<(Vec<LabeledInstruction>, Vec<LabeledInstruction>), BuildRejectionReason> {
+    let Some((first_execution, first_leg_plan)) = route_execution
+        .legs
+        .as_slice()
+        .first()
+        .zip(leg_plans.as_slice().first())
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let Some(wrap_plan) = first_leg_native_wrap_plan(first_execution, fee_payer, first_leg_plan)?
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if wrap_plan.lamports == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    Ok((
+        vec![
+            LabeledInstruction::new(
+                "native-wrap-transfer",
+                instruction::transfer(&fee_payer, &wrap_plan.token_account, wrap_plan.lamports),
+            ),
+            LabeledInstruction::new(
+                "native-wrap-sync",
+                spl_token_sync_native(wrap_plan.token_program, wrap_plan.token_account),
+            ),
+        ],
+        vec![LabeledInstruction::new(
+            "native-wrap-close",
+            spl_token_close_account(wrap_plan.token_program, wrap_plan.token_account, fee_payer),
+        )],
+    ))
+}
+
+fn first_leg_native_wrap_plan(
+    execution: &VenueExecutionConfig,
+    fee_payer: Pubkey,
+    leg_plan: &AtomicLegPlan,
+) -> Result<Option<NativeWrapPlan>, BuildRejectionReason> {
+    let lamports = wrap_amount_lamports(leg_plan);
+    if lamports == 0 {
+        return Ok(None);
+    }
+
+    match execution {
+        VenueExecutionConfig::OrcaWhirlpool(config) => {
+            let token_program = parse_pubkey(&config.token_program_id)?;
+            let token_mint_a = parse_pubkey(&config.token_mint_a)?;
+            let token_mint_b = parse_pubkey(&config.token_mint_b)?;
+            let (source_mint, token_account) = if config.a_to_b {
+                (
+                    token_mint_a,
+                    associated_token_address(&fee_payer, &token_mint_a, &token_program),
+                )
+            } else {
+                (
+                    token_mint_b,
+                    associated_token_address(&fee_payer, &token_mint_b, &token_program),
+                )
+            };
+            native_wrap_plan(source_mint, token_program, token_account, lamports)
+        }
+        VenueExecutionConfig::RaydiumClmm(config) => {
+            let token_program = parse_pubkey(&config.token_program_id)?;
+            let token_mint_0 = parse_pubkey(&config.token_mint_0)?;
+            let token_mint_1 = parse_pubkey(&config.token_mint_1)?;
+            let (source_mint, token_account) = if config.zero_for_one {
+                (
+                    token_mint_0,
+                    associated_token_address(&fee_payer, &token_mint_0, &token_program),
+                )
+            } else {
+                (
+                    token_mint_1,
+                    associated_token_address(&fee_payer, &token_mint_1, &token_program),
+                )
+            };
+            native_wrap_plan(source_mint, token_program, token_account, lamports)
+        }
+        VenueExecutionConfig::RaydiumSimplePool(config) => {
+            let Some(source_mint) = config.user_source_mint.as_deref() else {
+                return Ok(None);
+            };
+            let token_program = parse_pubkey(&config.token_program_id)?;
+            let source_mint = parse_pubkey(source_mint)?;
+            native_wrap_plan(
+                source_mint,
+                token_program,
+                associated_token_address(&fee_payer, &source_mint, &token_program),
+                lamports,
+            )
+        }
+        VenueExecutionConfig::OrcaSimplePool(_) => Ok(None),
+    }
+}
+
+fn native_wrap_plan(
+    source_mint: Pubkey,
+    token_program: Pubkey,
+    token_account: Pubkey,
+    lamports: u64,
+) -> Result<Option<NativeWrapPlan>, BuildRejectionReason> {
+    if source_mint != parse_static_pubkey(NATIVE_MINT_ID) {
+        return Ok(None);
+    }
+    Ok(Some(NativeWrapPlan {
+        token_program,
+        token_account,
+        lamports,
+    }))
+}
+
+fn wrap_amount_lamports(leg_plan: &AtomicLegPlan) -> u64 {
+    match leg_plan.amount_mode {
+        SwapAmountMode::ExactIn => leg_plan.specified_amount,
+        SwapAmountMode::ExactOut => leg_plan.other_amount_threshold,
+    }
 }
 
 fn compile_orca_simple_pool(
@@ -1145,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_execution_plan_when_final_leg_floor_does_not_cover_exact_out_buffer() {
+    fn rejects_execution_plan_when_final_leg_floor_is_below_required_minimum_output() {
         let candidate = OpportunityCandidate {
             route_id: RouteId("route-a".into()),
             route_kind: strategy::route_registry::RouteKind::TwoLeg,
@@ -1159,9 +1323,14 @@ mod tests {
             p_land_bps: 10_000,
             expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: Some(25),
+            source_input_balance: None,
             expected_net_output: 100_150_000,
             minimum_acceptable_output: 100_005_002,
             expected_gross_profit_quote_atoms: 5_000,
+            estimated_network_fee_lamports: 0,
+            estimated_network_fee_quote_atoms: 0,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: 5_000,
@@ -1175,6 +1344,7 @@ mod tests {
                     output_amount: 8_303_842,
                     fee_paid: 0,
                     current_tick_index: Some(0),
+                    ticks_crossed: 0,
                 },
                 strategy::quote::LegQuote {
                     venue: "raydium_clmm".into(),
@@ -1184,6 +1354,7 @@ mod tests {
                     output_amount: 100_009_567,
                     fee_paid: 0,
                     current_tick_index: Some(0),
+                    ticks_crossed: 0,
                 },
             ]
             .into(),
@@ -1193,9 +1364,9 @@ mod tests {
                 venue: "raydium_clmm".into(),
                 pool_id: domain::PoolId("pool-a".into()),
                 side: strategy::route_registry::SwapSide::BuyBase,
-                amount_mode: SwapAmountMode::ExactOut,
-                specified_amount: 8_303_842,
-                other_amount_threshold: 100_250_000,
+                amount_mode: SwapAmountMode::ExactIn,
+                specified_amount: 100_000_000,
+                other_amount_threshold: 8_303_842,
                 current_tick_index: Some(0),
             },
             AtomicLegPlan {
@@ -1204,7 +1375,7 @@ mod tests {
                 side: strategy::route_registry::SwapSide::SellBase,
                 amount_mode: SwapAmountMode::ExactIn,
                 specified_amount: 8_303_842,
-                other_amount_threshold: 100_005_002,
+                other_amount_threshold: 100_005_001,
                 current_tick_index: Some(0),
             },
         ]);
@@ -1212,8 +1383,8 @@ mod tests {
         assert_eq!(
             verify_profitable_execution_plan(&candidate, &leg_plans),
             Err(BuildRejectionReason::UnprofitableExecutionPlan {
-                guaranteed_output: 100_005_002,
-                minimum_output: 100_255_002,
+                guaranteed_output: 100_005_001,
+                minimum_output: 100_005_002,
             })
         );
     }
@@ -1321,6 +1492,30 @@ fn create_associated_token_account_idempotent(
     }
 }
 
+fn spl_token_sync_native(token_program: Pubkey, account: Pubkey) -> Instruction {
+    Instruction {
+        program_id: token_program,
+        accounts: vec![AccountMeta::new(account, false)],
+        data: vec![TOKEN_SYNC_NATIVE_TAG],
+    }
+}
+
+fn spl_token_close_account(
+    token_program: Pubkey,
+    account: Pubkey,
+    fee_payer: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: token_program,
+        accounts: vec![
+            AccountMeta::new(account, false),
+            AccountMeta::new(fee_payer, false),
+            AccountMeta::new_readonly(fee_payer, true),
+        ],
+        data: vec![TOKEN_CLOSE_ACCOUNT_TAG],
+    }
+}
+
 fn describe_instruction(
     label: &str,
     instruction: &Instruction,
@@ -1379,6 +1574,13 @@ fn account_source(
 struct RouteLookupTable {
     account: AddressLookupTableAccount,
     metadata: ResolvedAddressLookupTable,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeWrapPlan {
+    token_program: Pubkey,
+    token_account: Pubkey,
+    lamports: u64,
 }
 
 #[derive(Debug, Clone)]

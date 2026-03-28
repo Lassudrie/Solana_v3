@@ -88,6 +88,13 @@ pub struct RuntimeMetrics {
     pub shredstream_interarrival_latency_nanos: u64,
     pub shredstream_interarrival_latency_count: u64,
     pub shredstream_events_per_second: u64,
+    pub state_coalesced_updates: u64,
+    pub state_dirty_mailboxes: u64,
+    pub trigger_queue_depth: u64,
+    pub trigger_queue_wait_nanos: u64,
+    pub trigger_barrier_wait_nanos: u64,
+    pub route_eval_nanos: u64,
+    pub state_mailbox_age_nanos: u64,
     pub stage_latency_nanos: BTreeMap<String, u128>,
 }
 
@@ -113,6 +120,13 @@ impl RuntimeMetrics {
             shredstream_interarrival_latency_nanos: snapshot.shredstream_interarrival_latency_nanos,
             shredstream_interarrival_latency_count: snapshot.shredstream_interarrival_latency_count,
             shredstream_events_per_second: snapshot.shredstream_events_per_second,
+            state_coalesced_updates: snapshot.state_coalesced_updates,
+            state_dirty_mailboxes: snapshot.state_dirty_mailboxes,
+            trigger_queue_depth: snapshot.trigger_queue_depth,
+            trigger_queue_wait_nanos: snapshot.trigger_queue_wait_nanos,
+            trigger_barrier_wait_nanos: snapshot.trigger_barrier_wait_nanos,
+            route_eval_nanos: snapshot.route_eval_nanos,
+            state_mailbox_age_nanos: snapshot.state_mailbox_age_nanos,
             stage_latency_nanos: snapshot
                 .stage_latency_nanos
                 .into_iter()
@@ -190,6 +204,13 @@ impl Default for RuntimeStatus {
                 shredstream_interarrival_latency_nanos: 0,
                 shredstream_interarrival_latency_count: 0,
                 shredstream_events_per_second: 0,
+                state_coalesced_updates: 0,
+                state_dirty_mailboxes: 0,
+                trigger_queue_depth: 0,
+                trigger_queue_wait_nanos: 0,
+                trigger_barrier_wait_nanos: 0,
+                route_eval_nanos: 0,
+                state_mailbox_age_nanos: 0,
                 stage_latency_nanos: BTreeMap::new(),
             }),
             last_error: None,
@@ -293,6 +314,41 @@ impl RuntimeStatus {
         output.push_str(&format!(
             "bot_shredstream_events_per_second {}\n",
             self.metrics.shredstream_events_per_second
+        ));
+        output.push_str("# TYPE bot_state_coalesced_updates_total counter\n");
+        output.push_str(&format!(
+            "bot_state_coalesced_updates_total {}\n",
+            self.metrics.state_coalesced_updates
+        ));
+        output.push_str("# TYPE bot_state_dirty_mailboxes gauge\n");
+        output.push_str(&format!(
+            "bot_state_dirty_mailboxes {}\n",
+            self.metrics.state_dirty_mailboxes
+        ));
+        output.push_str("# TYPE bot_trigger_queue_depth gauge\n");
+        output.push_str(&format!(
+            "bot_trigger_queue_depth {}\n",
+            self.metrics.trigger_queue_depth
+        ));
+        output.push_str("# TYPE bot_trigger_queue_wait_nanos_total counter\n");
+        output.push_str(&format!(
+            "bot_trigger_queue_wait_nanos_total {}\n",
+            self.metrics.trigger_queue_wait_nanos
+        ));
+        output.push_str("# TYPE bot_trigger_barrier_wait_nanos_total counter\n");
+        output.push_str(&format!(
+            "bot_trigger_barrier_wait_nanos_total {}\n",
+            self.metrics.trigger_barrier_wait_nanos
+        ));
+        output.push_str("# TYPE bot_route_eval_nanos_total counter\n");
+        output.push_str(&format!(
+            "bot_route_eval_nanos_total {}\n",
+            self.metrics.route_eval_nanos
+        ));
+        output.push_str("# TYPE bot_state_mailbox_age_nanos_total counter\n");
+        output.push_str(&format!(
+            "bot_state_mailbox_age_nanos_total {}\n",
+            self.metrics.state_mailbox_age_nanos
         ));
         output.push_str("# TYPE bot_shredstream_sequence_gaps_total counter\n");
         output.push_str(&format!(
@@ -542,6 +598,13 @@ mod tests {
                 transport_failed_count: 2,
                 chain_failed_count: 3,
                 expired_count: 4,
+                state_coalesced_updates: 0,
+                state_dirty_mailboxes: 0,
+                trigger_queue_depth: 0,
+                trigger_queue_wait_nanos: 0,
+                trigger_barrier_wait_nanos: 0,
+                route_eval_nanos: 0,
+                state_mailbox_age_nanos: 0,
                 stage_latency_nanos: [("select".to_string(), 99)].into_iter().collect(),
             },
             last_error: None,

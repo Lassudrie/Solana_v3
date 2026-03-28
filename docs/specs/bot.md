@@ -9,6 +9,7 @@
 - daemon principal et boucle d'évènements
 - dispatch asynchrone build/sign puis submit
 - monitoring HTTP et CLI/TUI
+- persistance SQLite asynchrone des rejets et transactions
 - health policy des pools/routes live
 
 ## Points d'entrée
@@ -24,6 +25,7 @@
 - Le runtime seed initial (blockhash, wallet, ALT cache) est injecté avant de traiter le flux.
 - Les chemins build/sign et submit peuvent être asynchrones et bornés par des files de capacité finie.
 - Le monitoring et la route health policy ne doivent pas perturber le hot path.
+- La persistance d'audit ne doit pas introduire d'I/O disque synchrone dans le hot path.
 
 ## Inventaire des fichiers
 
@@ -37,6 +39,7 @@
 | `crates/bot/src/daemon.rs` | Boucle daemon | `BotDaemon`, workers de réconciliation, intégration refresh et dispatchers |
 | `crates/bot/src/control.rs` | Health HTTP simple | `RuntimeStatus`, `RuntimeIssue`, métriques Prometheus |
 | `crates/bot/src/observer.rs` | Observabilité métier | snapshots monitor, rejections, trades, edge capture, serveur HTTP du monitor |
+| `crates/bot/src/persistence.rs` | Audit durable | worker SQLite, schéma `bot_runs/rejection_events/trade_events/trade_latest`, batching asynchrone |
 | `crates/bot/src/route_health.rs` | Politique de santé live | `RouteHealthRegistry`, quarantines, `ShadowOnly`, synthèse pool/route |
 | `crates/bot/src/live.rs` | Adaptateur live detection -> bot | hooks repairs/déstabilisation, construction `TrackedPool`, source gRPC live |
 | `crates/bot/src/sources.rs` | Sélection de la source d'évènements | JSONL, UDP JSON, gRPC ShredStream |
@@ -73,6 +76,7 @@ Le module gère aussi:
 - schéma détaillé des legs d'exécution Orca/Raydium
 - sélection de la source d'évènements
 - paramètres de monitor et de health live set
+- paramètres de persistance durable via `runtime.persistence`
 
 ## `bootstrap.rs`
 
@@ -111,6 +115,7 @@ Le daemon:
 - distribue build/sign et submit sur des dispatchers bornés
 - alimente le worker de réconciliation
 - met à jour `RuntimeStatus` et l'observer
+- demande un flush best-effort de la persistance avant arrêt propre
 - gère les issues de runtime: route warmup, congestion, wallet, source défaillante, kill switch
 
 ## `observer.rs` et `botctl`
@@ -127,3 +132,28 @@ L'observer expose une API HTTP locale pour:
 - snapshot agrégé
 
 `botctl` consomme cette API en CLI simple ou via une TUI Ratatui.
+
+L'observer sert aussi de point de duplication vers la persistance durable:
+
+- `publish_hot_path` envoie le `HotPathReport` au monitor mémoire et au worker SQLite
+- `publish_trade_update` envoie les transitions de réconciliation au worker SQLite
+- le hot path ne fait pas de requête SQLite lui-même
+
+## `persistence.rs`
+
+Le module de persistance:
+
+- crée un `run_id` à chaque démarrage
+- ouvre une base SQLite locale
+- configure `WAL` et batch les écritures par transaction
+- persiste les rejets dans `rejection_events`
+- persiste l'historique des soumissions et transitions dans `trade_events`
+- maintient le dernier état par `submission_id` dans `trade_latest`
+
+Le choix est volontairement orienté latence:
+
+- pas d'I/O disque synchrone dans le hot path
+- flush périodique et par batch
+- meilleure traçabilité opérationnelle avec un coût CPU/I/O déporté sur un thread dédié
+
+Pour l'usage opératoire et le schéma détaillé, voir [`../bot/persistence.md`](../bot/persistence.md).

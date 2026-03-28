@@ -103,7 +103,7 @@ account_key = "8TM3cxoXfnNXU7XUjsAeyN8niu7dQMDf5ZB47nmrTcLD"
 
 [routes.definitions.execution_protection]
 enabled = true
-tight_max_quote_slot_lag = 3
+tight_max_quote_slot_lag = 16
 base_extra_buy_leg_slippage_bps = 35
 failure_step_bps = 25
 max_extra_buy_leg_slippage_bps = 125

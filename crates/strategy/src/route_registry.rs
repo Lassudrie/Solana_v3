@@ -29,7 +29,38 @@ pub struct StrategySizingConfig {
     pub max_inflight_penalty_bps: u16,
     pub blockhash_penalty_bps_per_slot: u16,
     pub max_blockhash_penalty_bps: u16,
+    pub quote_age_penalty_bps_per_slot: u16,
+    pub max_quote_age_penalty_bps: u16,
+    pub tick_cross_penalty_bps_per_tick: u16,
+    pub max_tick_cross_penalty_bps: u16,
     pub max_reserve_usage_penalty_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JitoTipMode {
+    Fixed,
+    #[default]
+    PnlRatio,
+    RiskAdjustedPnlRatio,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitoTipPolicy {
+    pub mode: JitoTipMode,
+    pub share_bps_of_expected_net_profit: u16,
+    pub min_lamports: u64,
+    pub max_lamports: u64,
+}
+
+impl Default for JitoTipPolicy {
+    fn default() -> Self {
+        Self {
+            mode: JitoTipMode::PnlRatio,
+            share_bps_of_expected_net_profit: 1_000,
+            min_lamports: 5_000,
+            max_lamports: 50_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +234,7 @@ pub struct RouteDefinition {
     pub kind: RouteKind,
     pub input_mint: String,
     pub output_mint: String,
+    pub input_source_account: Option<String>,
     pub base_mint: Option<String>,
     pub quote_mint: Option<String>,
     pub sol_quote_conversion_pool_id: Option<PoolId>,
@@ -213,6 +245,7 @@ pub struct RouteDefinition {
     pub default_trade_size: u64,
     pub max_trade_size: u64,
     pub size_ladder: Vec<u64>,
+    pub default_jito_tip_lamports: u64,
     pub estimated_execution_cost_lamports: u64,
     pub sizing: RouteSizingPolicy,
     pub execution_protection: Option<ExecutionProtectionPolicy>,
@@ -232,6 +265,13 @@ impl RouteDefinition {
                 entry_mint: self.input_mint.clone(),
                 exit_mint: self.output_mint.clone(),
             });
+        }
+        if self
+            .input_source_account
+            .as_deref()
+            .is_some_and(str::is_empty)
+        {
+            return Err(RouteValidationError::EmptyInputSourceAccount);
         }
         if let Some(quote_mint) = self.quote_mint.as_deref()
             && quote_mint != self.input_mint
@@ -329,6 +369,8 @@ pub enum RouteValidationError {
         quote_mint: String,
         route_mint: String,
     },
+    #[error("route input_source_account must not be empty when provided")]
+    EmptyInputSourceAccount,
     #[error("leg {leg_index} is missing an explicit input/output mint")]
     EmptyLegMint { leg_index: usize },
     #[error("leg {leg_index} is degenerate on mint {mint}")]
@@ -383,6 +425,7 @@ mod tests {
             kind: RouteKind::Triangular,
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            input_source_account: None,
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
             sol_quote_conversion_pool_id: Some(PoolId("pool-sol-usdc".into())),
@@ -419,6 +462,7 @@ mod tests {
             default_trade_size: 5_000,
             max_trade_size: 10_000,
             size_ladder: vec![2_500, 5_000],
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 5_000,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,

@@ -12,6 +12,8 @@ pub struct BotConfig {
     pub strategy: StrategyConfig,
     pub builder: BuilderConfig,
     pub signing: SigningConfig,
+    #[serde(default)]
+    pub build_sign: BuildSignConfig,
     pub submit: SubmitConfig,
     pub jito: JitoSubmitConfig,
     #[serde(default)]
@@ -30,6 +32,7 @@ impl Default for BotConfig {
             strategy: StrategyConfig::default(),
             builder: BuilderConfig::default(),
             signing: SigningConfig::default(),
+            build_sign: BuildSignConfig::default(),
             submit: SubmitConfig::default(),
             jito: JitoSubmitConfig::default(),
             rpc_submit: RpcSubmitConfig::default(),
@@ -98,24 +101,39 @@ impl BotConfig {
 
         // Ultra-fast mode keeps the async submit path short and fail-fast.
         set_if_default(
+            &mut self.build_sign.worker_count,
+            defaults.build_sign.worker_count,
+            8,
+        );
+        set_if_default(
+            &mut self.build_sign.queue_capacity,
+            defaults.build_sign.queue_capacity,
+            256,
+        );
+        set_if_default(
+            &mut self.build_sign.congestion_threshold_pct,
+            defaults.build_sign.congestion_threshold_pct,
+            90,
+        );
+        set_if_default(
             &mut self.submit.worker_count,
             defaults.submit.worker_count,
-            2,
+            8,
         );
         set_if_default(
             &mut self.submit.queue_capacity,
             defaults.submit.queue_capacity,
-            4,
+            256,
         );
         set_if_default(
             &mut self.submit.congestion_threshold_pct,
             defaults.submit.congestion_threshold_pct,
-            50,
+            90,
         );
         set_if_default(
             &mut self.submit.single_transaction_policy,
             defaults.submit.single_transaction_policy,
-            SingleTransactionSubmitPolicyConfig::LeaderAware,
+            SingleTransactionSubmitPolicyConfig::JitoOnly,
         );
         set_if_default(
             &mut self.jito.request_timeout_ms,
@@ -135,7 +153,7 @@ impl BotConfig {
         set_if_default(
             &mut self.rpc_submit.enabled,
             defaults.rpc_submit.enabled,
-            true,
+            false,
         );
         set_if_default(
             &mut self.rpc_submit.request_timeout_ms,
@@ -155,6 +173,21 @@ impl BotConfig {
         set_if_default(
             &mut self.runtime.control.max_events_per_tick,
             defaults.runtime.control.max_events_per_tick,
+            4_096,
+        );
+        set_if_default(
+            &mut self.runtime.parallelism.state_shard_count,
+            defaults.runtime.parallelism.state_shard_count,
+            16,
+        );
+        set_if_default(
+            &mut self.runtime.parallelism.route_eval_worker_count,
+            defaults.runtime.parallelism.route_eval_worker_count,
+            8,
+        );
+        set_if_default(
+            &mut self.runtime.parallelism.trigger_queue_capacity,
+            defaults.runtime.parallelism.trigger_queue_capacity,
             4_096,
         );
         set_if_default(
@@ -286,6 +319,10 @@ fn default_shredstream_price_dislocation_trigger_bps() -> u16 {
 
 fn default_account_batch_window_millis() -> u64 {
     20
+}
+
+fn default_account_batch_parallel_rpc_requests() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -656,6 +693,10 @@ pub struct StrategySizingConfig {
     pub max_inflight_penalty_bps: u16,
     pub blockhash_penalty_bps_per_slot: u16,
     pub max_blockhash_penalty_bps: u16,
+    pub quote_age_penalty_bps_per_slot: u16,
+    pub max_quote_age_penalty_bps: u16,
+    pub tick_cross_penalty_bps_per_tick: u16,
+    pub max_tick_cross_penalty_bps: u16,
     pub max_reserve_usage_penalty_bps: u16,
 }
 
@@ -674,6 +715,10 @@ impl Default for StrategySizingConfig {
             max_inflight_penalty_bps: 1_500,
             blockhash_penalty_bps_per_slot: 10,
             max_blockhash_penalty_bps: 1_000,
+            quote_age_penalty_bps_per_slot: 15,
+            max_quote_age_penalty_bps: 750,
+            tick_cross_penalty_bps_per_tick: 20,
+            max_tick_cross_penalty_bps: 1_000,
             max_reserve_usage_penalty_bps: 1_250,
         }
     }
@@ -683,6 +728,9 @@ impl Default for StrategySizingConfig {
 pub struct BuilderConfig {
     pub compute_unit_limit: u32,
     pub compute_unit_price_micro_lamports: u64,
+    #[serde(default)]
+    pub jito_tip_policy: JitoTipPolicyConfig,
+    #[serde(default)]
     pub jito_tip_lamports: u64,
 }
 
@@ -691,9 +739,69 @@ impl Default for BuilderConfig {
         Self {
             compute_unit_limit: 300_000,
             compute_unit_price_micro_lamports: 25_000,
-            jito_tip_lamports: 5_000,
+            jito_tip_policy: JitoTipPolicyConfig::default(),
+            jito_tip_lamports: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum JitoTipModeConfig {
+    Fixed,
+    #[default]
+    PnlRatio,
+    RiskAdjustedPnlRatio,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct JitoTipPolicyConfig {
+    pub mode: JitoTipModeConfig,
+    pub share_bps_of_expected_net_profit: u16,
+    pub min_lamports: u64,
+    pub max_lamports: u64,
+}
+
+impl Default for JitoTipPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: JitoTipModeConfig::PnlRatio,
+            share_bps_of_expected_net_profit: 1_000,
+            min_lamports: 5_000,
+            max_lamports: 50_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct BuildSignConfig {
+    pub worker_count: usize,
+    pub queue_capacity: usize,
+    pub congestion_threshold_pct: u8,
+}
+
+impl Default for BuildSignConfig {
+    fn default() -> Self {
+        Self {
+            worker_count: default_build_sign_worker_count(),
+            queue_capacity: default_build_sign_queue_capacity(),
+            congestion_threshold_pct: default_build_sign_congestion_threshold_pct(),
+        }
+    }
+}
+
+fn default_build_sign_worker_count() -> usize {
+    2
+}
+
+fn default_build_sign_queue_capacity() -> usize {
+    8
+}
+
+fn default_build_sign_congestion_threshold_pct() -> u8 {
+    50
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -876,6 +984,8 @@ pub struct ReconciliationConfig {
     pub max_pending_slots: u64,
     #[serde(default = "default_account_batch_window_millis")]
     pub account_batch_window_millis: u64,
+    #[serde(default = "default_account_batch_parallel_rpc_requests")]
+    pub account_batch_parallel_rpc_requests: usize,
 }
 
 impl Default for ReconciliationConfig {
@@ -890,6 +1000,7 @@ impl Default for ReconciliationConfig {
             poll_interval_millis: 100,
             max_pending_slots: 150,
             account_batch_window_millis: default_account_batch_window_millis(),
+            account_batch_parallel_rpc_requests: default_account_batch_parallel_rpc_requests(),
         }
     }
 }
@@ -914,9 +1025,13 @@ pub struct RuntimeConfig {
     pub event_source: EventSourceConfig,
     pub health_server: HealthServerConfig,
     pub monitor_server: MonitorServerConfig,
+    #[serde(default)]
+    pub persistence: PersistenceConfig,
     pub control: RuntimeControlConfig,
     #[serde(default)]
     pub refresh: AsyncRefreshConfig,
+    #[serde(default)]
+    pub parallelism: RuntimeParallelismConfig,
     #[serde(default)]
     pub live_set_health: LiveSetHealthConfig,
 }
@@ -928,8 +1043,10 @@ impl Default for RuntimeConfig {
             event_source: EventSourceConfig::default(),
             health_server: HealthServerConfig::default(),
             monitor_server: MonitorServerConfig::default(),
+            persistence: PersistenceConfig::default(),
             control: RuntimeControlConfig::default(),
             refresh: AsyncRefreshConfig::default(),
+            parallelism: RuntimeParallelismConfig::default(),
             live_set_health: LiveSetHealthConfig::default(),
         }
     }
@@ -944,6 +1061,7 @@ pub struct LiveSetHealthConfig {
     pub pool_quarantine_slots: u64,
     pub pool_disable_after_quarantine_count: u32,
     pub pool_disable_window_slots: u64,
+    pub route_targeted_failure_cooldown_slots: u64,
     pub route_shadow_after_chain_failures: u32,
     pub route_failure_window_slots: u64,
     pub route_reentry_cooldown_slots: u64,
@@ -958,6 +1076,7 @@ impl Default for LiveSetHealthConfig {
             pool_quarantine_slots: 512,
             pool_disable_after_quarantine_count: 3,
             pool_disable_window_slots: 4_096,
+            route_targeted_failure_cooldown_slots: 16,
             route_shadow_after_chain_failures: 2,
             route_failure_window_slots: 1_024,
             route_reentry_cooldown_slots: 1_024,
@@ -1001,6 +1120,42 @@ impl Default for AsyncRefreshConfig {
             slot_refresh_millis: default_slot_refresh_millis(),
             alt_refresh_millis: 2_000,
             wallet_refresh_millis: 2_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportModeConfig {
+    #[default]
+    Inproc,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StateUpdateModeConfig {
+    #[default]
+    LatestOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RuntimeParallelismConfig {
+    pub transport_mode: TransportModeConfig,
+    pub state_shard_count: usize,
+    pub route_eval_worker_count: usize,
+    pub trigger_queue_capacity: usize,
+    pub state_update_mode: StateUpdateModeConfig,
+}
+
+impl Default for RuntimeParallelismConfig {
+    fn default() -> Self {
+        Self {
+            transport_mode: TransportModeConfig::Inproc,
+            state_shard_count: 16,
+            route_eval_worker_count: 8,
+            trigger_queue_capacity: 4_096,
+            state_update_mode: StateUpdateModeConfig::LatestOnly,
         }
     }
 }
@@ -1071,6 +1226,26 @@ impl Default for MonitorServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PersistenceConfig {
+    pub enabled: bool,
+    pub path: String,
+    pub batch_size: usize,
+    pub flush_interval_millis: u64,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: "data/bot_observer.sqlite3".into(),
+            batch_size: 128,
+            flush_interval_millis: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeControlConfig {
     pub idle_sleep_millis: u64,
     pub max_events_per_tick: usize,
@@ -1116,25 +1291,55 @@ mod tests {
     }
 
     #[test]
+    fn loads_reconciliation_account_batch_parallel_rpc_requests_override() {
+        let path = temp_path("bot-config-account-batch-parallel", "toml");
+        fs::write(
+            &path,
+            r#"
+[runtime]
+profile = "ultra_fast"
+
+[runtime.event_source]
+mode = "jsonl_file"
+path = "/tmp/events.jsonl"
+
+[reconciliation]
+account_batch_parallel_rpc_requests = 4
+"#,
+        )
+        .unwrap();
+
+        let loaded = BotConfig::from_path(&path).unwrap();
+
+        assert_eq!(loaded.reconciliation.account_batch_parallel_rpc_requests, 4);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn ultra_fast_profile_applies_runtime_defaults() {
         let mut config = BotConfig::default();
         config.runtime.profile = RuntimeProfileConfig::UltraFast;
         config.apply_runtime_profile_defaults();
 
-        assert_eq!(config.submit.worker_count, 2);
-        assert_eq!(config.submit.queue_capacity, 4);
-        assert_eq!(config.submit.congestion_threshold_pct, 50);
+        assert_eq!(config.build_sign.worker_count, 8);
+        assert_eq!(config.build_sign.queue_capacity, 256);
+        assert_eq!(config.build_sign.congestion_threshold_pct, 90);
+        assert_eq!(config.submit.worker_count, 8);
+        assert_eq!(config.submit.queue_capacity, 256);
+        assert_eq!(config.submit.congestion_threshold_pct, 90);
         assert_eq!(
             config.submit.single_transaction_policy,
-            SingleTransactionSubmitPolicyConfig::LeaderAware
+            SingleTransactionSubmitPolicyConfig::JitoOnly
         );
         assert_eq!(config.runtime.control.idle_sleep_millis, 0);
         assert_eq!(config.runtime.control.max_events_per_tick, 4_096);
         assert_eq!(config.reconciliation.poll_interval_millis, 25);
+        assert_eq!(config.reconciliation.account_batch_parallel_rpc_requests, 1);
         assert_eq!(config.jito.request_timeout_ms, 250);
         assert_eq!(config.jito.retry_attempts, 1);
         assert_eq!(config.jito.retry_backoff_ms, 0);
-        assert!(config.rpc_submit.enabled);
+        assert!(!config.rpc_submit.enabled);
         assert_eq!(config.rpc_submit.request_timeout_ms, 250);
         assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 500);
         assert_eq!(config.runtime.refresh.slot_refresh_millis, 250);
@@ -1553,9 +1758,9 @@ default_jito_tip_lamports = 5000
         assert_eq!(loaded.signing.owner_pubkey, "owner-pubkey");
         assert_eq!(
             loaded.submit.single_transaction_policy,
-            SingleTransactionSubmitPolicyConfig::LeaderAware
+            SingleTransactionSubmitPolicyConfig::JitoOnly
         );
-        assert!(loaded.rpc_submit.enabled);
+        assert!(!loaded.rpc_submit.enabled);
         assert_eq!(loaded.routes.definitions.len(), 1);
         assert_eq!(loaded.routes.definitions[0].route_id, "route-a");
 
@@ -1585,9 +1790,9 @@ default_jito_tip_lamports = 5000
         );
         assert_eq!(
             loaded.submit.single_transaction_policy,
-            SingleTransactionSubmitPolicyConfig::LeaderAware
+            SingleTransactionSubmitPolicyConfig::JitoOnly
         );
-        assert!(loaded.rpc_submit.enabled);
+        assert!(!loaded.rpc_submit.enabled);
         assert_eq!(
             loaded.reconciliation.rpc_http_endpoint,
             "http://127.0.0.1:8899"
@@ -1595,6 +1800,7 @@ default_jito_tip_lamports = 5000
         assert_eq!(loaded.reconciliation.rpc_ws_endpoint, "ws://127.0.0.1:8900");
         assert_eq!(loaded.reconciliation.poll_interval_millis, 10);
         assert_eq!(loaded.reconciliation.account_batch_window_millis, 5);
+        assert_eq!(loaded.reconciliation.account_batch_parallel_rpc_requests, 1);
         assert_eq!(loaded.runtime.refresh.blockhash_refresh_millis, 250);
         assert_eq!(loaded.runtime.refresh.slot_refresh_millis, 25);
         assert_eq!(loaded.runtime.refresh.alt_refresh_millis, 250);
@@ -1627,7 +1833,7 @@ default_jito_tip_lamports = 5000
             "http://127.0.0.1:8899"
         );
         assert_eq!(loaded.reconciliation.rpc_ws_endpoint, "ws://127.0.0.1:8900");
-        assert!(loaded.rpc_submit.enabled);
+        assert!(!loaded.rpc_submit.enabled);
     }
 
     #[test]

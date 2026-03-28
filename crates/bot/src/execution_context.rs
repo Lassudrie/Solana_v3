@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use domain::{ExecutionSnapshot, LookupTableSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -9,6 +11,7 @@ pub struct ExecutionContext {
     alt_revision: u64,
     lookup_tables: Vec<LookupTableSnapshot>,
     wallet_balance_lamports: u64,
+    source_token_balances: HashMap<String, u64>,
     wallet_ready: bool,
     kill_switch_enabled: bool,
 }
@@ -23,6 +26,7 @@ impl ExecutionContext {
             alt_revision: self.alt_revision,
             lookup_tables: self.lookup_tables.clone(),
             wallet_balance_lamports: self.wallet_balance_lamports,
+            source_token_balances: self.source_token_balances.clone(),
             wallet_ready: self.wallet_ready,
             kill_switch_enabled: self.kill_switch_enabled,
         }
@@ -48,6 +52,10 @@ impl ExecutionContext {
     pub fn set_wallet_state(&mut self, balance_lamports: u64, ready: bool) {
         self.wallet_balance_lamports = balance_lamports;
         self.wallet_ready = ready;
+    }
+
+    pub fn set_source_token_balances(&mut self, balances: HashMap<String, u64>) {
+        self.source_token_balances = balances;
     }
 
     pub fn set_alt_revision(&mut self, revision: u64) {

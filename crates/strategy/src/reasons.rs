@@ -49,6 +49,14 @@ pub enum RejectionReason {
         requested: u64,
         maximum: u64,
     },
+    SourceBalanceUnavailable {
+        account: String,
+    },
+    SourceBalanceTooLow {
+        account: String,
+        current: u64,
+        minimum: u64,
+    },
     WalletNotReady,
     WalletBalanceTooLow {
         current: u64,

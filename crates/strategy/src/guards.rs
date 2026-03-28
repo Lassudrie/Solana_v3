@@ -267,6 +267,7 @@ mod tests {
             kind: RouteKind::TwoLeg,
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            input_source_account: None,
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
             sol_quote_conversion_pool_id: Some(PoolId("pool-a".into())),
@@ -295,6 +296,7 @@ mod tests {
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 0,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
@@ -404,6 +406,7 @@ mod tests {
                     output_amount: 10_100,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 LegQuote {
                     venue: "venue-b".into(),
@@ -413,6 +416,7 @@ mod tests {
                     output_amount: 10_150,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
             ]
             .into(),
@@ -433,6 +437,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -461,6 +466,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };

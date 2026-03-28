@@ -11,7 +11,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use builder::BuildRejectionReason;
+use builder::{BuildRejectionReason, SwapAmountMode};
 use reconciliation::{ExecutionOutcome, ExecutionRecord, FailureClass};
 use serde::{Deserialize, Serialize};
 use state::types::PoolSnapshot;
@@ -26,6 +26,7 @@ pub use crate::route_health::RouteMonitorView;
 use crate::{
     config::{BotConfig, MonitorServerConfig, RouteClassConfig, RuntimeProfileConfig},
     control::{RuntimeMode, RuntimeStatus},
+    persistence::PersistenceHandle,
     route_health::{PoolHealthState, RouteHealthState, SharedRouteHealth},
     runtime::{HotPathReport, PipelineTrace},
 };
@@ -77,15 +78,22 @@ pub struct RoutesResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MonitorSignalSample {
     pub seq: u64,
+    pub lane: String,
     pub source: String,
     pub source_sequence: u64,
     pub observed_slot: u64,
     pub source_received_at_unix_millis: u128,
     pub normalized_at_unix_millis: u128,
+    pub router_received_at_unix_millis: u128,
+    pub state_published_at_unix_millis: Option<u128>,
     pub source_latency_nanos: Option<u64>,
     pub ingest_nanos: u64,
     pub queue_wait_nanos: u64,
+    pub state_mailbox_age_nanos: Option<u64>,
+    pub trigger_queue_wait_nanos: Option<u64>,
+    pub trigger_barrier_wait_nanos: Option<u64>,
     pub state_apply_nanos: u64,
+    pub route_eval_nanos: Option<u64>,
     pub select_nanos: Option<u64>,
     pub build_nanos: Option<u64>,
     pub sign_nanos: Option<u64>,
@@ -134,6 +142,7 @@ pub struct MonitorTradeEvent {
     pub route_id: String,
     pub route_kind: String,
     pub leg_count: usize,
+    pub trade_size: Option<u64>,
     pub submission_id: String,
     pub signature: String,
     pub submit_status: String,
@@ -157,6 +166,15 @@ pub struct MonitorTradeEvent {
     pub realized_pnl_quote_atoms: Option<i64>,
     pub jito_tip_lamports: Option<u64>,
     pub active_execution_buffer_bps: Option<u16>,
+    pub source_input_balance: Option<u64>,
+    pub oldest_snapshot_slot: Option<u64>,
+    pub quote_state_age_slots: Option<u64>,
+    pub leg_ticks_crossed: Vec<u32>,
+    pub leg_amount_modes: Vec<String>,
+    pub leg_specified_amounts: Vec<u64>,
+    pub leg_threshold_amounts: Vec<u64>,
+    pub submit_leader: Option<String>,
+    pub failure_bucket: Option<String>,
     pub failure_program_id: Option<String>,
     pub failure_instruction_index: Option<u8>,
     pub failure_custom_code: Option<u32>,
@@ -165,6 +183,7 @@ pub struct MonitorTradeEvent {
     pub quoted_slot: u64,
     pub blockhash_slot: Option<u64>,
     pub submitted_slot: Option<u64>,
+    pub terminal_slot: Option<u64>,
     pub submitted_at_unix_millis: u128,
     pub updated_at_unix_millis: u128,
     pub source_to_submit_nanos: Option<u64>,
@@ -184,6 +203,8 @@ pub struct MonitorEdgeOverview {
     pub included_count: u64,
     pub failed_count: u64,
     pub submit_rejected_count: u64,
+    pub too_little_output_fail_count: u64,
+    pub amount_in_above_maximum_fail_count: u64,
     pub expected_session_pnl_quote_atoms: i64,
     pub captured_expected_session_pnl_quote_atoms: i64,
     pub missed_expected_session_pnl_quote_atoms: i64,
@@ -206,6 +227,8 @@ pub struct MonitorEdgeRouteView {
     pub included_count: u64,
     pub failed_count: u64,
     pub submit_rejected_count: u64,
+    pub too_little_output_fail_count: u64,
+    pub amount_in_above_maximum_fail_count: u64,
     pub expected_pnl_quote_atoms: i64,
     pub captured_expected_pnl_quote_atoms: i64,
     pub missed_expected_pnl_quote_atoms: i64,
@@ -219,7 +242,10 @@ pub struct MonitorEdgeRouteView {
     pub last_selected_by: Option<String>,
     pub last_p_land_bps: Option<u16>,
     pub last_active_execution_buffer_bps: Option<u16>,
+    pub last_trade_size: Option<u64>,
+    pub last_quoted_slot: Option<u64>,
     pub last_submitted_slot: Option<u64>,
+    pub last_terminal_slot: Option<u64>,
     pub last_updated_at_unix_millis: Option<u128>,
 }
 
@@ -407,6 +433,8 @@ struct RouteEdgeAggregate {
     included_count: u64,
     failed_count: u64,
     submit_rejected_count: u64,
+    too_little_output_fail_count: u64,
+    amount_in_above_maximum_fail_count: u64,
     expected_pnl_quote_atoms: i128,
     captured_expected_pnl_quote_atoms: i128,
     missed_expected_pnl_quote_atoms: i128,
@@ -419,7 +447,10 @@ struct RouteEdgeAggregate {
     last_selected_by: Option<String>,
     last_p_land_bps: Option<u16>,
     last_active_execution_buffer_bps: Option<u16>,
+    last_trade_size: Option<u64>,
+    last_quoted_slot: Option<u64>,
     last_submitted_slot: Option<u64>,
+    last_terminal_slot: Option<u64>,
     last_updated_at_unix_millis: Option<u128>,
 }
 
@@ -452,6 +483,17 @@ impl RouteEdgeAggregate {
             if item.outcome == "submit_rejected" {
                 self.submit_rejected_count = self.submit_rejected_count.saturating_add(1);
             }
+            match item.failure_custom_code {
+                Some(6_036) | Some(6_022) => {
+                    self.too_little_output_fail_count =
+                        self.too_little_output_fail_count.saturating_add(1);
+                }
+                Some(6_037) => {
+                    self.amount_in_above_maximum_fail_count =
+                        self.amount_in_above_maximum_fail_count.saturating_add(1);
+                }
+                _ => {}
+            }
             if let Some(expected) = item.expected_pnl_quote_atoms {
                 self.missed_expected_pnl_quote_atoms += i128::from(expected);
             }
@@ -461,7 +503,10 @@ impl RouteEdgeAggregate {
         self.last_selected_by = Some(item.selected_by.clone());
         self.last_p_land_bps = item.p_land_bps;
         self.last_active_execution_buffer_bps = item.active_execution_buffer_bps;
+        self.last_trade_size = item.trade_size;
+        self.last_quoted_slot = Some(item.quoted_slot);
         self.last_submitted_slot = item.submitted_slot;
+        self.last_terminal_slot = item.terminal_slot;
         self.last_updated_at_unix_millis = Some(item.updated_at_unix_millis);
     }
 }
@@ -561,6 +606,7 @@ impl ObserverState {
             .and_then(|detail| detail.error_name.clone());
         existing.updated_at_unix_millis = unix_millis(record.last_updated_at);
         existing.submitted_slot = record.submitted_slot;
+        existing.terminal_slot = record.terminal_slot;
         existing.submit_to_terminal_nanos = duration_nanos(
             record
                 .last_updated_at
@@ -808,15 +854,22 @@ impl ObserverState {
         let seq = self.next_seq();
         self.signals.push_back(MonitorSignalSample {
             seq,
+            lane: event_lane_label(trace.lane).to_string(),
             source: source_label(&trace.source).to_string(),
             source_sequence: trace.source_sequence,
             observed_slot: trace.observed_slot,
             source_received_at_unix_millis: unix_millis(trace.source_received_at),
             normalized_at_unix_millis: unix_millis(trace.normalized_at),
+            router_received_at_unix_millis: unix_millis(trace.router_received_at),
+            state_published_at_unix_millis: trace.state_published_at.map(unix_millis),
             source_latency_nanos: duration_nanos_opt(trace.source_latency),
             ingest_nanos: duration_nanos(trace.ingest_duration).unwrap_or(0),
             queue_wait_nanos: duration_nanos(trace.queue_wait_duration).unwrap_or(0),
+            state_mailbox_age_nanos: duration_nanos_opt(trace.state_mailbox_age_duration),
+            trigger_queue_wait_nanos: duration_nanos_opt(trace.trigger_queue_wait_duration),
+            trigger_barrier_wait_nanos: duration_nanos_opt(trace.trigger_barrier_wait_duration),
             state_apply_nanos: duration_nanos(trace.state_apply_duration).unwrap_or(0),
+            route_eval_nanos: duration_nanos_opt(trace.route_eval_duration),
             select_nanos: duration_nanos_opt(trace.select_duration),
             build_nanos: duration_nanos_opt(trace.build_duration),
             sign_nanos: duration_nanos_opt(trace.sign_duration),
@@ -975,6 +1028,11 @@ impl ObserverState {
             .as_ref()
             .map(|candidate| candidate.expected_shortfall_quote_atoms);
         let shadow_candidate = report.selection.shadow_candidate.as_ref();
+        let best_candidate = report.selection.best_candidate.as_ref();
+        let envelope = report
+            .build_result
+            .as_ref()
+            .and_then(|build| build.envelope.as_ref());
         let source_to_submit_nanos = duration_nanos_opt(report.pipeline_trace.total_to_submit);
         let submit_to_terminal_nanos = matches!(record.outcome, ExecutionOutcome::Pending)
             .then_some(None)
@@ -982,32 +1040,19 @@ impl ObserverState {
         let entry = MonitorTradeEvent {
             seq: self.next_seq(),
             route_id: record.route_id.0.clone(),
-            route_kind: report
-                .selection
-                .best_candidate
-                .as_ref()
+            route_kind: best_candidate
                 .map(|candidate| route_kind_label(candidate.route_kind).into())
                 .unwrap_or_else(|| "unknown".into()),
-            leg_count: report
-                .selection
-                .best_candidate
-                .as_ref()
-                .map(|candidate| candidate.leg_count())
-                .unwrap_or_default(),
+            leg_count: best_candidate.map(|candidate| candidate.leg_count()).unwrap_or_default(),
+            trade_size: best_candidate.map(|candidate| candidate.trade_size),
             submission_id: record.submission_id.0.clone(),
             signature: record.chain_signature.clone(),
             submit_status: submit_status_label(record.submit_status).into(),
             outcome: outcome_label(&record.outcome).into(),
-            selected_by: report
-                .selection
-                .best_candidate
-                .as_ref()
+            selected_by: best_candidate
                 .map(|candidate| selection_source_label(candidate.selected_by).into())
                 .unwrap_or_else(|| "unknown".into()),
-            ranking_score_quote_atoms: report
-                .selection
-                .best_candidate
-                .as_ref()
+            ranking_score_quote_atoms: best_candidate
                 .map(|candidate| candidate.ranking_score_quote_atoms),
             expected_edge_quote_atoms: expected_edge,
             estimated_cost_lamports: estimated_cost,
@@ -1016,16 +1061,10 @@ impl ObserverState {
             expected_value_quote_atoms: expected_value,
             p_land_bps,
             expected_shortfall_quote_atoms,
-            intermediate_output_amounts: report
-                .selection
-                .best_candidate
-                .as_ref()
+            intermediate_output_amounts: best_candidate
                 .map(|candidate| candidate.intermediate_output_amounts.clone())
                 .unwrap_or_default(),
-            leg_snapshot_slots: report
-                .selection
-                .best_candidate
-                .as_ref()
+            leg_snapshot_slots: best_candidate
                 .map(|candidate| candidate.leg_snapshot_slots.as_slice().to_vec())
                 .unwrap_or_default(),
             shadow_selected_by: shadow_candidate
@@ -1038,16 +1077,55 @@ impl ObserverState {
             shadow_expected_pnl_quote_atoms: shadow_candidate
                 .map(|candidate| candidate.expected_net_profit_quote_atoms),
             realized_pnl_quote_atoms: record.realized_pnl_quote_atoms,
-            jito_tip_lamports: report
-                .build_result
-                .as_ref()
-                .and_then(|build| build.envelope.as_ref())
-                .map(|envelope| envelope.jito_tip_lamports),
-            active_execution_buffer_bps: report
-                .selection
-                .best_candidate
-                .as_ref()
+            jito_tip_lamports: envelope.map(|envelope| envelope.jito_tip_lamports),
+            active_execution_buffer_bps: best_candidate
                 .and_then(|candidate| candidate.active_execution_buffer_bps),
+            source_input_balance: best_candidate.and_then(|candidate| candidate.source_input_balance),
+            oldest_snapshot_slot: best_candidate.map(|candidate| candidate.oldest_relevant_snapshot_slot()),
+            quote_state_age_slots: best_candidate
+                .map(|candidate| candidate.quoted_slot.saturating_sub(candidate.oldest_relevant_snapshot_slot())),
+            leg_ticks_crossed: best_candidate
+                .map(|candidate| {
+                    candidate
+                        .leg_quotes
+                        .as_slice()
+                        .iter()
+                        .map(|leg| leg.ticks_crossed)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            leg_amount_modes: envelope
+                .map(|envelope| {
+                    envelope
+                        .leg_plans
+                        .as_slice()
+                        .iter()
+                        .map(|leg| swap_amount_mode_label(leg.amount_mode).to_string())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            leg_specified_amounts: envelope
+                .map(|envelope| {
+                    envelope
+                        .leg_plans
+                        .as_slice()
+                        .iter()
+                        .map(|leg| leg.specified_amount)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            leg_threshold_amounts: envelope
+                .map(|envelope| {
+                    envelope
+                        .leg_plans
+                        .as_slice()
+                        .iter()
+                        .map(|leg| leg.other_amount_threshold)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            submit_leader: report.submit_leader.clone(),
+            failure_bucket: failure_bucket(record),
             failure_program_id: record
                 .failure_detail
                 .as_ref()
@@ -1068,6 +1146,7 @@ impl ObserverState {
             quoted_slot: record.quoted_slot,
             blockhash_slot: record.blockhash_slot,
             submitted_slot: record.submitted_slot,
+            terminal_slot: record.terminal_slot,
             submitted_at_unix_millis: unix_millis(record.submitted_at),
             updated_at_unix_millis: unix_millis(record.last_updated_at),
             source_to_submit_nanos,
@@ -1366,6 +1445,8 @@ impl ObserverState {
         let mut included_count = 0u64;
         let mut failed_count = 0u64;
         let mut submit_rejected_count = 0u64;
+        let mut too_little_output_fail_count = 0u64;
+        let mut amount_in_above_maximum_fail_count = 0u64;
         let mut source_to_submit_nanos_total = 0u128;
         let mut source_to_submit_count = 0u64;
         let mut source_to_terminal_nanos_total = 0u128;
@@ -1390,6 +1471,17 @@ impl ObserverState {
                 failed_count = failed_count.saturating_add(1);
                 if item.outcome == "submit_rejected" {
                     submit_rejected_count = submit_rejected_count.saturating_add(1);
+                }
+                match item.failure_custom_code {
+                    Some(6_036) | Some(6_022) => {
+                        too_little_output_fail_count =
+                            too_little_output_fail_count.saturating_add(1);
+                    }
+                    Some(6_037) => {
+                        amount_in_above_maximum_fail_count =
+                            amount_in_above_maximum_fail_count.saturating_add(1);
+                    }
+                    _ => {}
                 }
             } else {
                 pending_count = pending_count.saturating_add(1);
@@ -1428,6 +1520,9 @@ impl ObserverState {
                     included_count: aggregate.included_count,
                     failed_count: aggregate.failed_count,
                     submit_rejected_count: aggregate.submit_rejected_count,
+                    too_little_output_fail_count: aggregate.too_little_output_fail_count,
+                    amount_in_above_maximum_fail_count: aggregate
+                        .amount_in_above_maximum_fail_count,
                     expected_pnl_quote_atoms: clamp_i128(aggregate.expected_pnl_quote_atoms),
                     captured_expected_pnl_quote_atoms: clamp_i128(
                         aggregate.captured_expected_pnl_quote_atoms,
@@ -1463,7 +1558,10 @@ impl ObserverState {
                     last_selected_by: aggregate.last_selected_by,
                     last_p_land_bps: aggregate.last_p_land_bps,
                     last_active_execution_buffer_bps: aggregate.last_active_execution_buffer_bps,
+                    last_trade_size: aggregate.last_trade_size,
+                    last_quoted_slot: aggregate.last_quoted_slot,
                     last_submitted_slot: aggregate.last_submitted_slot,
+                    last_terminal_slot: aggregate.last_terminal_slot,
                     last_updated_at_unix_millis: aggregate.last_updated_at_unix_millis,
                 }
             })
@@ -1559,6 +1657,8 @@ impl ObserverState {
                 included_count,
                 failed_count,
                 submit_rejected_count,
+                too_little_output_fail_count,
+                amount_in_above_maximum_fail_count,
                 expected_session_pnl_quote_atoms: clamp_i128(self.cumulative_expected_pnl),
                 captured_expected_session_pnl_quote_atoms: clamp_i128(
                     self.cumulative_captured_expected_pnl,
@@ -1718,6 +1818,7 @@ impl SharedObserverState {
 pub struct ObserverHandle {
     sender: Option<SyncSender<ObserverEvent>>,
     drop_count: Option<Arc<AtomicU64>>,
+    persistence: PersistenceHandle,
 }
 
 impl ObserverHandle {
@@ -1726,8 +1827,13 @@ impl ObserverHandle {
         bot_config: &BotConfig,
         route_health: SharedRouteHealth,
     ) -> std::io::Result<Self> {
+        let persistence = PersistenceHandle::spawn(&bot_config.runtime.persistence, bot_config)?;
         if !config.enabled {
-            return Ok(Self::default());
+            return Ok(Self {
+                sender: None,
+                drop_count: None,
+                persistence,
+            });
         }
 
         let pool_metadata = build_pool_metadata(bot_config);
@@ -1765,6 +1871,7 @@ impl ObserverHandle {
         Ok(Self {
             sender: Some(sender),
             drop_count: Some(drop_count),
+            persistence,
         })
     }
 
@@ -1773,11 +1880,17 @@ impl ObserverHandle {
     }
 
     pub fn publish_hot_path(&self, report: HotPathReport) {
-        self.try_send(ObserverEvent::HotPath(report));
+        if self.sender.is_some() {
+            self.try_send(ObserverEvent::HotPath(report.clone()));
+        }
+        self.persistence.publish_hot_path(report);
     }
 
     pub fn publish_trade_update(&self, record: ExecutionRecord) {
-        self.try_send(ObserverEvent::TradeUpdate(record));
+        if self.sender.is_some() {
+            self.try_send(ObserverEvent::TradeUpdate(record.clone()));
+        }
+        self.persistence.publish_trade_update(record);
     }
 
     pub(crate) fn publish_repair(&self, event: RepairEvent) {
@@ -1797,6 +1910,10 @@ impl ObserverHandle {
                 drop_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    pub(crate) fn flush_persistence(&self, timeout: Duration) -> bool {
+        self.persistence.flush(timeout)
     }
 }
 
@@ -1931,8 +2048,24 @@ fn summarize_metrics(samples: &[MonitorSignalSample]) -> BTreeMap<String, Monito
         summarize_u64(samples.iter().map(|sample| sample.queue_wait_nanos)),
     );
     metrics.insert(
+        "state_mailbox_age".into(),
+        summarize_optional(samples.iter().map(|sample| sample.state_mailbox_age_nanos)),
+    );
+    metrics.insert(
+        "trigger_queue_wait".into(),
+        summarize_optional(samples.iter().map(|sample| sample.trigger_queue_wait_nanos)),
+    );
+    metrics.insert(
+        "trigger_barrier_wait".into(),
+        summarize_optional(samples.iter().map(|sample| sample.trigger_barrier_wait_nanos)),
+    );
+    metrics.insert(
         "state_apply".into(),
         summarize_u64(samples.iter().map(|sample| sample.state_apply_nanos)),
+    );
+    metrics.insert(
+        "route_eval".into(),
+        summarize_optional(samples.iter().map(|sample| sample.route_eval_nanos)),
     );
     metrics.insert(
         "select".into(),
@@ -2125,10 +2258,25 @@ fn source_label(source: &detection::EventSourceKind) -> &'static str {
     }
 }
 
+fn event_lane_label(lane: detection::EventLane) -> &'static str {
+    match lane {
+        detection::EventLane::StateOnly => "state_only",
+        detection::EventLane::Trigger => "trigger",
+        detection::EventLane::Broadcast => "broadcast",
+    }
+}
+
 fn submit_status_label(status: submit::SubmitStatus) -> &'static str {
     match status {
         submit::SubmitStatus::Accepted => "accepted",
         submit::SubmitStatus::Rejected => "rejected",
+    }
+}
+
+fn swap_amount_mode_label(mode: SwapAmountMode) -> &'static str {
+    match mode {
+        SwapAmountMode::ExactIn => "exact_in",
+        SwapAmountMode::ExactOut => "exact_out",
     }
 }
 
@@ -2144,6 +2292,41 @@ fn outcome_label(outcome: &ExecutionOutcome) -> &'static str {
             "chain_amount_in_above_maximum"
         }
         ExecutionOutcome::Failed(_) => "failed",
+    }
+}
+
+fn failure_bucket(record: &ExecutionRecord) -> Option<String> {
+    match &record.outcome {
+        ExecutionOutcome::Pending | ExecutionOutcome::Included { .. } => None,
+        ExecutionOutcome::Failed(FailureClass::SubmitRejected) => Some("submit_rejected".into()),
+        ExecutionOutcome::Failed(FailureClass::TransportFailed) => Some("transport_failed".into()),
+        ExecutionOutcome::Failed(FailureClass::ChainDropped) => Some("chain_dropped".into()),
+        ExecutionOutcome::Failed(FailureClass::Expired) => Some("expired".into()),
+        ExecutionOutcome::Failed(FailureClass::ChainExecutionTooLittleOutput) => {
+            Some("amount_out_below_minimum".into())
+        }
+        ExecutionOutcome::Failed(FailureClass::ChainExecutionAmountInAboveMaximum) => {
+            Some("amount_in_above_maximum".into())
+        }
+        ExecutionOutcome::Failed(FailureClass::ChainExecutionFailed)
+        | ExecutionOutcome::Failed(FailureClass::Unknown) => {
+            let error_name = record
+                .failure_detail
+                .as_ref()
+                .and_then(|detail| detail.error_name.as_deref());
+            match error_name {
+                Some("BlockhashNotFound") => Some("blockhash_not_found".into()),
+                Some("MinimumContextSlotNotReached" | "MinimumContextSlot") => {
+                    Some("minimum_context_slot".into())
+                }
+                Some("AmountOutBelowMinimum" | "TooLittleOutputReceived") => {
+                    Some("amount_out_below_minimum".into())
+                }
+                Some("AmountInAboveMaximum") => Some("amount_in_above_maximum".into()),
+                Some(other) => Some(other.to_ascii_lowercase()),
+                None => Some("chain_execution_failed".into()),
+            }
+        }
     }
 }
 
@@ -2177,6 +2360,8 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::ProfitBelowThreshold { .. } => "profit_below_threshold",
         RejectionReason::TradeSizeBelowSizingFloor { .. } => "trade_size_below_sizing_floor",
         RejectionReason::TradeSizeTooLarge { .. } => "trade_size_too_large",
+        RejectionReason::SourceBalanceUnavailable { .. } => "source_balance_unavailable",
+        RejectionReason::SourceBalanceTooLow { .. } => "source_balance_too_low",
         RejectionReason::WalletNotReady => "wallet_not_ready",
         RejectionReason::WalletBalanceTooLow { .. } => "wallet_balance_too_low",
         RejectionReason::TooManyInflight { .. } => "too_many_inflight",
@@ -2228,6 +2413,16 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
         }
         RejectionReason::TradeSizeTooLarge { requested, maximum } => {
             format!("requested={requested}, maximum={maximum}")
+        }
+        RejectionReason::SourceBalanceUnavailable { account } => {
+            format!("account={account}")
+        }
+        RejectionReason::SourceBalanceTooLow {
+            account,
+            current,
+            minimum,
+        } => {
+            format!("account={account}, current={current}, minimum={minimum}")
         }
         RejectionReason::WalletBalanceTooLow { current, minimum } => {
             format!("current={current}, minimum={minimum}")
@@ -2419,9 +2614,14 @@ mod tests {
             p_land_bps: 9_000,
             expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: Some(25),
+            source_input_balance: None,
             expected_net_output: 10_125,
             minimum_acceptable_output: 10_075,
             expected_gross_profit_quote_atoms: expected_pnl_quote_atoms,
+            estimated_network_fee_lamports: 500,
+            estimated_network_fee_quote_atoms: 5,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
             estimated_execution_cost_lamports: 500,
             estimated_execution_cost_quote_atoms: 5,
             expected_net_profit_quote_atoms: expected_pnl_quote_atoms,
@@ -2435,6 +2635,7 @@ mod tests {
                     output_amount: 10_050,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 LegQuote {
                     venue: "raydium".into(),
@@ -2444,6 +2645,7 @@ mod tests {
                     output_amount: 10_125,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
             ]
             .into(),
@@ -2471,6 +2673,7 @@ mod tests {
             realized_pnl_quote_atoms: None,
             failure_detail: None,
             submitted_at: created_at,
+            terminal_slot: None,
             last_updated_at: created_at,
         }
     }
@@ -2490,15 +2693,22 @@ mod tests {
             execution_record: Some(record),
             submit_leader: None,
             pipeline_trace: PipelineTrace {
+                lane: detection::EventLane::Trigger,
                 source: EventSourceKind::ShredStream,
                 source_sequence: 7,
                 observed_slot: 42,
                 source_received_at: UNIX_EPOCH.checked_add(Duration::from_millis(1)).unwrap(),
                 normalized_at: UNIX_EPOCH.checked_add(Duration::from_millis(2)).unwrap(),
+                router_received_at: UNIX_EPOCH.checked_add(Duration::from_millis(2)).unwrap(),
+                state_published_at: None,
                 source_latency: Some(Duration::from_millis(1)),
                 ingest_duration: Duration::from_millis(1),
                 queue_wait_duration: Duration::from_millis(2),
+                state_mailbox_age_duration: None,
+                trigger_queue_wait_duration: None,
+                trigger_barrier_wait_duration: None,
                 state_apply_duration: Duration::from_micros(4),
+                route_eval_duration: None,
                 select_duration: Some(Duration::from_millis(1)),
                 build_duration: Some(Duration::from_millis(1)),
                 sign_duration: Some(Duration::from_millis(1)),
@@ -2560,15 +2770,22 @@ mod tests {
         state.next_seq = 1;
         state.signals.push_back(super::MonitorSignalSample {
             seq: 1,
+            lane: "trigger".into(),
             source: "synthetic".into(),
             source_sequence: 1,
             observed_slot: 1,
             source_received_at_unix_millis: 1,
             normalized_at_unix_millis: 1,
+            router_received_at_unix_millis: 1,
+            state_published_at_unix_millis: None,
             source_latency_nanos: None,
             ingest_nanos: 1,
             queue_wait_nanos: 1,
+            state_mailbox_age_nanos: None,
+            trigger_queue_wait_nanos: None,
+            trigger_barrier_wait_nanos: None,
             state_apply_nanos: 1,
+            route_eval_nanos: None,
             select_nanos: None,
             build_nanos: None,
             sign_nanos: None,
@@ -2577,15 +2794,22 @@ mod tests {
         });
         state.signals.push_back(super::MonitorSignalSample {
             seq: 2,
+            lane: "trigger".into(),
             source: "synthetic".into(),
             source_sequence: 2,
             observed_slot: 2,
             source_received_at_unix_millis: 2,
             normalized_at_unix_millis: 2,
+            router_received_at_unix_millis: 2,
+            state_published_at_unix_millis: None,
             source_latency_nanos: None,
             ingest_nanos: 2,
             queue_wait_nanos: 2,
+            state_mailbox_age_nanos: None,
+            trigger_queue_wait_nanos: None,
+            trigger_barrier_wait_nanos: None,
             state_apply_nanos: 2,
+            route_eval_nanos: None,
             select_nanos: None,
             build_nanos: None,
             sign_nanos: None,
@@ -2594,15 +2818,22 @@ mod tests {
         });
         state.signals.push_back(super::MonitorSignalSample {
             seq: 3,
+            lane: "trigger".into(),
             source: "synthetic".into(),
             source_sequence: 3,
             observed_slot: 3,
             source_received_at_unix_millis: 3,
             normalized_at_unix_millis: 3,
+            router_received_at_unix_millis: 3,
+            state_published_at_unix_millis: None,
             source_latency_nanos: None,
             ingest_nanos: 3,
             queue_wait_nanos: 3,
+            state_mailbox_age_nanos: None,
+            trigger_queue_wait_nanos: None,
+            trigger_barrier_wait_nanos: None,
             state_apply_nanos: 3,
+            route_eval_nanos: None,
             select_nanos: None,
             build_nanos: None,
             sign_nanos: None,
@@ -2647,6 +2878,7 @@ mod tests {
             realized_pnl_quote_atoms: None,
             failure_detail: None,
             submitted_at: created_at,
+            terminal_slot: None,
             last_updated_at: created_at,
         };
         let report = HotPathReport {
@@ -2663,15 +2895,22 @@ mod tests {
             execution_record: Some(record.clone()),
             submit_leader: None,
             pipeline_trace: PipelineTrace {
+                lane: detection::EventLane::Trigger,
                 source: EventSourceKind::ShredStream,
                 source_sequence: 7,
                 observed_slot: 42,
                 source_received_at: created_at,
                 normalized_at: created_at,
+                router_received_at: created_at,
+                state_published_at: None,
                 source_latency: Some(Duration::from_millis(2)),
                 ingest_duration: Duration::from_millis(1),
                 queue_wait_duration: Duration::from_millis(3),
+                state_mailbox_age_duration: None,
+                trigger_queue_wait_duration: None,
+                trigger_barrier_wait_duration: None,
                 state_apply_duration: Duration::from_micros(4),
+                route_eval_duration: None,
                 select_duration: None,
                 build_duration: None,
                 sign_duration: None,
@@ -2744,19 +2983,27 @@ mod tests {
                 realized_pnl_quote_atoms: None,
                 failure_detail: None,
                 submitted_at: created_at,
+                terminal_slot: None,
                 last_updated_at: created_at,
             }),
             submit_leader: None,
             pipeline_trace: PipelineTrace {
+                lane: detection::EventLane::Trigger,
                 source: EventSourceKind::ShredStream,
                 source_sequence: 7,
                 observed_slot: 42,
                 source_received_at: created_at,
                 normalized_at: created_at,
+                router_received_at: created_at,
+                state_published_at: None,
                 source_latency: Some(Duration::from_millis(2)),
                 ingest_duration: Duration::from_millis(1),
                 queue_wait_duration: Duration::from_millis(3),
+                state_mailbox_age_duration: None,
+                trigger_queue_wait_duration: None,
+                trigger_barrier_wait_duration: None,
                 state_apply_duration: Duration::from_micros(4),
+                route_eval_duration: None,
                 select_duration: None,
                 build_duration: None,
                 sign_duration: None,
@@ -2790,6 +3037,7 @@ mod tests {
             realized_pnl_quote_atoms: Some(-5),
             failure_detail: None,
             submitted_at: created_at,
+            terminal_slot: Some(44),
             last_updated_at: created_at.checked_add(Duration::from_secs(1)).unwrap(),
         });
 

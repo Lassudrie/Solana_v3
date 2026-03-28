@@ -17,6 +17,7 @@ pub struct LegQuote {
     pub output_amount: u64,
     pub fee_paid: u64,
     pub current_tick_index: Option<i32>,
+    pub ticks_crossed: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +90,39 @@ pub fn sol_lamports_to_quote_atoms(
     execution_cost_quote_atoms(route, sol_quote_conversion_snapshot, lamports)
 }
 
+pub fn quote_atoms_to_sol_lamports(
+    route: &RouteDefinition,
+    sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
+    quote_atoms: u64,
+) -> Result<u64, QuoteError> {
+    if quote_atoms == 0 {
+        return Ok(0);
+    }
+
+    if route.input_mint != route.output_mint {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    }
+    let quote_mint = route.input_mint.as_str();
+    if quote_mint == SOL_MINT {
+        return Ok(quote_atoms);
+    }
+
+    let Some(snapshot) = sol_quote_conversion_snapshot else {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    };
+    if snapshot.price_bps == 0 {
+        return Err(QuoteError::ExecutionCostNotConvertible);
+    }
+    if snapshot.token_mint_a == SOL_MINT && snapshot.token_mint_b == quote_mint {
+        return mul_div_u64(quote_atoms, 10_000, snapshot.price_bps);
+    }
+    if snapshot.token_mint_a == quote_mint && snapshot.token_mint_b == SOL_MINT {
+        return mul_div_u64(quote_atoms, snapshot.price_bps, 10_000);
+    }
+
+    Err(QuoteError::ExecutionCostNotConvertible)
+}
+
 #[derive(Debug, Error)]
 pub enum QuoteError {
     #[error("snapshot count does not match the configured route shape")]
@@ -131,6 +165,7 @@ pub struct ConcentratedSwapState {
     pub current_tick_index: i32,
     pub input_amount: u64,
     pub output_amount: u64,
+    pub ticks_crossed: u32,
 }
 
 pub trait QuoteEngine: Send + Sync {
@@ -185,6 +220,7 @@ impl QuoteEngine for LocalTwoLegQuoteEngine {
                 output_amount: priced.net_output,
                 fee_paid: priced.fee_paid,
                 current_tick_index: view.snapshot.current_tick_index,
+                ticks_crossed: priced.ticks_crossed,
             });
             next_input_amount = priced.net_output;
         }
@@ -263,6 +299,7 @@ struct PricedAmount {
     gross_output: u64,
     net_output: u64,
     fee_paid: u64,
+    ticks_crossed: u32,
 }
 
 fn apply_additional_leg_slippage(
@@ -284,6 +321,7 @@ fn apply_additional_leg_slippage(
 
     Ok(PricedAmount {
         net_output,
+        ticks_crossed: priced.ticks_crossed,
         ..priced
     })
 }
@@ -312,6 +350,7 @@ fn apply_price(
         gross_output,
         net_output,
         fee_paid,
+        ticks_crossed: 0,
     })
 }
 
@@ -357,6 +396,7 @@ fn apply_constant_product_price(
         gross_output,
         net_output,
         fee_paid: gross_output.saturating_sub(net_output),
+        ticks_crossed: 0,
     })
 }
 
@@ -439,6 +479,7 @@ fn apply_route_price(
         gross_output,
         net_output,
         fee_paid,
+        ticks_crossed: 0,
     })
 }
 
@@ -474,14 +515,15 @@ fn apply_concentrated_price(
         return Err(QuoteError::QuoteModelNotExecutable);
     }
 
-    let net_output = simulate_concentrated_exact_input(
-        snapshot,
+    let net_state = apply_concentrated_exact_input_update(
+        snapshot.venue.ok_or(QuoteError::InvalidSnapshotPrice)?,
         model,
         direction,
         a_to_b,
         input_amount,
         fee_bps,
     )?;
+    let net_output = net_state.output_amount;
     let gross_output = if fee_bps == 0 {
         net_output
     } else {
@@ -491,6 +533,7 @@ fn apply_concentrated_price(
         gross_output,
         net_output,
         fee_paid: gross_output.saturating_sub(net_output),
+        ticks_crossed: net_state.ticks_crossed,
     })
 }
 
@@ -515,6 +558,7 @@ pub fn apply_concentrated_exact_input_update(
             current_tick_index: model.current_tick_index,
             input_amount: 0,
             output_amount: 0,
+            ticks_crossed: 0,
         });
     }
 
@@ -523,6 +567,7 @@ pub fn apply_concentrated_exact_input_update(
     let mut sqrt_price = model.sqrt_price_x64;
     let mut liquidity = model.liquidity;
     let mut current_tick = model.current_tick_index;
+    let mut ticks_crossed = 0u32;
     let mut iterations = 0usize;
     let lower_bound_tick = direction
         .windows
@@ -567,6 +612,7 @@ pub fn apply_concentrated_exact_input_update(
             if sqrt_price == target_price {
                 liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
                 current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                ticks_crossed = ticks_crossed.saturating_add(1);
                 continue;
             }
         } else if sqrt_price == target_price {
@@ -628,6 +674,7 @@ pub fn apply_concentrated_exact_input_update(
                     error
                 })?;
                 current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                ticks_crossed = ticks_crossed.saturating_add(1);
                 continue;
             }
         }
@@ -665,6 +712,7 @@ pub fn apply_concentrated_exact_input_update(
         current_tick_index: current_tick,
         input_amount,
         output_amount: amount_out_total,
+        ticks_crossed,
     })
 }
 
@@ -689,6 +737,7 @@ pub fn apply_concentrated_exact_output_update(
             current_tick_index: model.current_tick_index,
             input_amount: 0,
             output_amount: 0,
+            ticks_crossed: 0,
         });
     }
 
@@ -697,6 +746,7 @@ pub fn apply_concentrated_exact_output_update(
     let mut sqrt_price = model.sqrt_price_x64;
     let mut liquidity = model.liquidity;
     let mut current_tick = model.current_tick_index;
+    let mut ticks_crossed = 0u32;
     let mut iterations = 0usize;
     let lower_bound_tick = direction
         .windows
@@ -741,6 +791,7 @@ pub fn apply_concentrated_exact_output_update(
             if sqrt_price == target_price {
                 liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b)?;
                 current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                ticks_crossed = ticks_crossed.saturating_add(1);
                 continue;
             }
         } else if sqrt_price == target_price {
@@ -803,6 +854,7 @@ pub fn apply_concentrated_exact_output_update(
                     error
                 })?;
                 current_tick = if a_to_b { tick.saturating_sub(1) } else { tick };
+                ticks_crossed = ticks_crossed.saturating_add(1);
                 continue;
             }
         }
@@ -840,6 +892,7 @@ pub fn apply_concentrated_exact_output_update(
         current_tick_index: current_tick,
         input_amount: amount_in_total,
         output_amount,
+        ticks_crossed,
     })
 }
 
@@ -1650,6 +1703,7 @@ mod tests {
             kind: RouteKind::TwoLeg,
             input_mint: quote_mint.into(),
             output_mint: quote_mint.into(),
+            input_source_account: None,
             base_mint: Some(base_mint.into()),
             quote_mint: Some(quote_mint.into()),
             sol_quote_conversion_pool_id: conversion_pool.map(|pool_id| PoolId(pool_id.into())),
@@ -1678,6 +1732,7 @@ mod tests {
             default_trade_size: 1,
             max_trade_size: 10,
             size_ladder: Vec::new(),
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 0,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
@@ -1696,6 +1751,7 @@ mod tests {
             kind: RouteKind::Triangular,
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            input_source_account: None,
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
             sol_quote_conversion_pool_id: Some(PoolId("pool-sol-usdc".into())),
@@ -1732,6 +1788,7 @@ mod tests {
             default_trade_size: 1_000,
             max_trade_size: 10_000,
             size_ladder: Vec::new(),
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 0,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
@@ -1763,6 +1820,7 @@ mod tests {
                     output_amount: 1_050,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 crate::quote::LegQuote {
                     venue: "venue-b".into(),
@@ -1772,6 +1830,7 @@ mod tests {
                     output_amount: 1_080,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
             ]
             .into(),

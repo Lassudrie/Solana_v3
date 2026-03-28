@@ -23,6 +23,10 @@ pub struct LatencyMetadata {
     pub source_received_at: SystemTime,
     pub normalized_at: SystemTime,
     pub source_latency: Option<std::time::Duration>,
+    pub router_received_at: SystemTime,
+    pub state_published_at: Option<SystemTime>,
+    pub trigger_blocked_at: Option<SystemTime>,
+    pub lane: EventLane,
 }
 
 impl LatencyMetadata {
@@ -40,6 +44,14 @@ pub struct AccountUpdate {
     pub data: Vec<u8>,
     pub slot: u64,
     pub write_version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventLane {
+    StateOnly,
+    Trigger,
+    Broadcast,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +247,7 @@ impl NormalizedEvent {
         payload: MarketEvent,
     ) -> Self {
         let now = SystemTime::now();
+        let lane = lane_for_payload(&payload);
         Self {
             payload,
             source: SourceMetadata {
@@ -246,7 +259,22 @@ impl NormalizedEvent {
                 source_received_at: now,
                 normalized_at: now,
                 source_latency: None,
+                router_received_at: now,
+                state_published_at: None,
+                trigger_blocked_at: None,
+                lane,
             },
         }
+    }
+}
+
+pub fn lane_for_payload(payload: &MarketEvent) -> EventLane {
+    match payload {
+        MarketEvent::AccountUpdate(_)
+        | MarketEvent::PoolSnapshotUpdate(_)
+        | MarketEvent::PoolQuoteModelUpdate(_)
+        | MarketEvent::PoolInvalidation(_) => EventLane::StateOnly,
+        MarketEvent::DestabilizingTransaction(_) => EventLane::Trigger,
+        MarketEvent::SlotBoundary(_) | MarketEvent::Heartbeat(_) => EventLane::Broadcast,
     }
 }

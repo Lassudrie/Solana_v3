@@ -8,6 +8,7 @@ license.workspace = true
 base64 = "0.22"
 bincode.workspace = true
 domain = { path = "../domain" }
+futures = "0.3"
 openssl = { version = "0.10", features = ["vendored"] }
 prost = "0.13"
 prost-types = "0.13"
@@ -16,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 solana-address-lookup-table-interface = { version = "2.2.2", features = ["bincode", "bytemuck"] }
 solana-entry-legacy = { package = "solana-entry", version = "=2.2.1" }
+solana-signature-legacy = { package = "solana-signature", version = "=2.2.1" }
 solana-message-legacy = { package = "solana-message", version = "=2.2.1" }
 solana-pubkey-legacy = { package = "solana-pubkey", version = "=2.2.1" }
 solana-sdk.workspace = true
@@ -25,6 +27,8 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.13", features = ["tls-webpki-roots"] }
+yellowstone-grpc-client = "12.2.0"
+yellowstone-grpc-proto = { version = "12.1.0", default-features = false, features = ["tonic", "tonic-compression"] }
 
 [build-dependencies]
 protobuf-src = "1"

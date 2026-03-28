@@ -6,17 +6,19 @@ use crate::{
     },
     quote::{
         LocalTwoLegQuoteEngine, PoolPricingView, QuoteEngine, QuoteError,
-        QuoteExecutionAdjustments, route_uses_sol_quote_conversion, sol_lamports_to_quote_atoms,
+        QuoteExecutionAdjustments, quote_atoms_to_sol_lamports, route_uses_sol_quote_conversion,
+        sol_lamports_to_quote_atoms,
     },
     reasons::RejectionReason,
     route_registry::{
-        RouteDefinition, RouteLegSequence, RouteRegistry, SizingMode, StrategySizingConfig,
-        SwapSide,
+        JitoTipMode, JitoTipPolicy, RouteDefinition, RouteLegSequence, RouteRegistry, SizingMode,
+        StrategySizingConfig, SwapSide,
     },
 };
 use domain::{ExecutionSnapshot, PoolSnapshot, RouteId};
 use state::StatePlane;
 use std::collections::{BTreeSet, HashMap};
+use std::thread;
 
 const DEFAULT_SIZE_LADDER: [u64; 6] =
     [250_000, 500_000, 1_000_000, 2_000_000, 3_000_000, 5_000_000];
@@ -26,6 +28,7 @@ const MAX_RESERVE_USAGE_BPS: u64 = 2_000;
 pub struct OpportunitySelector<E = LocalTwoLegQuoteEngine> {
     quote_engine: E,
     guards: GuardrailSet,
+    jito_tip_policy: JitoTipPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -34,14 +37,39 @@ struct RouteSelection {
     shadow_candidate: Option<OpportunityCandidate>,
 }
 
+#[derive(Debug, Default)]
+struct EvaluationBatch {
+    decisions: Vec<OpportunityDecision>,
+    live_candidates: Vec<OpportunityCandidate>,
+    shadow_candidates: Vec<OpportunityCandidate>,
+}
+
 impl<E> OpportunitySelector<E>
 where
     E: QuoteEngine,
 {
     pub fn new(quote_engine: E, guards: GuardrailSet) -> Self {
+        Self::with_jito_tip_policy(
+            quote_engine,
+            guards,
+            JitoTipPolicy {
+                mode: JitoTipMode::Fixed,
+                share_bps_of_expected_net_profit: 0,
+                min_lamports: 0,
+                max_lamports: 0,
+            },
+        )
+    }
+
+    pub fn with_jito_tip_policy(
+        quote_engine: E,
+        guards: GuardrailSet,
+        jito_tip_policy: JitoTipPolicy,
+    ) -> Self {
         Self {
             quote_engine,
             guards,
+            jito_tip_policy,
         }
     }
 
@@ -55,6 +83,7 @@ where
         sizing_config: &StrategySizingConfig,
         route_execution_buffers: &HashMap<RouteId, u16>,
         route_execution_sizing: &HashMap<RouteId, RouteExecutionSizingState>,
+        route_eval_worker_count: usize,
     ) -> SelectionOutcome {
         if impacted_routes.is_empty() {
             return SelectionOutcome {
@@ -69,13 +98,87 @@ where
             };
         }
 
+        let worker_count = route_eval_worker_count.max(1).min(impacted_routes.len());
+        let batches = if worker_count <= 1 {
+            vec![self.evaluate_chunk(
+                registry,
+                state,
+                execution_state,
+                impacted_routes,
+                inflight_submissions,
+                sizing_config,
+                route_execution_buffers,
+                route_execution_sizing,
+            )]
+        } else {
+            let chunk_size = impacted_routes.len().div_ceil(worker_count);
+            thread::scope(|scope| {
+                let mut handles = Vec::with_capacity(worker_count);
+                for routes in impacted_routes.chunks(chunk_size) {
+                    handles.push(scope.spawn(move || {
+                        self.evaluate_chunk(
+                            registry,
+                            state,
+                            execution_state,
+                            routes,
+                            inflight_submissions,
+                            sizing_config,
+                            route_execution_buffers,
+                            route_execution_sizing,
+                        )
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("route evaluation worker panicked"))
+                    .collect::<Vec<_>>()
+            })
+        };
+
         let mut decisions = Vec::with_capacity(impacted_routes.len());
         let mut live_candidates = Vec::new();
         let mut shadow_candidates = Vec::new();
+        for batch in batches {
+            decisions.extend(batch.decisions);
+            live_candidates.extend(batch.live_candidates);
+            shadow_candidates.extend(batch.shadow_candidates);
+        }
+
+        let mut best_candidate = None;
+        for candidate in live_candidates {
+            select_best_candidate(&mut best_candidate, candidate);
+        }
+        let mut shadow_candidate = None;
+        for candidate in shadow_candidates {
+            select_best_candidate(&mut shadow_candidate, candidate);
+        }
+
+        SelectionOutcome {
+            decisions,
+            best_candidate,
+            shadow_candidate,
+        }
+    }
+
+    fn evaluate_chunk(
+        &self,
+        registry: &RouteRegistry,
+        state: &StatePlane,
+        execution_state: &ExecutionSnapshot,
+        impacted_routes: &[RouteId],
+        inflight_submissions: usize,
+        sizing_config: &StrategySizingConfig,
+        route_execution_buffers: &HashMap<RouteId, u16>,
+        route_execution_sizing: &HashMap<RouteId, RouteExecutionSizingState>,
+    ) -> EvaluationBatch {
+        let mut batch = EvaluationBatch {
+            decisions: Vec::with_capacity(impacted_routes.len()),
+            ..EvaluationBatch::default()
+        };
 
         for route_id in impacted_routes {
             let Some(route) = registry.get(route_id) else {
-                decisions.push(OpportunityDecision::Rejected {
+                batch.decisions.push(OpportunityDecision::Rejected {
                     route_id: route_id.clone(),
                     route_kind: None,
                     leg_count: 0,
@@ -94,13 +197,15 @@ where
                 route_execution_sizing.get(route_id).copied(),
             ) {
                 Ok(selection) => {
-                    live_candidates.push(selection.live_candidate.clone());
+                    batch.live_candidates.push(selection.live_candidate.clone());
                     if let Some(candidate) = selection.shadow_candidate.clone() {
-                        shadow_candidates.push(candidate);
+                        batch.shadow_candidates.push(candidate);
                     }
-                    decisions.push(OpportunityDecision::Accepted(selection.live_candidate));
+                    batch
+                        .decisions
+                        .push(OpportunityDecision::Accepted(selection.live_candidate));
                 }
-                Err(reason) => decisions.push(OpportunityDecision::Rejected {
+                Err(reason) => batch.decisions.push(OpportunityDecision::Rejected {
                     route_id: route_id.clone(),
                     route_kind: Some(route.kind),
                     leg_count: route.leg_count(),
@@ -109,20 +214,7 @@ where
             }
         }
 
-        let mut best_candidate = None;
-        for candidate in live_candidates {
-            select_best_candidate(&mut best_candidate, candidate);
-        }
-        let mut shadow_candidate = None;
-        for candidate in shadow_candidates {
-            select_best_candidate(&mut shadow_candidate, candidate);
-        }
-
-        SelectionOutcome {
-            decisions,
-            best_candidate,
-            shadow_candidate,
-        }
+        batch
     }
 
     fn evaluate_route(
@@ -191,6 +283,9 @@ where
             expected_shortfall_bps: route.sizing.base_expected_shortfall_bps,
             max_trade_size: route.max_trade_size,
         });
+        let source_input_balance = source_input_balance(route, execution_state)?;
+        let effective_max_trade_size =
+            effective_max_trade_size(route, route_sizing_state.max_trade_size, source_input_balance);
         if sizing_config.fixed_trade_size {
             return self.evaluate_route_fixed_size(
                 route,
@@ -203,6 +298,8 @@ where
                 &pricing_views,
                 sol_quote_conversion_snapshot,
                 used_sol_quote_conversion_snapshot,
+                source_input_balance,
+                effective_max_trade_size,
                 route_sizing_state,
             );
         }
@@ -211,16 +308,26 @@ where
             let effective_min_trade_size =
                 effective_min_trade_size(route, sol_quote_conversion_snapshot)
                     .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
-            if effective_min_trade_size > route_sizing_state.max_trade_size.max(1) {
+            if effective_min_trade_size > effective_max_trade_size.max(1) {
+                if let (Some(account), Some(current)) = (
+                    route.input_source_account.as_ref(),
+                    source_input_balance,
+                ) {
+                    return Err(RejectionReason::SourceBalanceTooLow {
+                        account: account.clone(),
+                        current,
+                        minimum: effective_min_trade_size,
+                    });
+                }
                 return Err(RejectionReason::TradeSizeBelowSizingFloor {
-                    maximum: route_sizing_state.max_trade_size.max(1),
+                    maximum: effective_max_trade_size.max(1),
                     minimum: effective_min_trade_size,
                 });
             }
             trade_sizes(
                 route,
                 effective_min_trade_size,
-                route_sizing_state.max_trade_size,
+                effective_max_trade_size,
             )
         };
 
@@ -244,7 +351,8 @@ where
                     continue;
                 }
             };
-            let quote = quote
+            let network_quote = quote
+                .clone()
                 .with_estimated_execution_cost(
                     route,
                     sol_quote_conversion_snapshot,
@@ -255,63 +363,92 @@ where
                 })?;
 
             let reserve_usage_bps =
-                reserve_usage_bps(route, &leg_snapshots, &quote).unwrap_or_default();
+                reserve_usage_bps(route, &leg_snapshots, &network_quote).unwrap_or_default();
+            let p_land_bps = effective_landing_rate_bps(
+                sizing_config,
+                execution_state,
+                inflight_submissions,
+                route_sizing_state.landing_rate_bps,
+                &network_quote,
+            );
+            let expected_shortfall_quote_atoms = expected_shortfall_quote_atoms(
+                route,
+                &network_quote,
+                route_sizing_state.expected_shortfall_bps,
+                active_execution_buffer_bps.unwrap_or_default(),
+            );
+            let execution_risk_penalty_quote_atoms = reserve_usage_penalty_quote_atoms(
+                sizing_config,
+                reserve_usage_bps,
+                network_quote.expected_gross_profit_quote_atoms,
+            );
+            let pre_tip_expected_value_quote_atoms = expected_value_quote_atoms(
+                p_land_bps,
+                network_quote.expected_gross_profit_quote_atoms,
+                network_quote.estimated_execution_cost_quote_atoms,
+                expected_shortfall_quote_atoms,
+                execution_risk_penalty_quote_atoms,
+            );
+            let quote = apply_jito_tip_policy(
+                route,
+                quote,
+                sol_quote_conversion_snapshot,
+                self.jito_tip_policy,
+                tip_basis_quote_atoms(
+                    self.jito_tip_policy.mode,
+                    network_quote.expected_net_profit_quote_atoms,
+                    pre_tip_expected_value_quote_atoms,
+                ),
+            )
+            .map_err(|error| RejectionReason::ExecutionCostNotConvertible {
+                detail: error.to_string(),
+            })?;
 
-            match self
-                .guards
-                .evaluate_quote(route, &quote, execution_state, inflight_submissions)
-            {
+            match self.guards.evaluate_quote(
+                route,
+                &quote.quote,
+                execution_state,
+                inflight_submissions,
+            ) {
                 Ok(()) => {
-                    let p_land_bps = effective_landing_rate_bps(
-                        sizing_config,
-                        execution_state,
-                        inflight_submissions,
-                        route_sizing_state.landing_rate_bps,
-                    );
-                    let expected_shortfall_quote_atoms = expected_shortfall_quote_atoms(
-                        route,
-                        &quote,
-                        route_sizing_state.expected_shortfall_bps,
-                        active_execution_buffer_bps.unwrap_or_default(),
-                    );
-                    let execution_risk_penalty_quote_atoms = reserve_usage_penalty_quote_atoms(
-                        sizing_config,
-                        reserve_usage_bps,
-                        quote.expected_gross_profit_quote_atoms,
-                    );
                     let expected_value_quote_atoms = expected_value_quote_atoms(
                         p_land_bps,
-                        quote.expected_gross_profit_quote_atoms,
-                        quote.estimated_execution_cost_quote_atoms,
+                        quote.quote.expected_gross_profit_quote_atoms,
+                        quote.quote.estimated_execution_cost_quote_atoms,
                         expected_shortfall_quote_atoms,
                         execution_risk_penalty_quote_atoms,
                     );
                     let shared_fields = CandidateSharedFields {
                         route,
-                        quote: &quote,
+                        quote: &quote.quote,
                         leg_snapshot_slots: leg_snapshot_slots(&leg_snapshots),
                         sol_quote_conversion_snapshot_slot: used_sol_quote_conversion_snapshot
                             .map(|snapshot| snapshot.last_update_slot),
                         active_execution_buffer_bps,
+                        source_input_balance,
                         minimum_acceptable_output: self.guards.minimum_acceptable_output(
                             route,
-                            quote.input_amount,
-                            quote.estimated_execution_cost_quote_atoms,
+                            quote.quote.input_amount,
+                            quote.quote.estimated_execution_cost_quote_atoms,
                         ),
                         p_land_bps,
                         expected_shortfall_quote_atoms,
                         expected_value_quote_atoms,
+                        estimated_network_fee_lamports: quote.estimated_network_fee_lamports,
+                        estimated_network_fee_quote_atoms: quote.estimated_network_fee_quote_atoms,
+                        jito_tip_lamports: quote.jito_tip_lamports,
+                        jito_tip_quote_atoms: quote.jito_tip_quote_atoms,
                     };
                     let legacy_candidate = build_candidate(
                         shared_fields.clone(),
                         CandidateSelectionSource::Legacy,
-                        quote.expected_net_profit_quote_atoms,
+                        quote.quote.expected_net_profit_quote_atoms,
                     );
                     select_best_candidate(&mut best_legacy_candidate, legacy_candidate);
 
                     let minimum_profit = self
                         .guards
-                        .minimum_profit_quote_atoms_for_route(route, quote.input_amount);
+                        .minimum_profit_quote_atoms_for_route(route, quote.quote.input_amount);
                     if expected_value_quote_atoms >= minimum_profit {
                         let ev_candidate = build_candidate(
                             shared_fields.clone(),
@@ -365,12 +502,31 @@ where
         pricing_views: &[PoolPricingView<'_>],
         sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
         used_sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
+        source_input_balance: Option<u64>,
+        effective_max_trade_size: u64,
         route_sizing_state: RouteExecutionSizingState,
     ) -> Result<RouteSelection, RejectionReason> {
+        let effective_min_trade_size = effective_min_trade_size(route, sol_quote_conversion_snapshot)
+            .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
+        if effective_min_trade_size > effective_max_trade_size.max(1) {
+            if let (Some(account), Some(current)) =
+                (route.input_source_account.as_ref(), source_input_balance)
+            {
+                return Err(RejectionReason::SourceBalanceTooLow {
+                    account: account.clone(),
+                    current,
+                    minimum: effective_min_trade_size,
+                });
+            }
+            return Err(RejectionReason::TradeSizeBelowSizingFloor {
+                maximum: effective_max_trade_size.max(1),
+                minimum: effective_min_trade_size,
+            });
+        }
         let trade_sizes = fixed_trade_sizes(
             route,
             sol_quote_conversion_snapshot,
-            route_sizing_state.max_trade_size,
+            effective_max_trade_size,
         )
         .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
         let adjustments = route_quote_adjustments(route, active_execution_buffer_bps);
@@ -398,7 +554,8 @@ where
                     continue;
                 }
             };
-            let quote = quote
+            let network_quote = quote
+                .clone()
                 .with_estimated_execution_cost(
                     route,
                     sol_quote_conversion_snapshot,
@@ -407,14 +564,54 @@ where
                 .map_err(|error| RejectionReason::ExecutionCostNotConvertible {
                     detail: error.to_string(),
                 })?;
-
             let reserve_usage_bps =
-                reserve_usage_bps(route, leg_snapshots, &quote).unwrap_or_default();
+                reserve_usage_bps(route, leg_snapshots, &network_quote).unwrap_or_default();
+            let p_land_bps = effective_landing_rate_bps(
+                sizing_config,
+                execution_state,
+                inflight_submissions,
+                route_sizing_state.landing_rate_bps,
+                &network_quote,
+            );
+            let expected_shortfall_quote_atoms = expected_shortfall_quote_atoms(
+                route,
+                &network_quote,
+                route_sizing_state.expected_shortfall_bps,
+                active_execution_buffer_bps.unwrap_or_default(),
+            );
+            let execution_risk_penalty_quote_atoms = reserve_usage_penalty_quote_atoms(
+                sizing_config,
+                reserve_usage_bps,
+                network_quote.expected_gross_profit_quote_atoms,
+            );
+            let pre_tip_expected_value_quote_atoms = expected_value_quote_atoms(
+                p_land_bps,
+                network_quote.expected_gross_profit_quote_atoms,
+                network_quote.estimated_execution_cost_quote_atoms,
+                expected_shortfall_quote_atoms,
+                execution_risk_penalty_quote_atoms,
+            );
+            let quote = apply_jito_tip_policy(
+                route,
+                quote,
+                sol_quote_conversion_snapshot,
+                self.jito_tip_policy,
+                tip_basis_quote_atoms(
+                    self.jito_tip_policy.mode,
+                    network_quote.expected_net_profit_quote_atoms,
+                    pre_tip_expected_value_quote_atoms,
+                ),
+            )
+            .map_err(|error| RejectionReason::ExecutionCostNotConvertible {
+                detail: error.to_string(),
+            })?;
 
-            match self
-                .guards
-                .evaluate_quote(route, &quote, execution_state, inflight_submissions)
-            {
+            match self.guards.evaluate_quote(
+                route,
+                &quote.quote,
+                execution_state,
+                inflight_submissions,
+            ) {
                 Ok(()) => {}
                 Err(reason) => {
                     last_rejection = Some(reason);
@@ -422,56 +619,44 @@ where
                 }
             }
 
-            let p_land_bps = effective_landing_rate_bps(
-                sizing_config,
-                execution_state,
-                inflight_submissions,
-                route_sizing_state.landing_rate_bps,
-            );
-            let expected_shortfall_quote_atoms = expected_shortfall_quote_atoms(
-                route,
-                &quote,
-                route_sizing_state.expected_shortfall_bps,
-                active_execution_buffer_bps.unwrap_or_default(),
-            );
-            let execution_risk_penalty_quote_atoms = reserve_usage_penalty_quote_atoms(
-                sizing_config,
-                reserve_usage_bps,
-                quote.expected_gross_profit_quote_atoms,
-            );
             let expected_value_quote_atoms = expected_value_quote_atoms(
                 p_land_bps,
-                quote.expected_gross_profit_quote_atoms,
-                quote.estimated_execution_cost_quote_atoms,
+                quote.quote.expected_gross_profit_quote_atoms,
+                quote.quote.estimated_execution_cost_quote_atoms,
                 expected_shortfall_quote_atoms,
                 execution_risk_penalty_quote_atoms,
             );
             let shared_fields = CandidateSharedFields {
                 route,
-                quote: &quote,
+                quote: &quote.quote,
                 leg_snapshot_slots: leg_snapshot_slots(leg_snapshots),
                 sol_quote_conversion_snapshot_slot: used_sol_quote_conversion_snapshot
                     .map(|snapshot| snapshot.last_update_slot),
                 active_execution_buffer_bps,
+                source_input_balance,
                 minimum_acceptable_output: self.guards.minimum_acceptable_output(
                     route,
-                    quote.input_amount,
-                    quote.estimated_execution_cost_quote_atoms,
+                    quote.quote.input_amount,
+                    quote.quote.estimated_execution_cost_quote_atoms,
                 ),
                 p_land_bps,
                 expected_shortfall_quote_atoms,
                 expected_value_quote_atoms,
+                estimated_network_fee_lamports: quote.estimated_network_fee_lamports,
+                estimated_network_fee_quote_atoms: quote.estimated_network_fee_quote_atoms,
+                jito_tip_lamports: quote.jito_tip_lamports,
+                jito_tip_quote_atoms: quote.jito_tip_quote_atoms,
             };
             let live_candidate = match route.sizing.mode {
                 SizingMode::Legacy | SizingMode::EvShadow => build_candidate(
                     shared_fields.clone(),
                     CandidateSelectionSource::Legacy,
-                    quote.expected_net_profit_quote_atoms,
+                    quote.quote.expected_net_profit_quote_atoms,
                 ),
                 SizingMode::EvLive => {
                     let minimum_profit = self
                         .guards
-                        .minimum_profit_quote_atoms_for_route(route, quote.input_amount);
+                        .minimum_profit_quote_atoms_for_route(route, quote.quote.input_amount);
                     if expected_value_quote_atoms < minimum_profit {
                         last_rejection = Some(RejectionReason::ProfitBelowThreshold {
                             expected: expected_value_quote_atoms,
@@ -491,7 +676,7 @@ where
                 SizingMode::EvShadow => {
                     let minimum_profit = self
                         .guards
-                        .minimum_profit_quote_atoms_for_route(route, quote.input_amount);
+                        .minimum_profit_quote_atoms_for_route(route, quote.quote.input_amount);
                     if expected_value_quote_atoms >= minimum_profit {
                         Some(build_candidate(
                             shared_fields.clone(),
@@ -505,7 +690,7 @@ where
                 SizingMode::EvLive => Some(build_candidate(
                     shared_fields,
                     CandidateSelectionSource::Legacy,
-                    quote.expected_net_profit_quote_atoms,
+                    quote.quote.expected_net_profit_quote_atoms,
                 )),
             };
             return Ok(RouteSelection {
@@ -679,6 +864,33 @@ fn prioritize_trade_sizes(mut sizes: Vec<u64>, default_trade_size: u64) -> Vec<u
     ordered
 }
 
+fn source_input_balance(
+    route: &RouteDefinition,
+    execution_state: &ExecutionSnapshot,
+) -> Result<Option<u64>, RejectionReason> {
+    let Some(account) = route.input_source_account.as_ref() else {
+        return Ok(None);
+    };
+    let Some(balance) = execution_state.source_token_balances.get(account).copied() else {
+        return Err(RejectionReason::SourceBalanceUnavailable {
+            account: account.clone(),
+        });
+    };
+    Ok(Some(balance))
+}
+
+fn effective_max_trade_size(
+    route: &RouteDefinition,
+    route_sizing_max_trade_size: u64,
+    source_input_balance: Option<u64>,
+) -> u64 {
+    let mut maximum = route.max_trade_size.min(route_sizing_max_trade_size);
+    if let Some(balance) = source_input_balance {
+        maximum = maximum.min(balance);
+    }
+    maximum
+}
+
 fn reserve_usage_bps(
     route: &RouteDefinition,
     snapshots: &[&PoolSnapshot],
@@ -707,6 +919,7 @@ fn effective_landing_rate_bps(
     execution_state: &ExecutionSnapshot,
     inflight_submissions: usize,
     route_landing_rate_bps: u16,
+    quote: &crate::quote::RouteQuote,
 ) -> u16 {
     let inflight_penalty_bps = u16::try_from(inflight_submissions)
         .unwrap_or(u16::MAX)
@@ -719,9 +932,27 @@ fn effective_landing_rate_bps(
     let blockhash_penalty_bps = blockhash_penalty_bps
         .saturating_mul(sizing_config.blockhash_penalty_bps_per_slot)
         .min(sizing_config.max_blockhash_penalty_bps);
+    let quote_age_slots = execution_state.head_slot.saturating_sub(quote.quoted_slot);
+    let quote_age_penalty_bps = quote_age_slots
+        .min(u64::from(u16::MAX)) as u16;
+    let quote_age_penalty_bps = quote_age_penalty_bps
+        .saturating_mul(sizing_config.quote_age_penalty_bps_per_slot)
+        .min(sizing_config.max_quote_age_penalty_bps);
+    let max_ticks_crossed = quote
+        .leg_quotes
+        .iter()
+        .map(|leg| leg.ticks_crossed)
+        .max()
+        .unwrap_or_default()
+        .min(u32::from(u16::MAX)) as u16;
+    let tick_cross_penalty_bps = max_ticks_crossed
+        .saturating_mul(sizing_config.tick_cross_penalty_bps_per_tick)
+        .min(sizing_config.max_tick_cross_penalty_bps);
     route_landing_rate_bps
         .saturating_sub(inflight_penalty_bps)
         .saturating_sub(blockhash_penalty_bps)
+        .saturating_sub(quote_age_penalty_bps)
+        .saturating_sub(tick_cross_penalty_bps)
 }
 
 fn expected_shortfall_quote_atoms(
@@ -769,6 +1000,14 @@ fn expected_value_quote_atoms(
         .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
+struct TipAdjustedQuote {
+    quote: crate::quote::RouteQuote,
+    estimated_network_fee_lamports: u64,
+    estimated_network_fee_quote_atoms: u64,
+    jito_tip_lamports: u64,
+    jito_tip_quote_atoms: u64,
+}
+
 #[derive(Clone)]
 struct CandidateSharedFields<'a> {
     route: &'a RouteDefinition,
@@ -776,10 +1015,15 @@ struct CandidateSharedFields<'a> {
     leg_snapshot_slots: RouteLegSequence<u64>,
     sol_quote_conversion_snapshot_slot: Option<u64>,
     active_execution_buffer_bps: Option<u16>,
+    source_input_balance: Option<u64>,
     minimum_acceptable_output: u64,
     p_land_bps: u16,
     expected_shortfall_quote_atoms: u64,
     expected_value_quote_atoms: i64,
+    estimated_network_fee_lamports: u64,
+    estimated_network_fee_quote_atoms: u64,
+    jito_tip_lamports: u64,
+    jito_tip_quote_atoms: u64,
 }
 
 fn build_candidate(
@@ -804,9 +1048,14 @@ fn build_candidate(
             .execution_protection
             .as_ref()
             .map(|_| shared.active_execution_buffer_bps.unwrap_or(0)),
+        source_input_balance: shared.source_input_balance,
         expected_net_output: shared.quote.net_output_amount,
         minimum_acceptable_output: shared.minimum_acceptable_output,
         expected_gross_profit_quote_atoms: shared.quote.expected_gross_profit_quote_atoms,
+        estimated_network_fee_lamports: shared.estimated_network_fee_lamports,
+        estimated_network_fee_quote_atoms: shared.estimated_network_fee_quote_atoms,
+        jito_tip_lamports: shared.jito_tip_lamports,
+        jito_tip_quote_atoms: shared.jito_tip_quote_atoms,
         estimated_execution_cost_lamports: shared.quote.estimated_execution_cost_lamports,
         estimated_execution_cost_quote_atoms: shared.quote.estimated_execution_cost_quote_atoms,
         expected_net_profit_quote_atoms: shared.quote.expected_net_profit_quote_atoms,
@@ -819,6 +1068,81 @@ fn build_candidate(
             .map(|leg| leg.output_amount)
             .collect(),
         leg_quotes: shared.quote.leg_quotes.clone(),
+    }
+}
+
+fn apply_jito_tip_policy(
+    route: &RouteDefinition,
+    quote: crate::quote::RouteQuote,
+    sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
+    jito_tip_policy: JitoTipPolicy,
+    tip_basis_quote_atoms: i64,
+) -> Result<TipAdjustedQuote, QuoteError> {
+    let network_quote = quote.clone().with_estimated_execution_cost(
+        route,
+        sol_quote_conversion_snapshot,
+        route.estimated_execution_cost_lamports,
+    )?;
+    let jito_tip_lamports = compute_jito_tip_lamports(
+        route,
+        sol_quote_conversion_snapshot,
+        &network_quote,
+        jito_tip_policy,
+        tip_basis_quote_atoms,
+    )?;
+    let quote = quote.with_estimated_execution_cost(
+        route,
+        sol_quote_conversion_snapshot,
+        route
+            .estimated_execution_cost_lamports
+            .saturating_add(jito_tip_lamports),
+    )?;
+    Ok(TipAdjustedQuote {
+        estimated_network_fee_lamports: network_quote.estimated_execution_cost_lamports,
+        estimated_network_fee_quote_atoms: network_quote.estimated_execution_cost_quote_atoms,
+        jito_tip_lamports,
+        jito_tip_quote_atoms: quote
+            .estimated_execution_cost_quote_atoms
+            .saturating_sub(network_quote.estimated_execution_cost_quote_atoms),
+        quote,
+    })
+}
+
+fn compute_jito_tip_lamports(
+    route: &RouteDefinition,
+    sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
+    _network_quote: &crate::quote::RouteQuote,
+    jito_tip_policy: JitoTipPolicy,
+    tip_basis_quote_atoms: i64,
+) -> Result<u64, QuoteError> {
+    match jito_tip_policy.mode {
+        JitoTipMode::Fixed => Ok(route.default_jito_tip_lamports),
+        JitoTipMode::PnlRatio | JitoTipMode::RiskAdjustedPnlRatio => {
+            let tip_basis_quote_atoms = u64::try_from(tip_basis_quote_atoms.max(0)).unwrap_or(0);
+            let raw_tip_quote_atoms = ((u128::from(tip_basis_quote_atoms)
+                * u128::from(jito_tip_policy.share_bps_of_expected_net_profit))
+                / 10_000u128) as u64;
+            let raw_tip_lamports = quote_atoms_to_sol_lamports(
+                route,
+                sol_quote_conversion_snapshot,
+                raw_tip_quote_atoms,
+            )?;
+            let min_lamports = jito_tip_policy.min_lamports;
+            let max_lamports = jito_tip_policy.max_lamports.max(min_lamports);
+            Ok(raw_tip_lamports.clamp(min_lamports, max_lamports))
+        }
+    }
+}
+
+fn tip_basis_quote_atoms(
+    mode: JitoTipMode,
+    expected_net_profit_quote_atoms: i64,
+    expected_value_quote_atoms: i64,
+) -> i64 {
+    match mode {
+        JitoTipMode::Fixed => 0,
+        JitoTipMode::PnlRatio => expected_net_profit_quote_atoms,
+        JitoTipMode::RiskAdjustedPnlRatio => expected_value_quote_atoms,
     }
 }
 
@@ -892,8 +1216,9 @@ mod tests {
         },
         reasons::RejectionReason,
         route_registry::{
-            ExecutionProtectionPolicy, RouteDefinition, RouteKind, RouteLeg, RouteLegSequence,
-            RouteSizingPolicy, SizingMode, StrategySizingConfig, SwapSide,
+            ExecutionProtectionPolicy, JitoTipMode, JitoTipPolicy, RouteDefinition, RouteKind,
+            RouteLeg, RouteLegSequence, RouteSizingPolicy, SizingMode, StrategySizingConfig,
+            SwapSide,
         },
     };
     use domain::{
@@ -919,6 +1244,10 @@ mod tests {
             max_inflight_penalty_bps: 1_500,
             blockhash_penalty_bps_per_slot: 10,
             max_blockhash_penalty_bps: 1_000,
+            quote_age_penalty_bps_per_slot: 15,
+            max_quote_age_penalty_bps: 750,
+            tick_cross_penalty_bps_per_tick: 20,
+            max_tick_cross_penalty_bps: 1_000,
             max_reserve_usage_penalty_bps: 1_250,
         }
     }
@@ -971,6 +1300,7 @@ mod tests {
                     output_amount,
                     fee_paid: 0,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 });
                 next_leg_input = output_amount;
             }
@@ -1039,6 +1369,7 @@ mod tests {
                             output_amount,
                             fee_paid: 0,
                             current_tick_index: None,
+                            ticks_crossed: 0,
                         });
                         next_leg_input = output_amount;
                     }
@@ -1066,6 +1397,7 @@ mod tests {
             route_id: RouteId("route-a".into()),
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            input_source_account: None,
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
             min_profit_quote_atoms: None,
@@ -1094,6 +1426,7 @@ mod tests {
             default_trade_size: 1_000_000,
             max_trade_size: 5_000_000,
             size_ladder: Vec::new(),
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 0,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
@@ -1112,6 +1445,7 @@ mod tests {
             route_id: RouteId("route-tri".into()),
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            input_source_account: None,
             base_mint: Some("SOL".into()),
             quote_mint: Some("USDC".into()),
             min_profit_quote_atoms: None,
@@ -1148,6 +1482,7 @@ mod tests {
             default_trade_size: 1_000_000,
             max_trade_size: 5_000_000,
             size_ladder: Vec::new(),
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 0,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
@@ -1224,6 +1559,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1273,6 +1609,167 @@ mod tests {
     }
 
     #[test]
+    fn selector_applies_pnl_ratio_tip_to_selected_candidate() {
+        let mut route = route_definition();
+        route.base_mint = Some(SOL_MINT.into());
+        route.legs.as_mut_slice()[0].output_mint = SOL_MINT.into();
+        route.legs.as_mut_slice()[1].input_mint = SOL_MINT.into();
+        let execution_state = ExecutionStateSnapshot {
+            head_slot: 10,
+            rpc_slot: Some(10),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(10),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        };
+        let selector = OpportunitySelector::with_jito_tip_policy(
+            MockQuoteEngine,
+            GuardrailSet::new(GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: false,
+                ..GuardrailConfig::default()
+            }),
+            JitoTipPolicy {
+                mode: JitoTipMode::PnlRatio,
+                share_bps_of_expected_net_profit: 2_000,
+                min_lamports: 1,
+                max_lamports: 10,
+            },
+        );
+        let mut state = StatePlane::new(2);
+
+        for pool_id in ["pool-a", "pool-b"] {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    1,
+                    10,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.into(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 10_000_000,
+                        reserve_a: Some(10_000_000),
+                        reserve_b: Some(10_000_000),
+                        active_liquidity: Some(10_000_000),
+                        sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: SOL_MINT.into(),
+                        token_mint_b: "USDC".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot: 10,
+                        write_version: 1,
+                    },
+                ))
+                .expect("snapshot update should apply");
+        }
+
+        let candidate = selector
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
+            .expect("candidate should remain profitable with pnl-ratio tip");
+        assert_eq!(candidate.live_candidate.trade_size, 250_000);
+        assert_eq!(candidate.live_candidate.estimated_network_fee_lamports, 0);
+        assert_eq!(candidate.live_candidate.jito_tip_lamports, 5);
+        assert_eq!(candidate.live_candidate.jito_tip_quote_atoms, 5);
+        assert_eq!(candidate.live_candidate.expected_net_profit_quote_atoms, 20);
+    }
+
+    #[test]
+    fn selector_rejects_route_when_minimum_tip_makes_trade_unprofitable() {
+        let mut route = route_definition();
+        route.base_mint = Some(SOL_MINT.into());
+        route.legs.as_mut_slice()[0].output_mint = SOL_MINT.into();
+        route.legs.as_mut_slice()[1].input_mint = SOL_MINT.into();
+        let execution_state = ExecutionStateSnapshot {
+            head_slot: 10,
+            rpc_slot: Some(10),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(10),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        };
+        let selector = OpportunitySelector::with_jito_tip_policy(
+            MockQuoteEngine,
+            GuardrailSet::new(GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: false,
+                ..GuardrailConfig::default()
+            }),
+            JitoTipPolicy {
+                mode: JitoTipMode::PnlRatio,
+                share_bps_of_expected_net_profit: 0,
+                min_lamports: 30,
+                max_lamports: 30,
+            },
+        );
+        let mut state = StatePlane::new(2);
+
+        for pool_id in ["pool-a", "pool-b"] {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    1,
+                    10,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.into(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 10_000_000,
+                        reserve_a: Some(10_000_000),
+                        reserve_b: Some(10_000_000),
+                        active_liquidity: Some(10_000_000),
+                        sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: SOL_MINT.into(),
+                        token_mint_b: "USDC".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot: 10,
+                        write_version: 1,
+                    },
+                ))
+                .expect("snapshot update should apply");
+        }
+
+        let rejection = selector
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
+            .expect_err("minimum tip should reject all profitable sizes");
+        assert!(matches!(
+            rejection,
+            RejectionReason::ProfitBelowThreshold { minimum: 10, .. }
+        ));
+    }
+
+    #[test]
     fn selector_fixed_trade_size_falls_back_when_target_exceeds_concentrated_window() {
         let route = route_definition();
         let execution_state = ExecutionStateSnapshot {
@@ -1283,6 +1780,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1347,6 +1845,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1422,6 +1921,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1486,6 +1986,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1562,6 +2063,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1634,6 +2136,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1708,6 +2211,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1784,6 +2288,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1868,6 +2373,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };
@@ -1948,6 +2454,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         };

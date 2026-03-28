@@ -31,7 +31,7 @@ mod tests {
     use crate::{
         AtomicArbTransactionBuilder, BuildRejectionReason, ExecutionRegistry,
         LookupTableUsageConfig, MessageFormat, MessageMode, OrcaSimplePoolConfig,
-        RaydiumSimplePoolConfig, RouteExecutionConfig, VenueExecutionConfig,
+        OrcaWhirlpoolConfig, RaydiumSimplePoolConfig, RouteExecutionConfig, VenueExecutionConfig,
         transaction_builder::TransactionBuilder,
         types::{BuildRequest, BuildStatus, DynamicBuildParameters},
     };
@@ -66,9 +66,14 @@ mod tests {
             p_land_bps: 10_000,
             expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: None,
+            source_input_balance: None,
             expected_net_output: 10_250,
             minimum_acceptable_output: 10_025,
             expected_gross_profit_quote_atoms: 250,
+            estimated_network_fee_lamports: 0,
+            estimated_network_fee_quote_atoms: 0,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: 250,
@@ -82,6 +87,7 @@ mod tests {
                     output_amount: 10_120,
                     fee_paid: 5,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 LegQuote {
                     venue: "raydium".into(),
@@ -91,6 +97,7 @@ mod tests {
                     output_amount: 10_250,
                     fee_paid: 5,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
             ]
             .into(),
@@ -192,7 +199,7 @@ mod tests {
         lookup_tables: Vec<LookupTableSnapshot>,
         head_slot: u64,
     ) -> DynamicBuildParameters {
-        dynamic_params_with_compute_limit(lookup_tables, head_slot, 300_000)
+        dynamic_params_custom(lookup_tables, head_slot, 300_000, 25_000, 5_000)
     }
 
     fn dynamic_params_with_compute_limit(
@@ -200,14 +207,24 @@ mod tests {
         head_slot: u64,
         compute_unit_limit: u32,
     ) -> DynamicBuildParameters {
+        dynamic_params_custom(lookup_tables, head_slot, compute_unit_limit, 25_000, 5_000)
+    }
+
+    fn dynamic_params_custom(
+        lookup_tables: Vec<LookupTableSnapshot>,
+        head_slot: u64,
+        compute_unit_limit: u32,
+        compute_unit_price_micro_lamports: u64,
+        jito_tip_lamports: u64,
+    ) -> DynamicBuildParameters {
         DynamicBuildParameters {
             recent_blockhash: recent_blockhash(),
             recent_blockhash_slot: Some(head_slot),
             head_slot,
             fee_payer_pubkey: fee_payer_pubkey(),
             compute_unit_limit,
-            compute_unit_price_micro_lamports: 25_000,
-            jito_tip_lamports: 5_000,
+            compute_unit_price_micro_lamports,
+            jito_tip_lamports,
             resolved_lookup_tables: lookup_tables,
         }
     }
@@ -226,9 +243,14 @@ mod tests {
             p_land_bps: 10_000,
             expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: None,
+            source_input_balance: None,
             expected_net_output: 10_350,
             minimum_acceptable_output: 10_150,
             expected_gross_profit_quote_atoms: 350,
+            estimated_network_fee_lamports: 0,
+            estimated_network_fee_quote_atoms: 0,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: 350,
@@ -242,6 +264,7 @@ mod tests {
                     output_amount: 10_120,
                     fee_paid: 5,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 LegQuote {
                     venue: "orca".into(),
@@ -251,6 +274,7 @@ mod tests {
                     output_amount: 10_220,
                     fee_paid: 5,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 LegQuote {
                     venue: "orca".into(),
@@ -260,6 +284,7 @@ mod tests {
                     output_amount: 10_350,
                     fee_paid: 5,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
             ]
             .into(),
@@ -318,6 +343,100 @@ mod tests {
                     user_source_token_account: test_pubkey("tri-route-mid-b-ata"),
                     user_destination_token_account: test_pubkey("tri-route-output-ata"),
                     host_fee_account: None,
+                }),
+            ]
+            .into(),
+        });
+        registry
+    }
+
+    fn native_input_candidate() -> OpportunityCandidate {
+        OpportunityCandidate {
+            route_id: RouteId("route-native".into()),
+            route_kind: RouteKind::TwoLeg,
+            quoted_slot: 42,
+            leg_snapshot_slots: [42, 42].into(),
+            sol_quote_conversion_snapshot_slot: None,
+            trade_size: 1_000_000_000,
+            selected_by: CandidateSelectionSource::Legacy,
+            ranking_score_quote_atoms: 250,
+            expected_value_quote_atoms: 250,
+            p_land_bps: 10_000,
+            expected_shortfall_quote_atoms: 0,
+            active_execution_buffer_bps: None,
+            source_input_balance: None,
+            expected_net_output: 1_010_000_000,
+            minimum_acceptable_output: 1_000_100_000,
+            expected_gross_profit_quote_atoms: 250,
+            estimated_network_fee_lamports: 0,
+            estimated_network_fee_quote_atoms: 0,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
+            estimated_execution_cost_lamports: 0,
+            estimated_execution_cost_quote_atoms: 0,
+            expected_net_profit_quote_atoms: 250,
+            intermediate_output_amounts: vec![50_000_000],
+            leg_quotes: [
+                LegQuote {
+                    venue: "orca_whirlpool".into(),
+                    pool_id: PoolId("pool-native-a".into()),
+                    side: SwapSide::BuyBase,
+                    input_amount: 1_000_000_000,
+                    output_amount: 50_000_000,
+                    fee_paid: 5,
+                    current_tick_index: Some(0),
+                    ticks_crossed: 0,
+                },
+                LegQuote {
+                    venue: "orca_whirlpool".into(),
+                    pool_id: PoolId("pool-native-b".into()),
+                    side: SwapSide::SellBase,
+                    input_amount: 50_000_000,
+                    output_amount: 1_010_000_000,
+                    fee_paid: 5,
+                    current_tick_index: Some(0),
+                    ticks_crossed: 0,
+                },
+            ]
+            .into(),
+        }
+    }
+
+    fn native_input_execution_registry() -> ExecutionRegistry {
+        let mut registry = ExecutionRegistry::default();
+        registry.register(RouteExecutionConfig {
+            route_id: RouteId("route-native".into()),
+            kind: RouteKind::TwoLeg,
+            message_mode: MessageMode::V0OrLegacy,
+            lookup_tables: Vec::new(),
+            default_compute_unit_limit: 450_000,
+            minimum_compute_unit_limit: RouteKind::TwoLeg.minimum_compute_unit_limit(),
+            default_compute_unit_price_micro_lamports: 25_000,
+            default_jito_tip_lamports: 0,
+            max_quote_slot_lag: 4,
+            max_alt_slot_lag: 4,
+            legs: [
+                VenueExecutionConfig::OrcaWhirlpool(OrcaWhirlpoolConfig {
+                    program_id: test_pubkey("native-orca-program-a"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    whirlpool: test_pubkey("native-whirlpool-a"),
+                    token_mint_a: "So11111111111111111111111111111111111111112".into(),
+                    token_vault_a: test_pubkey("native-vault-a"),
+                    token_mint_b: test_pubkey("native-quote-mint"),
+                    token_vault_b: test_pubkey("native-vault-b"),
+                    tick_spacing: 64,
+                    a_to_b: true,
+                }),
+                VenueExecutionConfig::OrcaWhirlpool(OrcaWhirlpoolConfig {
+                    program_id: test_pubkey("native-orca-program-b"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    whirlpool: test_pubkey("native-whirlpool-b"),
+                    token_mint_a: "So11111111111111111111111111111111111111112".into(),
+                    token_vault_a: test_pubkey("native-vault-c"),
+                    token_mint_b: test_pubkey("native-quote-mint"),
+                    token_vault_b: test_pubkey("native-vault-d"),
+                    tick_spacing: 64,
+                    a_to_b: false,
                 }),
             ]
             .into(),
@@ -492,5 +611,43 @@ mod tests {
                 minimum: 420_000,
             })
         );
+    }
+
+    #[test]
+    fn builder_adds_runtime_account_setup_for_concentrated_routes() {
+        let builder = AtomicArbTransactionBuilder::new(native_input_execution_registry());
+        let result = builder.build(BuildRequest {
+            candidate: native_input_candidate(),
+            dynamic: dynamic_params_custom(Vec::new(), 43, 450_000, 25_000, 0),
+        });
+
+        assert_eq!(result.status, BuildStatus::Built);
+        let envelope = result.envelope.expect("built envelope");
+        let labels = envelope
+            .instructions
+            .iter()
+            .map(|instruction| instruction.label.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(labels[0], "compute-budget-limit");
+        assert_eq!(labels[1], "compute-budget-price");
+        assert_eq!(labels[2], "ata-create-so11");
+        assert_eq!(
+            labels[3],
+            format!(
+                "ata-create-{}",
+                test_pubkey("native-quote-mint")
+                    .chars()
+                    .take(4)
+                    .collect::<String>()
+                    .to_ascii_lowercase()
+            )
+        );
+        assert_eq!(labels[4], "native-wrap-transfer");
+        assert_eq!(labels[5], "native-wrap-sync");
+        assert_eq!(labels[6], "route-native-leg-1");
+        assert_eq!(labels[7], "route-native-leg-2");
+        assert_eq!(labels[8], "native-wrap-close");
+        assert_eq!(labels.len(), 9);
     }
 }

@@ -142,6 +142,7 @@ impl OnChainReconciler {
                     &record.submission_id,
                     InclusionStatus::Expired { observed_slot },
                 ) {
+                    let _ = tracker.set_terminal_slot(&record.submission_id, observed_slot);
                     transitions.push(transition);
                 }
             }
@@ -178,6 +179,7 @@ impl OnChainReconciler {
                             &record.submission_id,
                             InclusionStatus::Failed(failure_class),
                         ) {
+                            let _ = tracker.set_terminal_slot(&record.submission_id, status.slot);
                             transitions.push(transition);
                         }
                     }
@@ -186,6 +188,7 @@ impl OnChainReconciler {
                             &record.submission_id,
                             InclusionStatus::Landed { slot: status.slot },
                         ) {
+                            let _ = tracker.set_terminal_slot(&record.submission_id, status.slot);
                             transitions.push(transition);
                         }
                     }
@@ -237,12 +240,13 @@ impl OnChainReconciler {
                     match status.status.as_str() {
                         "Pending" => {}
                         "Landed" => {
+                            let landed_slot = status.landed_slot.unwrap_or(record.slot_fallback());
                             if let Some(transition) = tracker.transition(
                                 &record.submission_id,
-                                InclusionStatus::Landed {
-                                    slot: status.landed_slot.unwrap_or(record.slot_fallback()),
-                                },
+                                InclusionStatus::Landed { slot: landed_slot },
                             ) {
+                                let _ =
+                                    tracker.set_terminal_slot(&record.submission_id, landed_slot);
                                 transitions.push(transition);
                             }
                         }
@@ -686,17 +690,22 @@ impl SignatureWsClient {
                 if let Some(detail) = failure_detail {
                     tracker.set_failure_detail(&submission_id, detail);
                 }
-                tracker.transition(&submission_id, InclusionStatus::Failed(failure_class))
+                let transition =
+                    tracker.transition(&submission_id, InclusionStatus::Failed(failure_class));
+                let _ = tracker.set_terminal_slot(&submission_id, params.result.context.slot);
+                transition
             }
             WsSignatureValue::Processed { err: None } => {
                 self.subscriptions.remove(&params.subscription);
                 self.tracked_submissions.remove(&submission_id);
-                tracker.transition(
+                let transition = tracker.transition(
                     &submission_id,
                     InclusionStatus::Landed {
                         slot: params.result.context.slot,
                     },
-                )
+                );
+                let _ = tracker.set_terminal_slot(&submission_id, params.result.context.slot);
+                transition
             }
             WsSignatureValue::ReceivedSignature(_) => None,
         }

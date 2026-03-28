@@ -15,6 +15,7 @@ domain = { path = "../domain" }
 ratatui = "0.29"
 reconciliation = { path = "../reconciliation" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 signing = { path = "../signing" }

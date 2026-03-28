@@ -1,4 +1,4 @@
-use std::time::SystemTime;
+use std::{collections::HashMap, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -454,6 +454,7 @@ pub struct ExecutionSnapshot {
     pub alt_revision: u64,
     pub lookup_tables: Vec<LookupTableSnapshot>,
     pub wallet_balance_lamports: u64,
+    pub source_token_balances: HashMap<String, u64>,
     pub wallet_ready: bool,
     pub kill_switch_enabled: bool,
 }

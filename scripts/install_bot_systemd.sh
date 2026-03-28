@@ -147,7 +147,10 @@ install_bot_dropins() {
         after+=("agave-rpc.service")
     fi
 
-    if systemctl list-unit-files jito-shredstream-proxy.service --no-legend 2>/dev/null | grep -Fq "jito-shredstream-proxy.service"; then
+    if systemctl list-unit-files yellowstone-shredstream-bridge.service --no-legend 2>/dev/null | grep -Fq "yellowstone-shredstream-bridge.service"; then
+        wants+=("yellowstone-shredstream-bridge.service")
+        after+=("yellowstone-shredstream-bridge.service")
+    elif systemctl list-unit-files jito-shredstream-proxy.service --no-legend 2>/dev/null | grep -Fq "jito-shredstream-proxy.service"; then
         wants+=("jito-shredstream-proxy.service")
         after+=("jito-shredstream-proxy.service")
     fi

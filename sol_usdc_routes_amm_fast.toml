@@ -18,6 +18,12 @@ max_snapshot_slot_lag = 256
 [strategy]
 max_snapshot_slot_lag = 256
 
+[builder.jito_tip_policy]
+mode = "pnl_ratio"
+share_bps_of_expected_net_profit = 1000
+min_lamports = 5000
+max_lamports = 50000
+
 [reconciliation]
 rpc_http_endpoint = "http://127.0.0.1:8899"
 rpc_ws_endpoint = "ws://127.0.0.1:8900"
@@ -28,10 +34,10 @@ account_batch_window_millis = 5
 worker_count = 4
 queue_capacity = 16
 congestion_threshold_pct = 75
-single_transaction_policy = "leader_aware"
+single_transaction_policy = "jito_only"
 
 [rpc_submit]
-enabled = true
+enabled = false
 endpoint = "http://127.0.0.1:8899"
 connect_timeout_ms = 100
 request_timeout_ms = 150
@@ -142,9 +148,10 @@ user_destination_token_account = "Nk9GkscATLRPkaSyfwbddMTjS2EoG7mQEhyzXTxGGqj"
 
 [routes.definitions.execution]
 message_mode = "v0_required"
-default_compute_unit_limit = 300000
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -223,9 +230,10 @@ user_destination_token_account = "Nk9GkscATLRPkaSyfwbddMTjS2EoG7mQEhyzXTxGGqj"
 
 [routes.definitions.execution]
 message_mode = "v0_required"
-default_compute_unit_limit = 300000
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -301,9 +309,10 @@ decoder_key = "orca-whirlpool-v1"
 
 [routes.definitions.execution]
 message_mode = "v0_required"
-default_compute_unit_limit = 300000
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -376,9 +385,10 @@ decoder_key = "raydium-clmm-v1"
 
 [routes.definitions.execution]
 message_mode = "v0_required"
-default_compute_unit_limit = 300000
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -451,9 +461,10 @@ decoder_key = "raydium-clmm-v1"
 
 [routes.definitions.execution]
 message_mode = "v0_required"
-default_compute_unit_limit = 300000
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -462,7 +473,7 @@ account_key = "CaAB3ULQ5iYw6MQZqrzca6oY4J8UNznod2EkS8s1bfuX"
 
 [routes.definitions.execution_protection]
 enabled = true
-tight_max_quote_slot_lag = 4
+tight_max_quote_slot_lag = 24
 base_extra_buy_leg_slippage_bps = 50
 failure_step_bps = 25
 max_extra_buy_leg_slippage_bps = 150
@@ -534,9 +545,10 @@ decoder_key = "orca-whirlpool-v1"
 
 [routes.definitions.execution]
 message_mode = "v0_required"
-default_compute_unit_limit = 300000
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -545,7 +557,7 @@ account_key = "CaAB3ULQ5iYw6MQZqrzca6oY4J8UNznod2EkS8s1bfuX"
 
 [routes.definitions.execution_protection]
 enabled = true
-tight_max_quote_slot_lag = 4
+tight_max_quote_slot_lag = 24
 base_extra_buy_leg_slippage_bps = 50
 failure_step_bps = 25
 max_extra_buy_leg_slippage_bps = 150
@@ -620,7 +632,7 @@ decoder_key = "raydium-clmm-v1"
 message_mode = "v0_required"
 default_compute_unit_limit = 300000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 
@@ -696,7 +708,7 @@ decoder_key = "orca-whirlpool-v1"
 message_mode = "v0_required"
 default_compute_unit_limit = 300000
 default_compute_unit_price_micro_lamports = 25000
-default_jito_tip_lamports = 5000
+default_jito_tip_lamports = 0
 max_quote_slot_lag = 32
 max_alt_slot_lag = 32
 

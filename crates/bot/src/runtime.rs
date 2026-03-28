@@ -1,12 +1,13 @@
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use builder::{BuildRequest, BuildResult, BuildStatus, DynamicBuildParameters, TransactionBuilder};
 use domain::{
-    AccountUpdateStatus, EventSourceKind, ExecutionSnapshot, LookupTableSnapshot, MarketEvent,
-    NormalizedEvent, PoolSnapshot, StateApplyOutcome,
+    AccountUpdateStatus, EventLane, EventSourceKind, ExecutionSnapshot, LookupTableSnapshot,
+    MarketEvent, NormalizedEvent, PoolSnapshot, StateApplyOutcome,
 };
 use reconciliation::{
     ExecutionOutcome, ExecutionRecord, ExecutionTracker, ExecutionTransition, FailureClass,
@@ -61,15 +62,22 @@ impl HotPathReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineTrace {
+    pub lane: EventLane,
     pub source: EventSourceKind,
     pub source_sequence: u64,
     pub observed_slot: u64,
     pub source_received_at: SystemTime,
     pub normalized_at: SystemTime,
+    pub router_received_at: SystemTime,
+    pub state_published_at: Option<SystemTime>,
     pub source_latency: Option<Duration>,
     pub ingest_duration: Duration,
     pub queue_wait_duration: Duration,
+    pub state_mailbox_age_duration: Option<Duration>,
+    pub trigger_queue_wait_duration: Option<Duration>,
+    pub trigger_barrier_wait_duration: Option<Duration>,
     pub state_apply_duration: Duration,
+    pub route_eval_duration: Option<Duration>,
     pub select_duration: Option<Duration>,
     pub build_duration: Option<Duration>,
     pub sign_duration: Option<Duration>,
@@ -85,15 +93,22 @@ impl PipelineTrace {
             .duration_since(event.latency.source_received_at)
             .unwrap_or(Duration::ZERO);
         Self {
+            lane: event.latency.lane,
             source: event.source.source,
             source_sequence: event.source.sequence,
             observed_slot: event.source.observed_slot,
             source_received_at: event.latency.source_received_at,
             normalized_at: event.latency.normalized_at,
+            router_received_at: event.latency.router_received_at,
+            state_published_at: event.latency.state_published_at,
             source_latency: event.latency.source_latency,
             ingest_duration,
             queue_wait_duration: Duration::ZERO,
+            state_mailbox_age_duration: None,
+            trigger_queue_wait_duration: None,
+            trigger_barrier_wait_duration: None,
             state_apply_duration: Duration::ZERO,
+            route_eval_duration: None,
             select_duration: None,
             build_duration: None,
             sign_duration: None,
@@ -240,12 +255,19 @@ pub struct WalletRefreshService {
     pub signer_available: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SourceTokenBalanceService {
+    pub balances: HashMap<String, u64>,
+    pub slot: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColdPathServices {
     pub warmup: WarmupCoordinator,
     pub blockhash: BlockhashService,
     pub alt_cache: AltCacheService,
     pub wallet_refresh: WalletRefreshService,
+    pub source_token_balances: SourceTokenBalanceService,
 }
 
 impl ColdPathServices {
@@ -263,6 +285,9 @@ impl ColdPathServices {
             self.wallet_refresh.balance_lamports,
             self.wallet_refresh.ready && self.wallet_refresh.signer_available,
         );
+        hot_path
+            .execution
+            .set_source_token_balances(self.source_token_balances.balances.clone());
         hot_path.wallet.balance_lamports = self.wallet_refresh.balance_lamports;
         hot_path.wallet.status = wallet_status(
             self.wallet_refresh.ready,
@@ -289,7 +314,6 @@ pub struct BotRuntime {
     submit_mode: SubmitMode,
     compute_unit_limit: u32,
     compute_unit_price_micro_lamports: u64,
-    jito_tip_lamports: u64,
     route_health: SharedRouteHealth,
 }
 
@@ -300,7 +324,6 @@ impl BotRuntime {
         submit_mode: SubmitMode,
         compute_unit_limit: u32,
         compute_unit_price_micro_lamports: u64,
-        jito_tip_lamports: u64,
         route_health: SharedRouteHealth,
     ) -> Self {
         Self {
@@ -311,7 +334,6 @@ impl BotRuntime {
             submit_mode,
             compute_unit_limit,
             compute_unit_price_micro_lamports,
-            jito_tip_lamports,
             route_health,
         }
     }
@@ -353,6 +375,13 @@ impl BotRuntime {
             self.hot_path.state.set_latest_slot(wallet.slot);
             self.hot_path.wallet.balance_lamports = wallet.balance_lamports;
             self.hot_path.wallet.status = wallet_status(wallet.ready, signer_available);
+        }
+
+        if let Some(source_token_balances) = snapshot.source_token_balances {
+            self.hot_path
+                .execution
+                .set_source_token_balances(source_token_balances.balances);
+            self.hot_path.state.set_latest_slot(source_token_balances.slot);
         }
     }
 
@@ -489,6 +518,33 @@ impl BotRuntime {
         pipeline_trace.queue_wait_duration = process_started_at
             .duration_since(event.latency.normalized_at)
             .unwrap_or(Duration::ZERO);
+        match event.latency.lane {
+            EventLane::StateOnly => {
+                pipeline_trace.state_mailbox_age_duration = event
+                    .latency
+                    .state_published_at
+                    .and_then(|published_at| process_started_at.duration_since(published_at).ok());
+                if let Some(duration) = pipeline_trace.state_mailbox_age_duration {
+                    self.telemetry.metrics.record_state_mailbox_age(duration);
+                }
+            }
+            EventLane::Trigger => {
+                pipeline_trace.trigger_queue_wait_duration = process_started_at
+                    .duration_since(event.latency.router_received_at)
+                    .ok();
+                pipeline_trace.trigger_barrier_wait_duration = event
+                    .latency
+                    .trigger_blocked_at
+                    .and_then(|blocked_at| process_started_at.duration_since(blocked_at).ok());
+                if let Some(duration) = pipeline_trace.trigger_queue_wait_duration {
+                    self.telemetry.metrics.record_trigger_queue_wait(duration);
+                }
+                if let Some(duration) = pipeline_trace.trigger_barrier_wait_duration {
+                    self.telemetry.metrics.record_trigger_barrier_wait(duration);
+                }
+            }
+            EventLane::Broadcast => {}
+        }
         self.telemetry.metrics.increment_detect();
         if let MarketEvent::SlotBoundary(slot_boundary) = &event.payload {
             self.hot_path
@@ -539,7 +595,13 @@ impl BotRuntime {
                 );
             }
         }
-        if event.source.source == EventSourceKind::ShredStream && !is_destabilizing_trigger {
+        let should_evaluate_shredstream_routes = is_destabilizing_trigger
+            || self
+                .hot_path
+                .strategy
+                .has_impacted_triangular_route(&state_outcome.impacted_routes);
+        if event.source.source == EventSourceKind::ShredStream && !should_evaluate_shredstream_routes
+        {
             return Ok(PreparedHotPath::Report(HotPathReport {
                 state_outcome: Some(state_outcome),
                 pool_snapshots,
@@ -585,6 +647,10 @@ impl BotRuntime {
                 )
             })
             .unwrap_or_else(|| state_outcome.impacted_routes.clone());
+        let impacted_routes = impacted_routes
+            .into_iter()
+            .filter(|route_id| !self.tracker.has_pending_route(route_id))
+            .collect::<Vec<_>>();
         if impacted_routes.is_empty() {
             self.telemetry.metrics.increment_rejection();
             return Ok(PreparedHotPath::Report(HotPathReport {
@@ -618,7 +684,9 @@ impl BotRuntime {
                 .saturating_add(additional_pending_submissions),
         );
         let select_duration = strategy_started.elapsed();
+        pipeline_trace.route_eval_duration = Some(select_duration);
         pipeline_trace.select_duration = Some(select_duration);
+        self.telemetry.metrics.record_route_eval(select_duration);
         self.telemetry
             .record_stage(PipelineStage::Select, select_duration);
         if selection.best_candidate.is_none() {
@@ -640,6 +708,11 @@ impl BotRuntime {
             .best_candidate
             .clone()
             .expect("candidate available");
+        let jito_tip_lamports = candidate.jito_tip_lamports;
+        let compute_unit_limit = self
+            .hot_path
+            .builder
+            .effective_compute_unit_limit(&candidate.route_id, self.compute_unit_limit);
         let build_request = BuildRequest {
             candidate,
             dynamic: DynamicBuildParameters {
@@ -647,9 +720,9 @@ impl BotRuntime {
                 recent_blockhash_slot: execution_state.blockhash_slot,
                 head_slot: execution_state.head_slot,
                 fee_payer_pubkey: self.hot_path.signer.pubkey_string()?,
-                compute_unit_limit: self.compute_unit_limit,
+                compute_unit_limit,
                 compute_unit_price_micro_lamports: self.compute_unit_price_micro_lamports,
-                jito_tip_lamports: self.jito_tip_lamports,
+                jito_tip_lamports,
                 resolved_lookup_tables: execution_state.lookup_tables.clone(),
             },
         };
@@ -836,6 +909,7 @@ mod tests {
         },
     };
     use std::{
+        collections::HashMap,
         env, fs,
         path::PathBuf,
         process,
@@ -845,11 +919,11 @@ mod tests {
     };
     use submit::SubmitStatus;
 
-    use super::PreparedHotPath;
+    use super::{BotRuntime, PreparedHotPath};
     use crate::{
         bootstrap::bootstrap,
         config::{
-            AccountDependencyConfig, BotConfig, MessageModeConfig,
+            AccountDependencyConfig, BotConfig, JitoTipModeConfig, MessageModeConfig,
             OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig,
             RouteClassConfig, RouteConfig, RouteExecutionConfig, RouteKindConfig, RouteLegConfig,
             RouteLegExecutionConfig, RoutesConfig, SigningProviderKind, SwapSideConfig,
@@ -865,7 +939,14 @@ mod tests {
         Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
     }
 
-    fn snapshot_event(sequence: u64, pool_id: &str, price_bps: u64) -> NormalizedEvent {
+    fn snapshot_event_with_pair(
+        source: EventSourceKind,
+        sequence: u64,
+        pool_id: &str,
+        price_bps: u64,
+        token_mint_a: &str,
+        token_mint_b: &str,
+    ) -> NormalizedEvent {
         let reserve_a = 100_000u64;
         let reserve_b = (reserve_a as u128)
             .saturating_mul(price_bps as u128)
@@ -873,7 +954,7 @@ mod tests {
             .and_then(|value| u64::try_from(value).ok())
             .unwrap_or(reserve_a);
         NormalizedEvent::pool_snapshot_update(
-            EventSourceKind::Synthetic,
+            source,
             sequence,
             sequence + 9,
             PoolSnapshotUpdate {
@@ -888,14 +969,32 @@ mod tests {
                 venue: PoolVenue::OrcaSimplePool,
                 confidence: SnapshotConfidence::Executable,
                 repair_pending: Some(false),
-                token_mint_a: "So11111111111111111111111111111111111111112".into(),
-                token_mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+                token_mint_a: token_mint_a.into(),
+                token_mint_b: token_mint_b.into(),
                 tick_spacing: 0,
                 current_tick_index: None,
                 slot: sequence + 9,
                 write_version: 1,
             },
         )
+    }
+
+    fn snapshot_event(sequence: u64, pool_id: &str, price_bps: u64) -> NormalizedEvent {
+        snapshot_event_with_pair(
+            EventSourceKind::Synthetic,
+            sequence,
+            pool_id,
+            price_bps,
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        )
+    }
+
+    fn seed_source_input_balance(runtime: &mut BotRuntime) {
+        runtime.hot_path.execution.set_source_token_balances(HashMap::from([(
+            test_pubkey("route-input-ata"),
+            1_000_000,
+        )]));
     }
 
     fn route_execution() -> RouteExecutionConfig {
@@ -1027,6 +1126,125 @@ mod tests {
         }
     }
 
+    fn triangular_route_config() -> RouteConfig {
+        RouteConfig {
+            enabled: true,
+            route_class: RouteClassConfig::AmmFastPath,
+            kind: RouteKindConfig::Triangular,
+            route_id: "route-tri".into(),
+            input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            base_mint: Some("So11111111111111111111111111111111111111112".into()),
+            quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+            sol_quote_conversion_pool_id: Some("pool-a".into()),
+            min_profit_quote_atoms: None,
+            min_trade_size: None,
+            default_trade_size: 10_000,
+            max_trade_size: 20_000,
+            size_ladder: Vec::new(),
+            sizing: crate::config::RouteSizingConfig {
+                min_trade_floor_sol_lamports: Some(0),
+                ..Default::default()
+            },
+            execution_protection: Default::default(),
+            legs: vec![
+                RouteLegConfig {
+                    venue: "orca".into(),
+                    pool_id: "pool-a".into(),
+                    side: SwapSideConfig::BuyBase,
+                    input_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                    output_mint: Some("So11111111111111111111111111111111111111112".into()),
+                    fee_bps: None,
+                    execution: RouteLegExecutionConfig::OrcaSimplePool(
+                        OrcaSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("tri-orca-program-a"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            swap_account: test_pubkey("tri-orca-swap-a"),
+                            authority: test_pubkey("tri-orca-authority-a"),
+                            pool_source_token_account: test_pubkey("tri-orca-pool-source-a"),
+                            pool_destination_token_account: test_pubkey(
+                                "tri-orca-pool-destination-a",
+                            ),
+                            pool_mint: test_pubkey("tri-orca-pool-mint-a"),
+                            fee_account: test_pubkey("tri-orca-fee-account-a"),
+                            user_source_token_account: test_pubkey("tri-route-input-ata"),
+                            user_destination_token_account: test_pubkey("tri-route-sol-ata"),
+                            host_fee_account: None,
+                        },
+                    ),
+                },
+                RouteLegConfig {
+                    venue: "orca".into(),
+                    pool_id: "pool-b".into(),
+                    side: SwapSideConfig::SellBase,
+                    input_mint: Some("So11111111111111111111111111111111111111112".into()),
+                    output_mint: Some("Es9vMFrzaCERmJfrF4H2FyYQh4MXXZ7nJmL2jP7LQ3V".into()),
+                    fee_bps: None,
+                    execution: RouteLegExecutionConfig::OrcaSimplePool(
+                        OrcaSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("tri-orca-program-b"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            swap_account: test_pubkey("tri-orca-swap-b"),
+                            authority: test_pubkey("tri-orca-authority-b"),
+                            pool_source_token_account: test_pubkey("tri-orca-pool-source-b"),
+                            pool_destination_token_account: test_pubkey(
+                                "tri-orca-pool-destination-b",
+                            ),
+                            pool_mint: test_pubkey("tri-orca-pool-mint-b"),
+                            fee_account: test_pubkey("tri-orca-fee-account-b"),
+                            user_source_token_account: test_pubkey("tri-route-sol-ata"),
+                            user_destination_token_account: test_pubkey("tri-route-usdt-ata"),
+                            host_fee_account: None,
+                        },
+                    ),
+                },
+                RouteLegConfig {
+                    venue: "orca".into(),
+                    pool_id: "pool-c".into(),
+                    side: SwapSideConfig::SellBase,
+                    input_mint: Some("Es9vMFrzaCERmJfrF4H2FyYQh4MXXZ7nJmL2jP7LQ3V".into()),
+                    output_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                    fee_bps: None,
+                    execution: RouteLegExecutionConfig::OrcaSimplePool(
+                        OrcaSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("tri-orca-program-c"),
+                            token_program_id: test_pubkey("spl-token-program"),
+                            swap_account: test_pubkey("tri-orca-swap-c"),
+                            authority: test_pubkey("tri-orca-authority-c"),
+                            pool_source_token_account: test_pubkey("tri-orca-pool-source-c"),
+                            pool_destination_token_account: test_pubkey(
+                                "tri-orca-pool-destination-c",
+                            ),
+                            pool_mint: test_pubkey("tri-orca-pool-mint-c"),
+                            fee_account: test_pubkey("tri-orca-fee-account-c"),
+                            user_source_token_account: test_pubkey("tri-route-usdt-ata"),
+                            user_destination_token_account: test_pubkey("tri-route-output-ata"),
+                            host_fee_account: None,
+                        },
+                    ),
+                },
+            ],
+            account_dependencies: vec![
+                AccountDependencyConfig {
+                    account_key: "acct-a".into(),
+                    pool_id: "pool-a".into(),
+                    decoder_key: "pool-price-v1".into(),
+                },
+                AccountDependencyConfig {
+                    account_key: "acct-b".into(),
+                    pool_id: "pool-b".into(),
+                    decoder_key: "pool-price-v1".into(),
+                },
+                AccountDependencyConfig {
+                    account_key: "acct-c".into(),
+                    pool_id: "pool-c".into(),
+                    decoder_key: "pool-price-v1".into(),
+                },
+            ],
+            execution: route_execution(),
+        }
+    }
+
     #[test]
     fn minimal_pipeline_wiring_reaches_submit() {
         let mut config = BotConfig::default();
@@ -1036,6 +1254,7 @@ mod tests {
         config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
         config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
@@ -1044,6 +1263,7 @@ mod tests {
         config.signing.owner_pubkey = owner_pubkey;
         config.signing.keypair_base58 = Some(keypair_base58);
         let mut runtime = bootstrap(config).unwrap();
+        seed_source_input_balance(&mut runtime);
 
         let first = snapshot_event(1, "pool-a", 5_000);
         let second = snapshot_event(2, "pool-b", 20_000);
@@ -1066,6 +1286,7 @@ mod tests {
         config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
         config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
@@ -1074,6 +1295,7 @@ mod tests {
         config.signing.owner_pubkey = owner_pubkey.clone();
         config.signing.keypair_base58 = Some(keypair_base58);
         let mut runtime = bootstrap(config).unwrap();
+        seed_source_input_balance(&mut runtime);
         runtime.hot_path.signer = Arc::new(PanicSigner {
             pubkey: owner_pubkey,
         });
@@ -1096,6 +1318,122 @@ mod tests {
     }
 
     #[test]
+    fn prepare_event_for_dispatch_dedupes_pending_route_submissions() {
+        let mut config = BotConfig::default();
+        config.routes = RoutesConfig {
+            definitions: vec![route_config()],
+        };
+        config.builder.compute_unit_limit = 300_000;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
+        config.runtime.live_set_health.enabled = false;
+        config.jito.endpoint = "mock://jito".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        let (owner_pubkey, keypair_base58) = test_signing_material();
+        config.signing.owner_pubkey = owner_pubkey;
+        config.signing.keypair_base58 = Some(keypair_base58);
+        let mut runtime = bootstrap(config).unwrap();
+        seed_source_input_balance(&mut runtime);
+
+        let first = snapshot_event(1, "pool-a", 5_000);
+        let second = snapshot_event(2, "pool-b", 20_000);
+        let third = snapshot_event(3, "pool-a", 20_500);
+
+        let first_report = runtime.process_event(first).unwrap();
+        assert!(first_report.submit_result.is_none());
+
+        let second_report = runtime.process_event(second).unwrap();
+        assert!(second_report.submit_result.is_some());
+        let pending = runtime
+            .tracker
+            .pending_records()
+            .into_iter()
+            .filter(|record| record.route_id.0 == "route-a")
+            .count();
+        assert_eq!(pending, 1);
+
+        let deduped = runtime.prepare_event_for_dispatch(third, 0).unwrap();
+        match deduped {
+            PreparedHotPath::Report(report) => {
+                assert!(report.selection.best_candidate.is_none());
+                assert!(report.build_result.is_none());
+                assert!(report.signed_envelope.is_none());
+            }
+            other => panic!("expected deduped report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepare_event_for_dispatch_evaluates_triangular_routes_on_plain_shredstream_updates() {
+        let mut config = BotConfig::default();
+        config.routes = RoutesConfig {
+            definitions: vec![triangular_route_config()],
+        };
+        config.builder.compute_unit_limit = 450_000;
+        config.builder.compute_unit_price_micro_lamports = 1;
+        config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
+        config.runtime.live_set_health.enabled = false;
+        config.jito.endpoint = "mock://jito".into();
+        config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+        let (owner_pubkey, keypair_base58) = test_signing_material();
+        config.signing.owner_pubkey = owner_pubkey.clone();
+        config.signing.keypair_base58 = Some(keypair_base58);
+        let mut runtime = bootstrap(config).unwrap();
+        runtime.hot_path.execution.set_source_token_balances(HashMap::from([(
+            test_pubkey("tri-route-input-ata"),
+            1_000_000,
+        )]));
+        runtime.hot_path.signer = Arc::new(PanicSigner {
+            pubkey: owner_pubkey,
+        });
+
+        let first = snapshot_event_with_pair(
+            EventSourceKind::ShredStream,
+            1,
+            "pool-a",
+            5_000,
+            "So11111111111111111111111111111111111111112",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        );
+        let second = snapshot_event_with_pair(
+            EventSourceKind::ShredStream,
+            2,
+            "pool-b",
+            20_000,
+            "So11111111111111111111111111111111111111112",
+            "Es9vMFrzaCERmJfrF4H2FyYQh4MXXZ7nJmL2jP7LQ3V",
+        );
+        let third = snapshot_event_with_pair(
+            EventSourceKind::ShredStream,
+            3,
+            "pool-c",
+            6_000,
+            "Es9vMFrzaCERmJfrF4H2FyYQh4MXXZ7nJmL2jP7LQ3V",
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        );
+
+        let first_report = runtime.prepare_event_for_dispatch(first, 0).unwrap();
+        assert!(matches!(first_report, PreparedHotPath::Report(_)));
+
+        let second_report = runtime.prepare_event_for_dispatch(second, 0).unwrap();
+        assert!(matches!(second_report, PreparedHotPath::Report(_)));
+
+        let prepared = runtime.prepare_event_for_dispatch(third, 0).unwrap();
+        match prepared {
+            PreparedHotPath::BuildSign(task) => {
+                assert_eq!(task.report.selection.best_candidate.as_ref().map(|candidate| candidate.route_id.0.as_str()), Some("route-tri"));
+                assert!(task.report.build_result.is_none());
+                assert!(task.report.signed_envelope.is_none());
+            }
+            other => panic!("expected build/sign handoff for triangular shredstream route, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn secure_unix_pipeline_wiring_reaches_submit() {
         let mut config = BotConfig::default();
         config.routes = RoutesConfig {
@@ -1104,6 +1442,7 @@ mod tests {
         config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
         config.runtime.live_set_health.enabled = false;
         config.jito.endpoint = "mock://jito".into();
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
@@ -1129,6 +1468,7 @@ mod tests {
         });
 
         let mut runtime = bootstrap(config).unwrap();
+        seed_source_input_balance(&mut runtime);
 
         let first = snapshot_event(1, "pool-a", 5_000);
         let second = snapshot_event(2, "pool-b", 20_000);

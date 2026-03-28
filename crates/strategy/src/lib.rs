@@ -11,7 +11,7 @@ use domain::{ExecutionSnapshot, RouteId};
 use guards::{GuardrailConfig, GuardrailSet};
 use opportunity::SelectionOutcome;
 use quote::LocalTwoLegQuoteEngine;
-use route_registry::{RouteDefinition, RouteRegistry, StrategySizingConfig};
+use route_registry::{JitoTipPolicy, RouteDefinition, RouteKind, RouteRegistry, StrategySizingConfig};
 use selector::OpportunitySelector;
 use state::StatePlane;
 
@@ -33,19 +33,35 @@ pub struct StrategyPlane {
     registry: RouteRegistry,
     selector: OpportunitySelector,
     sizing: StrategySizingConfig,
+    route_eval_worker_count: usize,
     execution_protection: HashMap<RouteId, RouteExecutionProtectionState>,
     execution_sizing: HashMap<RouteId, RouteExecutionSizingState>,
 }
 
 impl StrategyPlane {
-    pub fn new(guardrails: GuardrailConfig, sizing: StrategySizingConfig) -> Self {
+    pub fn new(
+        guardrails: GuardrailConfig,
+        sizing: StrategySizingConfig,
+        jito_tip_policy: JitoTipPolicy,
+    ) -> Self {
+        Self::with_parallelism(guardrails, sizing, jito_tip_policy, 1)
+    }
+
+    pub fn with_parallelism(
+        guardrails: GuardrailConfig,
+        sizing: StrategySizingConfig,
+        jito_tip_policy: JitoTipPolicy,
+        route_eval_worker_count: usize,
+    ) -> Self {
         Self {
             registry: RouteRegistry::default(),
-            selector: OpportunitySelector::new(
+            selector: OpportunitySelector::with_jito_tip_policy(
                 LocalTwoLegQuoteEngine,
                 GuardrailSet::new(guardrails),
+                jito_tip_policy,
             ),
             sizing,
+            route_eval_worker_count: route_eval_worker_count.max(1),
             execution_protection: HashMap::new(),
             execution_sizing: HashMap::new(),
         }
@@ -93,7 +109,16 @@ impl StrategyPlane {
             &self.sizing,
             &route_execution_buffers,
             &self.execution_sizing,
+            self.route_eval_worker_count,
         )
+    }
+
+    pub fn has_impacted_triangular_route(&self, impacted_routes: &[RouteId]) -> bool {
+        impacted_routes.iter().any(|route_id| {
+            self.registry
+                .get(route_id)
+                .is_some_and(|route| route.kind == RouteKind::Triangular)
+        })
     }
 
     pub fn record_execution_too_little_output(&mut self, route_id: &RouteId) {
@@ -279,8 +304,8 @@ mod tests {
         opportunity::OpportunityDecision,
         reasons::RejectionReason,
         route_registry::{
-            ExecutionProtectionPolicy, RouteDefinition, RouteKind, RouteLeg, RouteSizingPolicy,
-            SizingMode, StrategySizingConfig, SwapSide,
+            ExecutionProtectionPolicy, JitoTipMode, JitoTipPolicy, RouteDefinition, RouteKind,
+            RouteLeg, RouteSizingPolicy, SizingMode, StrategySizingConfig, SwapSide,
         },
     };
     use state::StatePlane;
@@ -301,6 +326,10 @@ mod tests {
             max_inflight_penalty_bps: 1_500,
             blockhash_penalty_bps_per_slot: 10,
             max_blockhash_penalty_bps: 1_000,
+            quote_age_penalty_bps_per_slot: 15,
+            max_quote_age_penalty_bps: 750,
+            tick_cross_penalty_bps_per_tick: 20,
+            max_tick_cross_penalty_bps: 1_000,
             max_reserve_usage_penalty_bps: 1_250,
         }
     }
@@ -311,6 +340,7 @@ mod tests {
             kind: RouteKind::TwoLeg,
             input_mint: "USDC".into(),
             output_mint: "USDC".into(),
+            input_source_account: None,
             base_mint: Some(SOL_MINT.into()),
             quote_mint: Some("USDC".into()),
             sol_quote_conversion_pool_id: Some(PoolId("pool-a".into())),
@@ -339,6 +369,7 @@ mod tests {
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
+            default_jito_tip_lamports: 0,
             estimated_execution_cost_lamports: 0,
             sizing: RouteSizingPolicy {
                 mode: SizingMode::Legacy,
@@ -348,6 +379,15 @@ mod tests {
                 max_expected_shortfall_bps: 500,
             },
             execution_protection: None,
+        }
+    }
+
+    fn test_jito_tip_policy() -> JitoTipPolicy {
+        JitoTipPolicy {
+            mode: JitoTipMode::Fixed,
+            share_bps_of_expected_net_profit: 0,
+            min_lamports: 0,
+            max_lamports: 0,
         }
     }
 
@@ -372,6 +412,7 @@ mod tests {
             alt_revision: 0,
             lookup_tables: Vec::new(),
             wallet_balance_lamports: 1_000_000,
+            source_token_balances: std::collections::HashMap::new(),
             wallet_ready: true,
             kill_switch_enabled: false,
         }
@@ -417,7 +458,11 @@ mod tests {
     #[test]
     fn blocks_routes_that_are_not_warm() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
         let mut state = StatePlane::new(2);
         state.register_route(
@@ -450,6 +495,7 @@ mod tests {
                 max_blockhash_slot_lag: 8,
             },
             sizing_config(),
+            test_jito_tip_policy(),
         );
         strategy.register_route(route.clone());
 
@@ -485,6 +531,7 @@ mod tests {
                 max_blockhash_slot_lag: 8,
             },
             sizing_config(),
+            test_jito_tip_policy(),
         );
         strategy.register_route(route.clone());
 
@@ -523,6 +570,7 @@ mod tests {
                 max_blockhash_slot_lag: 8,
             },
             sizing_config(),
+            test_jito_tip_policy(),
         );
         strategy.register_route(route.clone());
 
@@ -551,7 +599,11 @@ mod tests {
     #[test]
     fn rejects_route_when_snapshot_is_not_executable() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -629,7 +681,11 @@ mod tests {
     #[test]
     fn rejects_route_when_snapshot_is_verified_without_active_repair() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -707,7 +763,11 @@ mod tests {
     #[test]
     fn rejects_route_when_clmm_quote_model_is_not_executable() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -786,7 +846,11 @@ mod tests {
     fn execution_protection_state_steps_up_and_recovers() {
         let route = protected_route_definition();
         let route_id = route.route_id.clone();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route);
 
         assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(50));
@@ -809,7 +873,11 @@ mod tests {
     fn amount_in_above_maximum_steps_up_buffer_and_caps_trade_size() {
         let route = protected_route_definition();
         let route_id = route.route_id.clone();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
 
         assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(50));
@@ -831,7 +899,11 @@ mod tests {
     fn realized_underperformance_increases_expected_shortfall() {
         let route = route_definition();
         let route_id = route.route_id.clone();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
 
         strategy.record_execution_success(&route_id);
@@ -850,7 +922,11 @@ mod tests {
     fn realized_loss_reduces_route_max_trade_size() {
         let route = route_definition();
         let route_id = route.route_id.clone();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig::default(),
+            sizing_config(),
+            test_jito_tip_policy(),
+        );
         strategy.register_route(route.clone());
 
         strategy.record_execution_success(&route_id);

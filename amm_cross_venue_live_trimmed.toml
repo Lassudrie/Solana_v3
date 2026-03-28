@@ -14,7 +14,7 @@ base_mint = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
 default_trade_size = 10000000
 enabled = true
 input_mint = "So11111111111111111111111111111111111111112"
-max_trade_size = 100000000
+max_trade_size = 50000000
 min_trade_size = 2500000
 output_mint = "So11111111111111111111111111111111111111112"
 quote_mint = "So11111111111111111111111111111111111111112"
@@ -26,8 +26,11 @@ size_ladder = [
     10000000,
     20000000,
     50000000,
-    100000000,
 ]
+
+[routes.definitions.sizing]
+base_expected_shortfall_bps = 150
+max_expected_shortfall_bps = 750
 
 [[routes.definitions.account_dependencies]]
 account_key = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
@@ -44,7 +47,7 @@ default_compute_unit_limit = 300000
 default_compute_unit_price_micro_lamports = 10000
 default_jito_tip_lamports = 1000
 max_alt_slot_lag = 32
-max_quote_slot_lag = 32
+max_quote_slot_lag = 16
 message_mode = "v0_required"
 
 [[routes.definitions.execution.lookup_tables]]
@@ -56,10 +59,10 @@ account_key = "rNFfT7TYkjcXPhudX7rXARZkqkDyRnJNsSnh3FMeXJY"
 [routes.definitions.execution_protection]
 base_extra_buy_leg_slippage_bps = 25
 enabled = true
-failure_step_bps = 25
+failure_step_bps = 50
 max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
-tight_max_quote_slot_lag = 24
+tight_max_quote_slot_lag = 16
 
 [[routes.definitions.legs]]
 fee_bps = 3
@@ -107,7 +110,7 @@ base_mint = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
 default_trade_size = 10000000
 enabled = true
 input_mint = "So11111111111111111111111111111111111111112"
-max_trade_size = 100000000
+max_trade_size = 50000000
 min_trade_size = 2500000
 output_mint = "So11111111111111111111111111111111111111112"
 quote_mint = "So11111111111111111111111111111111111111112"
@@ -119,8 +122,11 @@ size_ladder = [
     10000000,
     20000000,
     50000000,
-    100000000,
 ]
+
+[routes.definitions.sizing]
+base_expected_shortfall_bps = 150
+max_expected_shortfall_bps = 750
 
 [[routes.definitions.account_dependencies]]
 account_key = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
@@ -137,7 +143,7 @@ default_compute_unit_limit = 300000
 default_compute_unit_price_micro_lamports = 10000
 default_jito_tip_lamports = 1000
 max_alt_slot_lag = 32
-max_quote_slot_lag = 32
+max_quote_slot_lag = 16
 message_mode = "v0_required"
 
 [[routes.definitions.execution.lookup_tables]]
@@ -149,10 +155,10 @@ account_key = "rNFfT7TYkjcXPhudX7rXARZkqkDyRnJNsSnh3FMeXJY"
 [routes.definitions.execution_protection]
 base_extra_buy_leg_slippage_bps = 25
 enabled = true
-failure_step_bps = 25
+failure_step_bps = 50
 max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
-tight_max_quote_slot_lag = 24
+tight_max_quote_slot_lag = 16
 
 [[routes.definitions.legs]]
 fee_bps = 4

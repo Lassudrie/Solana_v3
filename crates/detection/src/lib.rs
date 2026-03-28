@@ -13,7 +13,7 @@ pub use account_batcher::{
     RpcAccountValue, RpcContext, decode_lookup_table,
 };
 pub use events::{
-    AccountUpdate, DirectionalPoolQuoteModelUpdate, EventSourceKind, Heartbeat,
+    AccountUpdate, DirectionalPoolQuoteModelUpdate, EventLane, EventSourceKind, Heartbeat,
     InitializedTickUpdate, LatencyMetadata, MarketEvent, NormalizedEvent, PoolInvalidation,
     PoolQuoteModelUpdate, PoolSnapshotUpdate, SlotBoundary, SnapshotConfidence, SourceMetadata,
     TickArrayWindowUpdate,

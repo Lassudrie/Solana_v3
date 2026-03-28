@@ -4,7 +4,7 @@ use std::{
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -303,7 +303,7 @@ impl GrpcEntriesEventSource {
         let registry = Arc::new(TrackedPoolRegistry::from_grpc_config(&config));
         let executable_states = Arc::new(RwLock::new(LiveExecutableStateStore::default()));
         let sync_tracker = Arc::new(Mutex::new(PoolSyncTracker::default()));
-        let (event_tx, event_rx) = mpsc::sync_channel(config.buffer_capacity.max(64));
+        let (event_tx, event_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
 
         let repair_tx = spawn_repair_worker(
@@ -1164,7 +1164,7 @@ fn spawn_stream_worker(
     sync_tracker: Arc<Mutex<PoolSyncTracker>>,
     account_batcher: GetMultipleAccountsBatcher,
     lookup_table_cache: LookupTableCacheHandle,
-    event_tx: SyncSender<NormalizedEvent>,
+    event_tx: Sender<NormalizedEvent>,
     repair_tx: mpsc::Sender<RepairRequest>,
     sequence: Arc<AtomicU64>,
     hooks: Arc<dyn LiveHooks>,
@@ -1269,7 +1269,7 @@ fn handle_entry_batch(
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
     account_batcher: &GetMultipleAccountsBatcher,
     lookup_table_cache: &LookupTableCacheHandle,
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     idle_refresh_slot_lag: u64,
@@ -2466,7 +2466,7 @@ fn invalidate_and_repair(
     source_latency: Option<Duration>,
     executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     hooks: &dyn LiveHooks,
@@ -2535,7 +2535,7 @@ fn schedule_exact_refresh(
     source_latency: Option<Duration>,
     executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     hooks: &dyn LiveHooks,
@@ -2652,7 +2652,7 @@ fn invalidate_live_snapshot_after_advanced_request(
     pool_id: &str,
     observed_slot: u64,
     executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
 ) {
     let invalidation_event = if let Ok(mut store) = executable_states.write() {
@@ -2695,7 +2695,7 @@ fn expire_exact_refreshes(
     registry: &TrackedPoolRegistry,
     executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     hooks: &dyn LiveHooks,
@@ -2892,7 +2892,7 @@ fn requested_observed_slot(
 }
 
 fn publish_slot_boundary(
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
     slot: u64,
     source_received_at: SystemTime,
@@ -2909,7 +2909,7 @@ fn publish_slot_boundary(
 }
 
 fn publish_pool_snapshot_update(
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
     slot: u64,
     source_received_at: SystemTime,
@@ -2946,7 +2946,7 @@ fn publish_pool_snapshot_update(
 }
 
 fn publish_pool_quote_model_update(
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
     slot: u64,
     source_received_at: SystemTime,
@@ -3113,7 +3113,7 @@ fn relative_price_dislocation_bps(left_price_bps: u64, right_price_bps: u64) -> 
 }
 
 fn publish_destabilizing_transaction(
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
     slot: u64,
     source_received_at: SystemTime,
@@ -3183,7 +3183,7 @@ fn spawn_repair_worker(
     registry: Arc<TrackedPoolRegistry>,
     executable_states: Arc<RwLock<LiveExecutableStateStore>>,
     sync_tracker: Arc<Mutex<PoolSyncTracker>>,
-    event_tx: SyncSender<NormalizedEvent>,
+    event_tx: Sender<NormalizedEvent>,
     sequence: Arc<AtomicU64>,
     hooks: Arc<dyn LiveHooks>,
     account_batcher: GetMultipleAccountsBatcher,
@@ -3468,7 +3468,7 @@ fn drain_repair_results(
     result_rx: &mpsc::Receiver<RepairJobResult>,
     executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
-    event_tx: &SyncSender<NormalizedEvent>,
+    event_tx: &Sender<NormalizedEvent>,
     sequence: &Arc<AtomicU64>,
     hooks: &dyn LiveHooks,
     retry_tx: &mpsc::Sender<RepairRequest>,
@@ -4540,6 +4540,8 @@ fn event_with_timing(
     source_latency: Option<Duration>,
     payload: crate::MarketEvent,
 ) -> NormalizedEvent {
+    let lane = crate::events::lane_for_payload(&payload);
+    let normalized_at = SystemTime::now();
     NormalizedEvent {
         payload,
         source: crate::SourceMetadata {
@@ -4549,8 +4551,12 @@ fn event_with_timing(
         },
         latency: crate::LatencyMetadata {
             source_received_at,
-            normalized_at: SystemTime::now(),
+            normalized_at,
             source_latency,
+            router_received_at: normalized_at,
+            state_published_at: None,
+            trigger_blocked_at: None,
+            lane,
         },
     }
 }
@@ -4633,7 +4639,7 @@ fn read_i32(data: &[u8], offset: usize) -> Option<i32> {
     Some(i32::from_le_bytes(buf))
 }
 
-fn send_lossless_event(event_tx: &SyncSender<NormalizedEvent>, event: NormalizedEvent) {
+fn send_lossless_event(event_tx: &Sender<NormalizedEvent>, event: NormalizedEvent) {
     let _ = event_tx.send(event);
 }
 
@@ -6489,7 +6495,7 @@ mod tests {
         }
 
         let (result_tx, result_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
         let (retry_tx, retry_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
         let hooks = NoopLiveHooks;
@@ -6576,7 +6582,7 @@ mod tests {
         }
 
         let (result_tx, result_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
         let (retry_tx, retry_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
         let hooks = NoopLiveHooks;
@@ -6648,7 +6654,7 @@ mod tests {
         }
 
         let (result_tx, result_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
         let (retry_tx, retry_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
         let hooks = NoopLiveHooks;
@@ -6770,7 +6776,7 @@ mod tests {
             SyncCompletionDisposition::Advanced { observed_slot: 105 }
         );
 
-        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
         invalidate_live_snapshot_after_advanced_request(
             &pool_id,
@@ -6832,7 +6838,7 @@ mod tests {
         }
 
         let (result_tx, result_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
         let (retry_tx, retry_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
         let hooks = NoopLiveHooks;
@@ -7001,7 +7007,7 @@ mod tests {
                 },
             ));
         let sync_tracker = Arc::new(Mutex::new(PoolSyncTracker::default()));
-        let (event_tx, event_rx) = mpsc::sync_channel(4);
+        let (event_tx, event_rx) = mpsc::channel();
         let (repair_tx, repair_rx) = mpsc::channel();
         let sequence = Arc::new(AtomicU64::new(1));
         let hooks = NoopLiveHooks;

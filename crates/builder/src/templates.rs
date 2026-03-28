@@ -24,43 +24,18 @@ impl AtomicTwoLegTemplate {
     pub fn materialize_leg_plans(
         &self,
         candidate: &OpportunityCandidate,
-        route_execution: &RouteExecutionConfig,
+        _route_execution: &RouteExecutionConfig,
     ) -> RouteLegSequence<AtomicLegPlan> {
         let quote_legs = candidate.leg_quotes.as_slice();
-        let execution_legs = route_execution.legs.as_slice();
-        let route_input_buffer_allowance = quote_legs
-            .first()
-            .zip(execution_legs.first())
-            .filter(|(quote_leg, execution_leg)| execution_leg.supports_exact_out(quote_leg.side))
-            .map(|(quote_leg, _)| {
-                apply_input_buffer(
-                    quote_leg.input_amount,
-                    candidate.active_execution_buffer_bps.unwrap_or(0),
-                )
-                .saturating_sub(quote_leg.input_amount)
-            })
-            .unwrap_or(0);
         let mut plans = Vec::with_capacity(quote_legs.len());
         for index in 0..quote_legs.len() {
             let quote_leg = &quote_legs[index];
-            let execution_leg = &execution_legs[index];
             let (amount_mode, specified_amount, other_amount_threshold) =
                 if index + 1 == quote_legs.len() {
                     (
                         SwapAmountMode::ExactIn,
                         quote_leg.input_amount,
-                        route_minimum_acceptable_output(candidate)
-                            .saturating_add(route_input_buffer_allowance)
-                            .min(quote_leg.output_amount),
-                    )
-                } else if execution_leg.supports_exact_out(quote_leg.side) {
-                    (
-                        SwapAmountMode::ExactOut,
-                        quote_legs[index + 1].input_amount,
-                        apply_input_buffer(
-                            quote_leg.input_amount,
-                            candidate.active_execution_buffer_bps.unwrap_or(0),
-                        ),
+                        route_minimum_acceptable_output(candidate).min(quote_leg.output_amount),
                     )
                 } else {
                     (
@@ -121,19 +96,6 @@ fn route_minimum_acceptable_output(candidate: &OpportunityCandidate) -> u64 {
     candidate.minimum_acceptable_output
 }
 
-fn apply_input_buffer(amount: u64, buffer_bps: u16) -> u64 {
-    if buffer_bps == 0 {
-        return amount;
-    }
-
-    let numerator = u128::from(amount).saturating_mul(10_000u128 + u128::from(buffer_bps));
-    numerator
-        .saturating_add(9_999)
-        .checked_div(10_000)
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use domain::{PoolId, RouteId};
@@ -167,9 +129,14 @@ mod tests {
             p_land_bps: 10_000,
             expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: None,
+            source_input_balance: None,
             expected_net_output: 10_250,
             minimum_acceptable_output: 10_175,
             expected_gross_profit_quote_atoms: 350,
+            estimated_network_fee_lamports: 0,
+            estimated_network_fee_quote_atoms: 100,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 100,
             expected_net_profit_quote_atoms: 250,
@@ -183,6 +150,7 @@ mod tests {
                     output_amount: 10_120,
                     fee_paid: 10,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
                 LegQuote {
                     venue: "venue-b".into(),
@@ -192,6 +160,7 @@ mod tests {
                     output_amount: 10_250,
                     fee_paid: 10,
                     current_tick_index: None,
+                    ticks_crossed: 0,
                 },
             ]
             .into(),
@@ -266,9 +235,9 @@ mod tests {
         let first = &plans[0];
         let second = &plans[1];
 
-        assert_eq!(first.amount_mode, SwapAmountMode::ExactOut);
-        assert_eq!(first.specified_amount, 10_120);
-        assert_eq!(first.other_amount_threshold, 10_000);
+        assert_eq!(first.amount_mode, SwapAmountMode::ExactIn);
+        assert_eq!(first.specified_amount, 10_000);
+        assert_eq!(first.other_amount_threshold, 10_120);
         assert_eq!(second.amount_mode, SwapAmountMode::ExactIn);
         assert_eq!(second.specified_amount, 10_120);
         assert_eq!(second.other_amount_threshold, 10_175);
@@ -301,15 +270,15 @@ mod tests {
             second.other_amount_threshold,
             candidate.leg_quotes[1].output_amount
         );
-        assert_eq!(first.specified_amount, candidate.leg_quotes[1].input_amount);
+        assert_eq!(first.specified_amount, candidate.leg_quotes[0].input_amount);
         assert_eq!(
             first.other_amount_threshold,
-            candidate.leg_quotes[0].input_amount
+            candidate.leg_quotes[1].input_amount
         );
     }
 
     #[test]
-    fn exact_out_first_leg_applies_active_execution_buffer_to_max_input() {
+    fn active_execution_buffer_does_not_reintroduce_exact_out_on_leg1() {
         let mut candidate = candidate();
         candidate.active_execution_buffer_bps = Some(25);
 
@@ -317,13 +286,16 @@ mod tests {
         let plans = template.materialize_leg_plans(&candidate, &route_execution(true));
         let first = &plans[0];
 
-        assert_eq!(first.amount_mode, SwapAmountMode::ExactOut);
-        assert_eq!(first.specified_amount, candidate.leg_quotes[1].input_amount);
-        assert_eq!(first.other_amount_threshold, 10_025);
+        assert_eq!(first.amount_mode, SwapAmountMode::ExactIn);
+        assert_eq!(first.specified_amount, candidate.leg_quotes[0].input_amount);
+        assert_eq!(
+            first.other_amount_threshold,
+            candidate.leg_quotes[1].input_amount
+        );
     }
 
     #[test]
-    fn exact_out_first_leg_raises_final_min_output_by_buffer_allowance() {
+    fn active_execution_buffer_does_not_raise_final_min_output_floor() {
         let mut candidate = candidate();
         candidate.active_execution_buffer_bps = Some(25);
 
@@ -336,6 +308,9 @@ mod tests {
             second.specified_amount,
             candidate.leg_quotes[1].input_amount
         );
-        assert_eq!(second.other_amount_threshold, 10_200);
+        assert_eq!(
+            second.other_amount_threshold,
+            candidate.minimum_acceptable_output
+        );
     }
 }

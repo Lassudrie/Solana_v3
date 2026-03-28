@@ -1,4 +1,6 @@
+use base64::Engine;
 use std::{
+    collections::HashMap,
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -10,12 +12,16 @@ use serde_json::json;
 use state::types::LookupTableSnapshot;
 
 use crate::account_batcher::{
-    GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcContext, decode_lookup_table,
+    GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcAccountValue, RpcContext,
+    decode_lookup_table,
 };
 use crate::config::AsyncRefreshConfig;
 use crate::rpc::{RpcError, RpcRateLimitBackoff, rpc_call};
 
 const MOCK_SCHEME: &str = "mock://";
+const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
+const SPL_TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
+const SPL_TOKEN_ACCOUNT_STATE_OFFSET: usize = 108;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockhashRefresh {
@@ -42,6 +48,12 @@ pub struct WalletRefresh {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTokenBalancesRefresh {
+    pub balances: HashMap<String, u64>,
+    pub slot: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefreshFailure {
     pub worker: &'static str,
     pub detail: String,
@@ -53,6 +65,7 @@ pub struct AsyncRefreshSnapshot {
     pub slot: Option<SlotRefresh>,
     pub lookup_tables: Option<LookupTablesRefresh>,
     pub wallet: Option<WalletRefresh>,
+    pub source_token_balances: Option<SourceTokenBalancesRefresh>,
     pub failures: Vec<RefreshFailure>,
 }
 
@@ -61,6 +74,7 @@ enum RefreshUpdate {
     Slot(SlotRefresh),
     LookupTables(LookupTablesRefresh),
     Wallet(WalletRefresh),
+    SourceTokenBalances(SourceTokenBalancesRefresh),
     Failure(RefreshFailure),
 }
 
@@ -75,6 +89,7 @@ impl AsyncStateRefresher {
         rpc_http_endpoint: &str,
         wallet_pubkey: &str,
         lookup_table_keys: &[String],
+        source_token_accounts: &[String],
         account_batcher: GetMultipleAccountsBatcher,
     ) -> Self {
         if !config.enabled
@@ -125,11 +140,25 @@ impl AsyncStateRefresher {
         if config.wallet_refresh_millis > 0 && !wallet_pubkey.is_empty() {
             let wallet_pubkey = wallet_pubkey.to_owned();
             spawn_refresher(
-                sender,
+                sender.clone(),
                 Duration::from_millis(config.wallet_refresh_millis),
                 "wallet",
                 RpcRefreshClient::new(rpc_http_endpoint),
                 move |client| client.wallet_balance_update(&wallet_pubkey),
+            );
+        }
+
+        if config.wallet_refresh_millis > 0 && !source_token_accounts.is_empty() {
+            let source_token_accounts = source_token_accounts.to_vec();
+            let account_batcher = account_batcher.clone();
+            spawn_refresher(
+                sender,
+                Duration::from_millis(config.wallet_refresh_millis),
+                "source_token_balances",
+                RpcRefreshClient::new(rpc_http_endpoint),
+                move |_client| {
+                    source_token_balances_update(&account_batcher, &source_token_accounts)
+                },
             );
         }
 
@@ -157,6 +186,9 @@ impl AsyncStateRefresher {
                     snapshot.lookup_tables = Some(lookup_tables);
                 }
                 RefreshUpdate::Wallet(wallet) => snapshot.wallet = Some(wallet),
+                RefreshUpdate::SourceTokenBalances(source_token_balances) => {
+                    snapshot.source_token_balances = Some(source_token_balances);
+                }
                 RefreshUpdate::Failure(failure) => snapshot.failures.push(failure),
             }
         }
@@ -254,6 +286,55 @@ fn lookup_tables_update(
     }))
 }
 
+fn source_token_balances_update(
+    account_batcher: &GetMultipleAccountsBatcher,
+    account_keys: &[String],
+) -> Result<RefreshUpdate, String> {
+    let fetched = account_batcher
+        .fetch(account_keys)
+        .map_err(|error| error.to_string())?;
+    let mut balances = HashMap::with_capacity(account_keys.len());
+    for account_key in account_keys {
+        let Some(account) = fetched.values_by_key.get(account_key).cloned().flatten() else {
+            continue;
+        };
+        let amount = parse_spl_token_amount(&account)?;
+        balances.insert(account_key.clone(), amount);
+    }
+    Ok(RefreshUpdate::SourceTokenBalances(
+        SourceTokenBalancesRefresh {
+            balances,
+            slot: fetched.slot,
+        },
+    ))
+}
+
+fn parse_spl_token_amount(account: &RpcAccountValue) -> Result<u64, String> {
+    if account.data.1 != "base64" {
+        return Err(format!("unsupported account encoding {}", account.data.1));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(account.data.0.as_bytes())
+        .map_err(|error| error.to_string())?;
+    if bytes.len() < SPL_TOKEN_ACCOUNT_LEN {
+        return Err(format!(
+            "account data too short: expected at least {SPL_TOKEN_ACCOUNT_LEN} bytes, got {}",
+            bytes.len()
+        ));
+    }
+    if bytes[SPL_TOKEN_ACCOUNT_STATE_OFFSET] != 1 {
+        return Err(format!(
+            "token account is not initialized (state={})",
+            bytes[SPL_TOKEN_ACCOUNT_STATE_OFFSET]
+        ));
+    }
+    let mut amount_bytes = [0u8; 8];
+    amount_bytes.copy_from_slice(
+        &bytes[SPL_TOKEN_ACCOUNT_AMOUNT_OFFSET..SPL_TOKEN_ACCOUNT_AMOUNT_OFFSET + 8],
+    );
+    Ok(u64::from_le_bytes(amount_bytes))
+}
+
 fn spawn_refresher<F>(
     sender: mpsc::Sender<RefreshUpdate>,
     interval: Duration,
@@ -347,6 +428,7 @@ mod tests {
                 slot: Some(SlotRefresh { slot: 42 }),
                 lookup_tables: None,
                 wallet: None,
+                source_token_balances: None,
                 failures: Vec::new(),
             }
         );

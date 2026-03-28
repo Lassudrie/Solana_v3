@@ -397,6 +397,7 @@ fn normalized_event(
         *next_sequence += 1;
         current
     });
+    let lane = crate::events::lane_for_payload(&payload);
     NormalizedEvent {
         payload,
         source: SourceMetadata {
@@ -408,6 +409,10 @@ fn normalized_event(
             source_received_at: now,
             normalized_at: now,
             source_latency: None,
+            router_received_at: now,
+            state_published_at: None,
+            trigger_blocked_at: None,
+            lane,
         },
     }
 }

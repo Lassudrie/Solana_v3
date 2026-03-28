@@ -50,6 +50,7 @@ pub struct ExecutionRecord {
     pub quoted_slot: u64,
     pub blockhash_slot: Option<u64>,
     pub submitted_slot: Option<u64>,
+    pub terminal_slot: Option<u64>,
     pub inclusion_status: InclusionStatus,
     pub outcome: ExecutionOutcome,
     pub profit_mint: Option<String>,
@@ -113,6 +114,7 @@ impl ExecutionTracker {
             quoted_slot,
             blockhash_slot,
             submitted_slot,
+            terminal_slot: None,
             inclusion_status,
             outcome,
             profit_mint: None,
@@ -206,11 +208,26 @@ impl ExecutionTracker {
         true
     }
 
+    pub fn set_terminal_slot(&mut self, submission_id: &SubmissionId, terminal_slot: u64) -> bool {
+        let Some(record) = self.history.get_mut(submission_id) else {
+            return false;
+        };
+        record.terminal_slot = Some(terminal_slot);
+        record.last_updated_at = SystemTime::now();
+        true
+    }
+
     pub fn pending_count(&self) -> usize {
         self.history
             .values()
             .filter(|record| record.outcome == ExecutionOutcome::Pending)
             .count()
+    }
+
+    pub fn has_pending_route(&self, route_id: &RouteId) -> bool {
+        self.history.values().any(|record| {
+            record.outcome == ExecutionOutcome::Pending && record.route_id == *route_id
+        })
     }
 
     pub fn pending_records(&self) -> Vec<ExecutionRecord> {

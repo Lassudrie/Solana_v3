@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread::{self, JoinHandle},
@@ -16,10 +16,14 @@ use thiserror::Error;
 
 use crate::{
     account_batcher::GetMultipleAccountsBatcher,
-    bootstrap::{BootstrapError, bootstrap_with_health},
+    bootstrap::{
+        BootstrapError, bootstrap_with_health, collect_route_input_source_accounts,
+        route_enabled_in_profile,
+    },
     build_sign_dispatch::{BuildSignDispatcher, EnqueueError as BuildSignEnqueueError},
     config::{BotConfig, RuntimeControlConfig},
     control::{RuntimeIssue, RuntimeMode, RuntimeStatus, SharedRuntimeStatus},
+    ingress::IngressRouter,
     observer::ObserverHandle,
     refresh::{AsyncStateRefresher, RefreshFailure},
     route_health::RouteHealthRegistry,
@@ -241,6 +245,7 @@ pub struct BotDaemon {
     reconciliation_worker: ReconciliationWorker,
     refresher: AsyncStateRefresher,
     source: Box<dyn MarketEventSource>,
+    ingress: IngressRouter,
     status: SharedRuntimeStatus,
     observer: ObserverHandle,
     control: RuntimeControlConfig,
@@ -280,20 +285,22 @@ impl BotDaemon {
             .map_err(|source| DaemonError::SubmitDispatcher { source })?;
         let build_sign_dispatcher = BuildSignDispatcher::new(
             runtime.build_sign_pipeline(),
-            config.submit.worker_count,
-            config.submit.queue_capacity,
-            config.submit.congestion_threshold_pct,
+            config.build_sign.worker_count,
+            config.build_sign.queue_capacity,
+            config.build_sign.congestion_threshold_pct,
         )
         .map_err(|source| DaemonError::BuildSignDispatcher { source })?;
-        let account_batcher = GetMultipleAccountsBatcher::new_with_window(
+        let account_batcher = GetMultipleAccountsBatcher::new_with_window_and_parallel_rpc_requests(
             &config.reconciliation.rpc_http_endpoint,
             Duration::from_millis(config.reconciliation.account_batch_window_millis),
+            config.reconciliation.account_batch_parallel_rpc_requests,
         );
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
         let lookup_table_keys = config
             .routes
             .definitions
             .iter()
+            .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
             .flat_map(|route| {
                 route
                     .execution
@@ -304,11 +311,31 @@ impl BotDaemon {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let active_routes = config
+            .routes
+            .definitions
+            .iter()
+            .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
+            .collect::<Vec<_>>();
+        let source_token_accounts = collect_route_input_source_accounts(
+            &active_routes,
+            runtime.wallet_pubkey(),
+        )
+        .map_err(DaemonError::Bootstrap)?;
+        let account_to_pool = active_routes
+            .iter()
+            .flat_map(|route| {
+                route.account_dependencies.iter().map(|dependency| {
+                    (dependency.account_key.clone(), dependency.pool_id.clone())
+                })
+            })
+            .collect::<HashMap<_, _>>();
         let refresher = AsyncStateRefresher::new(
             &config.runtime.refresh,
             &config.reconciliation.rpc_http_endpoint,
             runtime.wallet_pubkey(),
             &lookup_table_keys,
+            &source_token_accounts,
             account_batcher.clone(),
         );
         let lookup_table_cache = refresher.lookup_table_cache_handle();
@@ -339,6 +366,7 @@ impl BotDaemon {
             reconciliation_worker,
             refresher,
             source,
+            ingress: IngressRouter::new(&config.runtime.parallelism, account_to_pool),
             status,
             observer,
             control: config.runtime.control.clone(),
@@ -382,10 +410,18 @@ impl BotDaemon {
                 self.refresh_status(None, None, None);
             }
 
+            let mut ingested_events;
             match self.source.wait_next(idle_wait) {
-                Ok(Some(event)) => self.process_source_event(event),
-                Ok(None) => continue,
+                Ok(Some(event)) => {
+                    self.ingest_source_event(event);
+                    ingested_events = true;
+                }
+                Ok(None) => {
+                    self.drain_ingress(max_events_per_tick);
+                    continue;
+                }
                 Err(IngestError::Exhausted { .. }) => {
+                    self.flush_ingress();
                     self.flush_build_sign_dispatcher();
                     self.flush_submit_dispatcher();
                     self.flush_reconciliation_worker();
@@ -394,6 +430,7 @@ impl BotDaemon {
                         Some(RuntimeIssue::EventSourceExhausted),
                         None,
                     );
+                    self.flush_persistence();
                     return Ok(DaemonExit::SourceExhausted);
                 }
                 Err(error) => {
@@ -404,9 +441,13 @@ impl BotDaemon {
 
             for _ in 1..max_events_per_tick {
                 match self.source.poll_next() {
-                    Ok(Some(event)) => self.process_source_event(event),
+                    Ok(Some(event)) => {
+                        self.ingest_source_event(event);
+                        ingested_events = true;
+                    }
                     Ok(None) => break,
                     Err(IngestError::Exhausted { .. }) => {
+                        self.flush_ingress();
                         self.flush_build_sign_dispatcher();
                         self.flush_submit_dispatcher();
                         self.flush_reconciliation_worker();
@@ -415,6 +456,7 @@ impl BotDaemon {
                             Some(RuntimeIssue::EventSourceExhausted),
                             None,
                         );
+                        self.flush_persistence();
                         return Ok(DaemonExit::SourceExhausted);
                     }
                     Err(error) => {
@@ -424,17 +466,70 @@ impl BotDaemon {
                 }
             }
 
+            if ingested_events {
+                self.drain_ingress(max_events_per_tick);
+            }
             self.drain_build_sign_completions();
             self.drain_submit_completions();
             self.drain_reconciliation_updates();
         }
     }
 
+    #[cfg(test)]
     fn process_source_event(&mut self, event: NormalizedEvent) {
+        self.ingest_source_event(event);
+        self.drain_ingress(self.control.max_events_per_tick.max(1));
+    }
+
+    fn ingest_source_event(&mut self, event: NormalizedEvent) {
         if event.source.source == EventSourceKind::ShredStream {
             self.record_shredstream_metrics(&event);
         }
+        let stats = self.ingress.route(event);
+        if stats.coalesced_updates > 0 {
+            self.runtime
+                .telemetry()
+                .metrics
+                .increment_state_coalesced_updates(stats.coalesced_updates);
+        }
+        self.runtime
+            .telemetry()
+            .metrics
+            .set_state_dirty_mailboxes(stats.state_dirty_mailboxes);
+        self.runtime
+            .telemetry()
+            .metrics
+            .set_trigger_queue_depth(stats.trigger_queue_depth);
+    }
 
+    fn drain_ingress(&mut self, budget: usize) {
+        for _ in 0..budget.max(1) {
+            let Some(event) = self.ingress.pop_next() else {
+                break;
+            };
+            self.process_ingress_event(event);
+        }
+        self.refresh_ingress_metrics();
+    }
+
+    fn flush_ingress(&mut self) {
+        while self.ingress.has_pending() {
+            self.drain_ingress(self.control.max_events_per_tick.max(1));
+        }
+    }
+
+    fn refresh_ingress_metrics(&self) {
+        self.runtime
+            .telemetry()
+            .metrics
+            .set_state_dirty_mailboxes(self.ingress.state_dirty_mailboxes());
+        self.runtime
+            .telemetry()
+            .metrics
+            .set_trigger_queue_depth(self.ingress.trigger_queue_depth());
+    }
+
+    fn process_ingress_event(&mut self, event: NormalizedEvent) {
         let additional_pending = self
             .submit_dispatcher
             .pending_count()
@@ -772,6 +867,10 @@ impl BotDaemon {
         active
     }
 
+    fn flush_persistence(&self) {
+        let _ = self.observer.flush_persistence(Duration::from_secs(2));
+    }
+
     fn record_shredstream_metrics(&mut self, event: &NormalizedEvent) {
         let source_received_at = event.latency.source_received_at;
         let source_event_at = event.latency.source_event_at();
@@ -971,27 +1070,68 @@ impl BotDaemon {
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine;
     use detection::{EventSourceKind, NormalizedEvent};
     use domain::{PoolSnapshotUpdate, SnapshotConfidence, types::PoolVenue};
     use serde_json::{Value, json};
-    use solana_sdk::{hash::hashv, pubkey::Pubkey, signer::keypair::Keypair};
+    use solana_sdk::{
+        hash::hashv,
+        pubkey::Pubkey,
+        signer::{Signer as SolanaSigner, keypair::Keypair},
+    };
     use std::{
         env, fs,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
         path::PathBuf,
+        str::FromStr,
         sync::Arc,
         thread,
     };
 
     use crate::config::{
-        AccountDependencyConfig, BotConfig, EventSourceMode, MessageModeConfig,
+        AccountDependencyConfig, BotConfig, EventSourceMode, JitoTipModeConfig, MessageModeConfig,
         OrcaSimplePoolLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteClassConfig,
         RouteConfig, RouteExecutionConfig, RouteKindConfig, RouteLegConfig,
         RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
     };
+    use crate::refresh::{AsyncRefreshSnapshot, SourceTokenBalancesRefresh};
 
     use super::{BotDaemon, DaemonExit};
+
+    const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
+    const SPL_TOKEN_ACCOUNT_AMOUNT_OFFSET: usize = 64;
+    const SPL_TOKEN_ACCOUNT_STATE_OFFSET: usize = 108;
+
+    fn seed_source_input_balance(daemon: &mut BotDaemon) {
+        daemon.runtime.apply_async_refresh(AsyncRefreshSnapshot {
+            source_token_balances: Some(SourceTokenBalancesRefresh {
+                balances: std::collections::HashMap::from([(
+                    test_pubkey("route-input-ata"),
+                    1_000_000,
+                )]),
+                slot: daemon.runtime.latest_slot(),
+            }),
+            ..AsyncRefreshSnapshot::default()
+        });
+    }
+
+    fn token_account_data(mint: &str, owner: &str, amount: u64) -> String {
+        let mut bytes = vec![0u8; SPL_TOKEN_ACCOUNT_LEN];
+        bytes[..32].copy_from_slice(&Pubkey::from_str(mint).expect("mint").to_bytes());
+        bytes[32..64].copy_from_slice(&Pubkey::from_str(owner).expect("owner").to_bytes());
+        bytes[SPL_TOKEN_ACCOUNT_AMOUNT_OFFSET..SPL_TOKEN_ACCOUNT_AMOUNT_OFFSET + 8]
+            .copy_from_slice(&amount.to_le_bytes());
+        bytes[SPL_TOKEN_ACCOUNT_STATE_OFFSET] = 1;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn rpc_token_account(owner_program: &str, mint: &str, owner: &str, amount: u64) -> Value {
+        json!({
+            "owner": owner_program,
+            "data": [token_account_data(mint, owner, amount), "base64"]
+        })
+    }
 
     #[test]
     fn daemon_processes_jsonl_replay_and_reaches_submit() {
@@ -1009,6 +1149,7 @@ mod tests {
         let mut config = bot_config(path.to_string_lossy().into_owned());
         config.runtime.health_server.enabled = false;
         let mut daemon = BotDaemon::from_config(config).unwrap();
+        seed_source_input_balance(&mut daemon);
 
         let exit = daemon.run().unwrap();
         let status = daemon.status_snapshot();
@@ -1043,6 +1184,7 @@ mod tests {
         config.runtime.control.kill_switch_sentinel_path =
             Some(kill_switch.to_string_lossy().into_owned());
         let mut daemon = BotDaemon::from_config(config).unwrap();
+        seed_source_input_balance(&mut daemon);
 
         let exit = daemon.run().unwrap();
         let status = daemon.status_snapshot();
@@ -1069,6 +1211,10 @@ mod tests {
         .unwrap();
 
         let latest_blockhash = hashv(&[b"daemon-reconcile-test-blockhash"]).to_string();
+        let wallet_owner = Keypair::new_from_array([7; 32]).pubkey().to_string();
+        let source_account = test_pubkey("route-input-ata");
+        let token_program_id = test_pubkey("spl-token-program");
+        let input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".to_string();
         let rpc_endpoint = spawn_mock_rpc_server(move |body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
             match payload["method"].as_str().expect("method") {
@@ -1089,6 +1235,31 @@ mod tests {
                 "getSignatureStatuses" => {
                     json!({ "result": { "value": [{ "slot": 99, "err": null }] } }).to_string()
                 }
+                "getTransaction" => json!({ "result": null }).to_string(),
+                "getMultipleAccounts" => {
+                    let keys = payload["params"][0].as_array().expect("account keys");
+                    json!({
+                        "result": {
+                            "context": { "slot": 0 },
+                            "value": keys
+                                .iter()
+                                .map(|key| {
+                                    if key.as_str() == Some(source_account.as_str()) {
+                                        rpc_token_account(
+                                            &token_program_id,
+                                            &input_mint,
+                                            &wallet_owner,
+                                            1_000_000,
+                                        )
+                                    } else {
+                                        Value::Null
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        }
+                    })
+                    .to_string()
+                }
                 other => panic!("unexpected method {other}"),
             }
         });
@@ -1100,6 +1271,7 @@ mod tests {
         config.reconciliation.websocket_enabled = false;
         config.reconciliation.poll_interval_millis = 0;
         let mut daemon = BotDaemon::from_config(config).unwrap();
+        seed_source_input_balance(&mut daemon);
 
         let exit = daemon.run().unwrap();
         let status = daemon.status_snapshot();
@@ -1122,6 +1294,7 @@ mod tests {
             "route-b", "pool-c", "pool-d", "acct-c", "acct-d",
         ));
         let mut daemon = BotDaemon::from_config(config).unwrap();
+        seed_source_input_balance(&mut daemon);
 
         daemon.process_source_event(replay_snapshot_event("pool-a", 1, 5_000));
         daemon.process_source_event(replay_snapshot_event("pool-b", 2, 20_000));
@@ -1146,6 +1319,7 @@ mod tests {
         config.builder.compute_unit_limit = 300_000;
         config.builder.compute_unit_price_micro_lamports = 1;
         config.builder.jito_tip_lamports = 1;
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
         config.signing.validate_execution_accounts = false;
         config.runtime.live_set_health.enabled = false;
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();

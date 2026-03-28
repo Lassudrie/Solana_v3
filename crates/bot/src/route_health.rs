@@ -259,7 +259,7 @@ impl RouteHealthRegistry {
     pub fn on_execution_failure(
         &mut self,
         route_id: &RouteId,
-        _class: &FailureClass,
+        class: &FailureClass,
         observed_slot: u64,
     ) {
         let record = self.routes.entry(route_id.0.clone()).or_default();
@@ -269,10 +269,31 @@ impl RouteHealthRegistry {
             observed_slot,
             self.config.route_failure_window_slots,
         );
+        if matches!(
+            class,
+            FailureClass::ChainExecutionTooLittleOutput
+                | FailureClass::ChainExecutionAmountInAboveMaximum
+        ) && self.config.route_targeted_failure_cooldown_slots > 0
+        {
+            let targeted_shadow_until =
+                observed_slot.saturating_add(self.config.route_targeted_failure_cooldown_slots);
+            record.shadow_until_slot = Some(
+                record
+                    .shadow_until_slot
+                    .map(|slot| slot.max(targeted_shadow_until))
+                    .unwrap_or(targeted_shadow_until),
+            );
+        }
         if record.recent_failure_slots.len() as u32 >= self.config.route_shadow_after_chain_failures
         {
-            record.shadow_until_slot =
-                Some(observed_slot.saturating_add(self.config.route_reentry_cooldown_slots));
+            let budget_shadow_until =
+                observed_slot.saturating_add(self.config.route_reentry_cooldown_slots);
+            record.shadow_until_slot = Some(
+                record
+                    .shadow_until_slot
+                    .map(|slot| slot.max(budget_shadow_until))
+                    .unwrap_or(budget_shadow_until),
+            );
         }
     }
 
@@ -821,6 +842,7 @@ mod tests {
     #[test]
     fn route_moves_to_shadow_only_after_failure_budget() {
         let mut config = LiveSetHealthConfig::default();
+        config.route_targeted_failure_cooldown_slots = 0;
         config.route_shadow_after_chain_failures = 2;
         config.route_reentry_cooldown_slots = 8;
         let mut registry = RouteHealthRegistry::new(config, 2);
@@ -857,6 +879,37 @@ mod tests {
         assert_eq!(route.health_state, RouteHealthState::ShadowOnly);
 
         let route = registry.route_views(21).pop().unwrap();
+        assert_eq!(route.health_state, RouteHealthState::Eligible);
+    }
+
+    #[test]
+    fn targeted_chain_failure_immediately_shadows_route() {
+        let mut config = LiveSetHealthConfig::default();
+        config.route_targeted_failure_cooldown_slots = 8;
+        config.route_shadow_after_chain_failures = 2;
+        let mut registry = RouteHealthRegistry::new(config, 2);
+        registry.register_route(
+            RouteId("route-a".into()),
+            &[state::types::PoolId("pool-a".into())],
+            32,
+        );
+        registry.on_pool_snapshot(
+            &snapshot("pool-a", 10, 10, PoolConfidence::Executable, false),
+            true,
+            10,
+        );
+
+        registry.on_execution_failure(
+            &RouteId("route-a".into()),
+            &FailureClass::ChainExecutionTooLittleOutput,
+            11,
+        );
+
+        let route = registry.route_views(11).pop().unwrap();
+        assert_eq!(route.health_state, RouteHealthState::ShadowOnly);
+        assert_eq!(route.shadow_until_slot, Some(19));
+
+        let route = registry.route_views(20).pop().unwrap();
         assert_eq!(route.health_state, RouteHealthState::Eligible);
     }
 

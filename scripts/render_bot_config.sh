@@ -93,7 +93,7 @@ function print_signing_overrides() {
     print "provider = \"secure_unix\""
     print "owner_pubkey = \"\""
     print "socket_path = \"" signer_socket "\""
-    print "validate_execution_accounts = false"
+    print "validate_execution_accounts = true"
 }
 
 function print_runtime_overrides(printed_any) {
@@ -129,11 +129,6 @@ function print_strategy_overrides() {
     print "sizing.min_trade_floor_sol_lamports = 100000000"
 }
 
-function print_builder_overrides() {
-    print "compute_unit_price_micro_lamports = 1"
-    print "jito_tip_lamports = 1"
-}
-
 BEGIN {
     inserted_runtime_overrides = 0
     inserted_shredstream_table = 0
@@ -144,8 +139,6 @@ BEGIN {
     printed_strategy_overrides = 0
     in_runtime_monitor_server = 0
     printed_runtime_monitor_server_enabled = 0
-    in_builder = 0
-    printed_builder_overrides = 0
 }
 
 /^\[/ {
@@ -154,9 +147,6 @@ BEGIN {
     }
     if (in_runtime_monitor_server && !printed_runtime_monitor_server_enabled) {
         print "enabled = true"
-    }
-    if (in_builder && !printed_builder_overrides) {
-        print_builder_overrides()
     }
 
     if (!inserted_runtime_overrides && $0 == "[state]") {
@@ -196,15 +186,6 @@ BEGIN {
         next
     }
 
-    in_builder = ($0 == "[builder]")
-    printed_builder_overrides = 0
-    if (in_builder) {
-        print $0
-        print_builder_overrides()
-        printed_builder_overrides = 1
-        next
-    }
-
     print $0
     next
 }
@@ -234,23 +215,12 @@ BEGIN {
         next
     }
 
-    if (in_builder) {
-        if ($0 ~ /^(compute_unit_price_micro_lamports|jito_tip_lamports)[[:space:]]*=/) {
-            next
-        }
-        print
-        next
-    }
-
     print
 }
 
 END {
     if (in_strategy && !printed_strategy_overrides) {
         print_strategy_overrides()
-    }
-    if (in_builder && !printed_builder_overrides) {
-        print_builder_overrides()
     }
     if (in_runtime_monitor_server && !printed_runtime_monitor_server_enabled) {
         print "enabled = true"

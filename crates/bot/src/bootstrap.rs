@@ -24,8 +24,9 @@ use strategy::{
     StrategyPlane,
     guards::GuardrailConfig,
     route_registry::{
-        ExecutionProtectionPolicy, RouteDefinition, RouteKind, RouteLeg, RouteLegSequence,
-        RouteSizingPolicy, RouteValidationError, SizingMode, StrategySizingConfig, SwapSide,
+        ExecutionProtectionPolicy, JitoTipMode, JitoTipPolicy, RouteDefinition, RouteKind,
+        RouteLeg, RouteLegSequence, RouteSizingPolicy, RouteValidationError, SizingMode,
+        StrategySizingConfig, SwapSide,
     },
 };
 use thiserror::Error;
@@ -33,15 +34,15 @@ use thiserror::Error;
 use crate::{
     account_batcher::{GetMultipleAccountsBatcher, RpcContext, decode_lookup_table},
     config::{
-        BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteKindConfig,
-        RouteLegExecutionConfig, RuntimeProfileConfig, SigningConfig, SigningProviderKind,
-        SwapSideConfig,
+        BotConfig, BuilderConfig, JitoTipModeConfig, MessageModeConfig, RouteClassConfig,
+        RouteKindConfig, RouteLegExecutionConfig, RuntimeProfileConfig, SigningConfig,
+        SigningProviderKind, SingleTransactionSubmitPolicyConfig, SwapSideConfig,
     },
     route_health::SharedRouteHealth,
     rpc::rpc_call,
     runtime::{
         AltCacheService, BlockhashService, BotRuntime, ColdPathServices, HotPathPipeline,
-        WalletRefreshService, WarmupCoordinator,
+        SourceTokenBalanceService, WalletRefreshService, WarmupCoordinator,
     },
     submit_factory::{build_submitter, submit_mode_from_config},
 };
@@ -51,6 +52,8 @@ const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
 const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MOCK_SCHEME: &str = "mock://";
+const CONCENTRATED_ROUTE_MINIMUM_COMPUTE_UNIT_LIMIT: u32 = 420_000;
+const CONCENTRATED_ROUTE_DEFAULT_COMPUTE_UNIT_LIMIT: u32 = 450_000;
 const SPL_TOKEN_ACCOUNT_LEN: usize = 165;
 const SPL_TOKEN_ACCOUNT_STATE_OFFSET: usize = 108;
 
@@ -78,6 +81,7 @@ struct RequiredTokenAccount {
     token_program_id: String,
     wallet_owner: String,
     expected_mint: Option<String>,
+    must_exist: bool,
     sources: BTreeSet<String>,
 }
 
@@ -114,6 +118,7 @@ struct RpcAccountInfo {
 struct ParsedTokenAccount {
     mint: String,
     owner: String,
+    amount: u64,
 }
 
 pub fn bootstrap(config: BotConfig) -> Result<BotRuntime, BootstrapError> {
@@ -150,7 +155,7 @@ pub fn bootstrap_with_health(
         .decoder_registry_mut()
         .register(RaydiumClmmPoolDecoder);
 
-    let mut strategy = StrategyPlane::new(
+    let mut strategy = StrategyPlane::with_parallelism(
         GuardrailConfig {
             min_profit_quote_atoms: config.strategy.min_profit_quote_atoms,
             min_profit_bps: config.strategy.min_profit_bps,
@@ -178,8 +183,28 @@ pub fn bootstrap_with_health(
             max_inflight_penalty_bps: config.strategy.sizing.max_inflight_penalty_bps,
             blockhash_penalty_bps_per_slot: config.strategy.sizing.blockhash_penalty_bps_per_slot,
             max_blockhash_penalty_bps: config.strategy.sizing.max_blockhash_penalty_bps,
+            quote_age_penalty_bps_per_slot: config
+                .strategy
+                .sizing
+                .quote_age_penalty_bps_per_slot,
+            max_quote_age_penalty_bps: config.strategy.sizing.max_quote_age_penalty_bps,
+            tick_cross_penalty_bps_per_tick: config
+                .strategy
+                .sizing
+                .tick_cross_penalty_bps_per_tick,
+            max_tick_cross_penalty_bps: config.strategy.sizing.max_tick_cross_penalty_bps,
             max_reserve_usage_penalty_bps: config.strategy.sizing.max_reserve_usage_penalty_bps,
         },
+        JitoTipPolicy {
+            mode: map_jito_tip_mode(config.builder.jito_tip_policy.mode),
+            share_bps_of_expected_net_profit: config
+                .builder
+                .jito_tip_policy
+                .share_bps_of_expected_net_profit,
+            min_lamports: config.builder.jito_tip_policy.min_lamports,
+            max_lamports: config.builder.jito_tip_policy.max_lamports,
+        },
+        config.runtime.parallelism.route_eval_worker_count,
     );
 
     let active_routes = config
@@ -188,12 +213,15 @@ pub fn bootstrap_with_health(
         .iter()
         .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
         .collect::<Vec<_>>();
+    validate_submit_config(&config, &active_routes)?;
     let lookup_table_keys = collect_lookup_table_keys(&active_routes);
     for route in &active_routes {
         validate_runtime_route_config(route)?;
     }
     let resolved_signer = resolve_signer(&config.signing)?;
     validate_execution_environment(&config, &active_routes, &resolved_signer.owner_pubkey)?;
+    let source_token_accounts =
+        collect_route_input_source_accounts(&active_routes, &resolved_signer.owner_pubkey)?;
     let tracked_pool_pairs = build_tracked_pool_pairs(&active_routes);
 
     let mut execution_registry = ExecutionRegistry::default();
@@ -206,6 +234,7 @@ pub fn bootstrap_with_health(
             route_kind,
             &config.strategy.sizing,
             &config.builder,
+            &resolved_signer.owner_pubkey,
             sol_quote_conversion_pool_id.clone(),
         )?;
         let route_execution = resolve_builder_route_execution(route, route_kind)?;
@@ -242,6 +271,7 @@ pub fn bootstrap_with_health(
         &resolved_signer.owner_pubkey,
         resolved_signer.signer_available,
         &lookup_table_keys,
+        &source_token_accounts,
     );
     let wallet_status = if !config.signing.wallet_ready {
         signing::WalletStatus::Refreshing
@@ -268,7 +298,6 @@ pub fn bootstrap_with_health(
         submit_mode,
         config.builder.compute_unit_limit,
         config.builder.compute_unit_price_micro_lamports,
-        config.builder.jito_tip_lamports,
         route_health,
     );
     runtime.apply_cold_path_seed();
@@ -280,6 +309,7 @@ fn build_cold_path_services(
     wallet_pubkey: &str,
     signer_available: bool,
     lookup_table_keys: &[String],
+    source_token_accounts: &[String],
 ) -> ColdPathServices {
     let mut blockhash = BlockhashService {
         current_blockhash: config.state.bootstrap_blockhash.clone(),
@@ -294,6 +324,7 @@ fn build_cold_path_services(
         ready: config.signing.wallet_ready,
         signer_available,
     };
+    let mut source_token_balances = SourceTokenBalanceService::default();
 
     let endpoint = config.reconciliation.rpc_http_endpoint.trim();
     if !endpoint.is_empty() && !endpoint.starts_with(MOCK_SCHEME) {
@@ -322,6 +353,16 @@ fn build_cold_path_services(
                         ),
                     }
                 }
+                if !source_token_accounts.is_empty() {
+                    match fetch_live_source_token_balances_seed(endpoint, source_token_accounts) {
+                        Ok(live_source_token_balances) => {
+                            source_token_balances = live_source_token_balances;
+                        }
+                        Err(error) => eprintln!(
+                            "bootstrap: failed to seed source token balances from {endpoint}: {error}"
+                        ),
+                    }
+                }
             }
             Err(error) => {
                 eprintln!("bootstrap: failed to build RPC client for {endpoint}: {error}")
@@ -334,6 +375,7 @@ fn build_cold_path_services(
         blockhash,
         alt_cache,
         wallet_refresh,
+        source_token_balances,
     }
 }
 
@@ -408,7 +450,33 @@ fn fetch_live_lookup_table_seed(
     })
 }
 
-fn route_enabled_in_profile(
+fn fetch_live_source_token_balances_seed(
+    endpoint: &str,
+    account_keys: &[String],
+) -> Result<SourceTokenBalanceService, String> {
+    let account_batcher =
+        GetMultipleAccountsBatcher::new_with_window(endpoint, Duration::from_millis(1));
+    let fetched = account_batcher
+        .fetch(account_keys)
+        .map_err(|error| error.to_string())?;
+    let mut balances = HashMap::with_capacity(account_keys.len());
+    for account_key in account_keys {
+        let Some(account) = fetched.values_by_key.get(account_key).cloned().flatten() else {
+            continue;
+        };
+        let parsed = parse_token_account(&RpcAccountInfo {
+            owner: account.owner,
+            data: account.data,
+        })?;
+        balances.insert(account_key.clone(), parsed.amount);
+    }
+    Ok(SourceTokenBalanceService {
+        balances,
+        slot: Some(fetched.slot),
+    })
+}
+
+pub(crate) fn route_enabled_in_profile(
     route: &crate::config::RouteConfig,
     profile: RuntimeProfileConfig,
 ) -> bool {
@@ -431,6 +499,14 @@ fn map_sizing_mode(mode: crate::config::SizingModeConfig) -> SizingMode {
         crate::config::SizingModeConfig::Legacy => SizingMode::Legacy,
         crate::config::SizingModeConfig::EvShadow => SizingMode::EvShadow,
         crate::config::SizingModeConfig::EvLive => SizingMode::EvLive,
+    }
+}
+
+fn map_jito_tip_mode(mode: JitoTipModeConfig) -> JitoTipMode {
+    match mode {
+        JitoTipModeConfig::Fixed => JitoTipMode::Fixed,
+        JitoTipModeConfig::PnlRatio => JitoTipMode::PnlRatio,
+        JitoTipModeConfig::RiskAdjustedPnlRatio => JitoTipMode::RiskAdjustedPnlRatio,
     }
 }
 
@@ -470,6 +546,7 @@ fn resolve_route_definition(
     route_kind: RouteKind,
     strategy_sizing: &crate::config::StrategySizingConfig,
     builder: &BuilderConfig,
+    wallet_owner: &str,
     sol_quote_conversion_pool_id: Option<PoolId>,
 ) -> Result<RouteDefinition, BootstrapError> {
     let min_trade_size = resolve_min_trade_size(route)?;
@@ -496,6 +573,7 @@ fn resolve_route_definition(
         kind: route_kind,
         input_mint: route.input_mint.clone(),
         output_mint: route.output_mint.clone(),
+        input_source_account: Some(resolve_route_input_source_account(route, wallet_owner)?),
         base_mint: route.base_mint.clone(),
         quote_mint: route.quote_mint.clone(),
         sol_quote_conversion_pool_id,
@@ -507,12 +585,15 @@ fn resolve_route_definition(
         default_trade_size: route.default_trade_size,
         max_trade_size: route.max_trade_size,
         size_ladder: route.size_ladder.clone(),
-        estimated_execution_cost_lamports: estimate_execution_cost_lamports(
+        default_jito_tip_lamports: effective_u64(
+            builder.jito_tip_lamports,
+            route.execution.default_jito_tip_lamports,
+        ),
+        estimated_execution_cost_lamports: estimate_network_fee_lamports(
             route,
             builder,
-            route.execution.default_compute_unit_limit,
+            effective_default_compute_unit_limit(route, route_kind),
             route.execution.default_compute_unit_price_micro_lamports,
-            route.execution.default_jito_tip_lamports,
         ),
         sizing: resolve_route_sizing(strategy_sizing, &route.sizing),
         execution_protection: map_execution_protection(&route.execution_protection),
@@ -528,19 +609,8 @@ fn resolve_builder_route_execution(
     route: &crate::config::RouteConfig,
     route_kind: RouteKind,
 ) -> Result<BuilderRouteExecutionConfig, BootstrapError> {
-    let minimum_compute_unit_limit = route
-        .execution
-        .minimum_compute_unit_limit
-        .max(route_kind.minimum_compute_unit_limit());
-    if route.execution.default_compute_unit_limit < minimum_compute_unit_limit {
-        return Err(BootstrapError::InvalidRouteConfig {
-            route_id: route.route_id.clone(),
-            detail: format!(
-                "execution.default_compute_unit_limit ({}) must be >= {} for {:?} routes",
-                route.execution.default_compute_unit_limit, minimum_compute_unit_limit, route_kind
-            ),
-        });
-    }
+    let minimum_compute_unit_limit = effective_minimum_compute_unit_limit(route, route_kind);
+    let default_compute_unit_limit = effective_default_compute_unit_limit(route, route_kind);
     let execution_legs = route
         .legs
         .iter()
@@ -559,7 +629,7 @@ fn resolve_builder_route_execution(
                 account_key: table.account_key.clone(),
             })
             .collect(),
-        default_compute_unit_limit: route.execution.default_compute_unit_limit,
+        default_compute_unit_limit,
         minimum_compute_unit_limit,
         default_compute_unit_price_micro_lamports: route
             .execution
@@ -570,6 +640,50 @@ fn resolve_builder_route_execution(
         legs: RouteLegSequence::from_vec(execution_legs)
             .map_err(|error| route_validation_error(route, error))?,
     })
+}
+
+pub(crate) fn collect_route_input_source_accounts(
+    routes: &[&crate::config::RouteConfig],
+    wallet_owner: &str,
+) -> Result<Vec<String>, BootstrapError> {
+    let mut accounts = BTreeSet::new();
+    for route in routes {
+        accounts.insert(resolve_route_input_source_account(route, wallet_owner)?);
+    }
+    Ok(accounts.into_iter().collect())
+}
+
+fn resolve_route_input_source_account(
+    route: &crate::config::RouteConfig,
+    wallet_owner: &str,
+) -> Result<String, BootstrapError> {
+    let route_kind = map_route_kind(route.kind);
+    let first_leg = route.legs.first().ok_or_else(|| BootstrapError::InvalidRouteConfig {
+        route_id: route.route_id.clone(),
+        detail: "route must contain at least one leg".into(),
+    })?;
+    let (input_mint, _) = resolve_route_leg_mints(route, route_kind, first_leg, 0)?;
+    match &first_leg.execution {
+        RouteLegExecutionConfig::OrcaSimplePool(config) => Ok(config.user_source_token_account.clone()),
+        RouteLegExecutionConfig::RaydiumSimplePool(config) => {
+            if let Some(mint) = &config.user_source_mint {
+                associated_token_address(wallet_owner, mint, &config.token_program_id)
+            } else {
+                config.user_source_token_account.clone().ok_or_else(|| {
+                    BootstrapError::InvalidRouteConfig {
+                        route_id: route.route_id.clone(),
+                        detail: "raydium_simple_pool leg requires user_source_token_account or user_source_mint".into(),
+                    }
+                })
+            }
+        }
+        RouteLegExecutionConfig::OrcaWhirlpool(config) => {
+            associated_token_address(wallet_owner, &input_mint, &config.token_program_id)
+        }
+        RouteLegExecutionConfig::RaydiumClmm(config) => {
+            associated_token_address(wallet_owner, &input_mint, &config.token_program_id)
+        }
+    }
 }
 
 fn resolve_route_leg_mints(
@@ -728,7 +842,32 @@ fn validate_runtime_route_config(route: &crate::config::RouteConfig) -> Result<(
         });
     }
 
+    validate_execution_protection_requirements(route)?;
     validate_route_leg_requirements(route)
+}
+
+fn validate_execution_protection_requirements(
+    route: &crate::config::RouteConfig,
+) -> Result<(), BootstrapError> {
+    let protection = &route.execution_protection;
+    if protection.enabled
+        && protection.tight_max_quote_slot_lag > 0
+        && protection.tight_max_quote_slot_lag < MIN_EXECUTION_PROTECTION_QUOTE_SLOT_LAG
+        && route.execution.max_quote_slot_lag > protection.tight_max_quote_slot_lag
+    {
+        return Err(BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: format!(
+                "execution_protection.tight_max_quote_slot_lag={} is ambiguous with execution.max_quote_slot_lag={}; use 0, a value >= {}, or raise tight_max_quote_slot_lag to at least {}",
+                protection.tight_max_quote_slot_lag,
+                route.execution.max_quote_slot_lag,
+                MIN_EXECUTION_PROTECTION_QUOTE_SLOT_LAG,
+                route.execution.max_quote_slot_lag
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_route_leg_requirements(
@@ -813,6 +952,49 @@ fn route_requires_explicit_sol_quote_conversion(route: &crate::config::RouteConf
     route.input_mint == route.output_mint && route.input_mint != SOL_MINT
 }
 
+fn validate_submit_config(
+    config: &BotConfig,
+    active_routes: &[&crate::config::RouteConfig],
+) -> Result<(), BootstrapError> {
+    if config.submit.single_transaction_policy != SingleTransactionSubmitPolicyConfig::JitoOnly {
+        return Err(BootstrapError::InvalidConfig {
+            detail: "submit.single_transaction_policy must be jito_only".into(),
+        });
+    }
+    if config.rpc_submit.enabled {
+        return Err(BootstrapError::InvalidConfig {
+            detail: "rpc_submit.enabled must remain false for execution; RPC stays read-only under reconciliation".into(),
+        });
+    }
+    if config.builder.jito_tip_policy.max_lamports < config.builder.jito_tip_policy.min_lamports {
+        return Err(BootstrapError::InvalidConfig {
+            detail:
+                "builder.jito_tip_policy.max_lamports must be greater than or equal to min_lamports"
+                    .into(),
+        });
+    }
+    if matches!(
+        config.builder.jito_tip_policy.mode,
+        JitoTipModeConfig::PnlRatio
+    ) {
+        if config.builder.jito_tip_lamports > 0 {
+            return Err(BootstrapError::InvalidConfig {
+                detail: "builder.jito_tip_lamports is legacy-only; clear it when builder.jito_tip_policy.mode = \"pnl_ratio\"".into(),
+            });
+        }
+        if let Some(route) = active_routes
+            .iter()
+            .find(|route| route.execution.default_jito_tip_lamports > 0)
+        {
+            return Err(BootstrapError::InvalidRouteConfig {
+                route_id: route.route_id.clone(),
+                detail: "execution.default_jito_tip_lamports is legacy-only; clear it when builder.jito_tip_policy.mode = \"pnl_ratio\"".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_execution_environment(
     config: &BotConfig,
     routes: &[&crate::config::RouteConfig],
@@ -851,17 +1033,10 @@ fn validate_execution_environment(
     let mut failures = Vec::new();
     for requirement in requirements {
         match accounts.get(&requirement.address) {
-            None => failures.push(format!(
-                "{} missing for {}",
-                requirement.address,
-                requirement
-                    .sources
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
-            Some(None) => failures.push(format!(
+            None | Some(None)
+                if !requirement.must_exist
+                    || requirement_can_be_derived_at_runtime(&requirement) => {}
+            None | Some(None) => failures.push(format!(
                 "{} missing for {}",
                 requirement.address,
                 requirement
@@ -886,6 +1061,15 @@ fn validate_execution_environment(
     }
 }
 
+fn requirement_can_be_derived_at_runtime(requirement: &RequiredTokenAccount) -> bool {
+    requirement.sources.iter().all(|source| {
+        matches!(
+            source.split(':').next(),
+            Some("route_mint_ata" | "derived_whirlpool_ata" | "derived_clmm_ata")
+        )
+    })
+}
+
 fn collect_required_token_accounts(
     routes: &[&crate::config::RouteConfig],
     wallet_owner: &str,
@@ -904,6 +1088,7 @@ fn collect_required_token_accounts(
                     token_program_id: route_token_program.clone(),
                     wallet_owner: wallet_owner.into(),
                     expected_mint: Some(mint),
+                    must_exist: false,
                     sources: BTreeSet::new(),
                 },
                 "route_mint_ata",
@@ -921,6 +1106,7 @@ fn collect_required_token_accounts(
                             token_program_id: config.token_program_id.clone(),
                             wallet_owner: wallet_owner.into(),
                             expected_mint: None,
+                            must_exist: true,
                             sources: BTreeSet::new(),
                         },
                         "configured_user_source_account",
@@ -933,6 +1119,7 @@ fn collect_required_token_accounts(
                             token_program_id: config.token_program_id.clone(),
                             wallet_owner: wallet_owner.into(),
                             expected_mint: None,
+                            must_exist: true,
                             sources: BTreeSet::new(),
                         },
                         "configured_user_destination_account",
@@ -968,6 +1155,7 @@ fn collect_required_token_accounts(
                             token_program_id: config.token_program_id.clone(),
                             wallet_owner: wallet_owner.into(),
                             expected_mint: config.user_source_mint.clone(),
+                            must_exist: true,
                             sources: BTreeSet::new(),
                         },
                         "configured_user_source_account",
@@ -980,6 +1168,7 @@ fn collect_required_token_accounts(
                             token_program_id: config.token_program_id.clone(),
                             wallet_owner: wallet_owner.into(),
                             expected_mint: config.user_destination_mint.clone(),
+                            must_exist: true,
                             sources: BTreeSet::new(),
                         },
                         "configured_user_destination_account",
@@ -997,6 +1186,7 @@ fn collect_required_token_accounts(
                                 token_program_id: config.token_program_id.clone(),
                                 wallet_owner: wallet_owner.into(),
                                 expected_mint: Some(mint.clone()),
+                                must_exist: true,
                                 sources: BTreeSet::new(),
                             },
                             "derived_whirlpool_ata",
@@ -1015,6 +1205,7 @@ fn collect_required_token_accounts(
                                 token_program_id: config.token_program_id.clone(),
                                 wallet_owner: wallet_owner.into(),
                                 expected_mint: Some(mint.clone()),
+                                must_exist: true,
                                 sources: BTreeSet::new(),
                             },
                             "derived_clmm_ata",
@@ -1069,6 +1260,7 @@ fn insert_required_token_account(
                 (None, Some(mint)) => existing.expected_mint = Some(mint.clone()),
                 _ => {}
             }
+            existing.must_exist |= requirement.must_exist;
             existing.sources.extend(requirement.sources);
         }
         None => {
@@ -1250,7 +1442,16 @@ fn parse_token_account(account: &RpcAccountInfo) -> Result<ParsedTokenAccount, S
     let owner = Pubkey::try_from(&bytes[32..64])
         .map_err(|error| error.to_string())?
         .to_string();
-    Ok(ParsedTokenAccount { mint, owner })
+    let amount = u64::from_le_bytes(
+        bytes[64..72]
+            .try_into()
+            .map_err(|_| "token account amount slice malformed".to_string())?,
+    );
+    Ok(ParsedTokenAccount {
+        mint,
+        owner,
+        amount,
+    })
 }
 
 fn build_tracked_pool_pairs(
@@ -1366,12 +1567,11 @@ fn resolve_min_trade_size(route: &crate::config::RouteConfig) -> Result<u64, Boo
     Ok(min_trade_size)
 }
 
-fn estimate_execution_cost_lamports(
+fn estimate_network_fee_lamports(
     route: &crate::config::RouteConfig,
     builder: &BuilderConfig,
     route_compute_unit_limit: u32,
     route_compute_unit_price_micro_lamports: u64,
-    route_jito_tip_lamports: u64,
 ) -> u64 {
     if route.input_mint != route.output_mint {
         return 0;
@@ -1382,14 +1582,11 @@ fn estimate_execution_cost_lamports(
         builder.compute_unit_price_micro_lamports,
         route_compute_unit_price_micro_lamports,
     );
-    let jito_tip_lamports = effective_u64(builder.jito_tip_lamports, route_jito_tip_lamports);
     let priority_fee_lamports = (compute_unit_limit as u64)
         .saturating_mul(compute_unit_price_micro_lamports)
         .saturating_add(MICRO_LAMPORTS_PER_LAMPORT - 1)
         / MICRO_LAMPORTS_PER_LAMPORT;
-    BASE_FEE_LAMPORTS_PER_SIGNATURE
-        .saturating_add(priority_fee_lamports)
-        .saturating_add(jito_tip_lamports)
+    BASE_FEE_LAMPORTS_PER_SIGNATURE.saturating_add(priority_fee_lamports)
 }
 
 fn effective_u32(value: u32, default_value: u32) -> u32 {
@@ -1398,6 +1595,49 @@ fn effective_u32(value: u32, default_value: u32) -> u32 {
 
 fn effective_u64(value: u64, default_value: u64) -> u64 {
     if value == 0 { default_value } else { value }
+}
+
+fn effective_minimum_compute_unit_limit(
+    route: &crate::config::RouteConfig,
+    route_kind: RouteKind,
+) -> u32 {
+    route
+        .execution
+        .minimum_compute_unit_limit
+        .max(route_kind.minimum_compute_unit_limit())
+        .max(recommended_minimum_compute_unit_limit(route))
+}
+
+fn effective_default_compute_unit_limit(
+    route: &crate::config::RouteConfig,
+    route_kind: RouteKind,
+) -> u32 {
+    route
+        .execution
+        .default_compute_unit_limit
+        .max(effective_minimum_compute_unit_limit(route, route_kind))
+        .max(recommended_default_compute_unit_limit(route))
+}
+
+fn recommended_minimum_compute_unit_limit(route: &crate::config::RouteConfig) -> u32 {
+    route_contains_concentrated_venue(route)
+        .then_some(CONCENTRATED_ROUTE_MINIMUM_COMPUTE_UNIT_LIMIT)
+        .unwrap_or_default()
+}
+
+fn recommended_default_compute_unit_limit(route: &crate::config::RouteConfig) -> u32 {
+    route_contains_concentrated_venue(route)
+        .then_some(CONCENTRATED_ROUTE_DEFAULT_COMPUTE_UNIT_LIMIT)
+        .unwrap_or_default()
+}
+
+fn route_contains_concentrated_venue(route: &crate::config::RouteConfig) -> bool {
+    route.legs.iter().any(|leg| {
+        matches!(
+            leg.execution,
+            RouteLegExecutionConfig::OrcaWhirlpool(_) | RouteLegExecutionConfig::RaydiumClmm(_)
+        )
+    })
 }
 
 const MIN_EXECUTION_PROTECTION_QUOTE_SLOT_LAG: u64 = 24;
@@ -1600,10 +1840,11 @@ mod tests {
         map_message_mode, map_route_kind, map_swap_side, route_enabled_in_profile,
     };
     use crate::config::{
-        BotConfig, LookupTableConfig, MessageModeConfig, OrcaSimplePoolLegExecutionConfig,
-        OrcaWhirlpoolLegExecutionConfig, RaydiumClmmLegExecutionConfig,
-        RaydiumSimplePoolLegExecutionConfig, RouteClassConfig, RouteConfig, RouteExecutionConfig,
-        RouteKindConfig, RouteLegConfig, RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
+        BotConfig, JitoTipModeConfig, LookupTableConfig, MessageModeConfig,
+        OrcaSimplePoolLegExecutionConfig, OrcaWhirlpoolLegExecutionConfig,
+        RaydiumClmmLegExecutionConfig, RaydiumSimplePoolLegExecutionConfig, RouteClassConfig,
+        RouteConfig, RouteExecutionConfig, RouteKindConfig, RouteLegConfig,
+        RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
     };
 
     fn test_pubkey(label: &str) -> String {
@@ -1779,6 +2020,7 @@ mod tests {
         config.reconciliation.rpc_http_endpoint = "mock://solana-rpc".into();
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
         config.jito.endpoint = "mock://jito".into();
+        config.builder.jito_tip_policy.mode = JitoTipModeConfig::Fixed;
         config.routes = RoutesConfig {
             definitions: vec![route],
         };
@@ -2031,11 +2273,14 @@ mod tests {
                         account_key: table.account_key.clone(),
                     })
                     .collect(),
-                default_compute_unit_limit: route.execution.default_compute_unit_limit,
-                minimum_compute_unit_limit: route
-                    .execution
-                    .minimum_compute_unit_limit
-                    .max(map_route_kind(route.kind).minimum_compute_unit_limit()),
+                default_compute_unit_limit: super::effective_default_compute_unit_limit(
+                    route,
+                    map_route_kind(route.kind),
+                ),
+                minimum_compute_unit_limit: super::effective_minimum_compute_unit_limit(
+                    route,
+                    map_route_kind(route.kind),
+                ),
                 default_compute_unit_price_micro_lamports: route
                     .execution
                     .default_compute_unit_price_micro_lamports,
@@ -2101,7 +2346,10 @@ mod tests {
             recent_blockhash_slot: Some(43),
             head_slot: 43,
             fee_payer_pubkey: fee_payer_pubkey(),
-            compute_unit_limit: 300_000,
+            compute_unit_limit: super::effective_default_compute_unit_limit(
+                route,
+                map_route_kind(route.kind),
+            ),
             compute_unit_price_micro_lamports: 25_000,
             jito_tip_lamports: 5_000,
             resolved_lookup_tables: route
@@ -2131,6 +2379,7 @@ mod tests {
                 output_amount,
                 fee_paid: 0,
                 current_tick_index: current_tick_index_hint(&leg.execution),
+                ticks_crossed: 0,
             });
             input_amount = output_amount;
             if index + 1 < route.legs.len() {
@@ -2147,9 +2396,14 @@ mod tests {
             sol_quote_conversion_snapshot_slot: None,
             trade_size: route.default_trade_size,
             active_execution_buffer_bps: None,
+            source_input_balance: None,
             expected_net_output: input_amount,
             minimum_acceptable_output: route.default_trade_size.saturating_add(1),
             expected_gross_profit_quote_atoms: 1,
+            estimated_network_fee_lamports: 0,
+            estimated_network_fee_quote_atoms: 0,
+            jito_tip_lamports: 0,
+            jito_tip_quote_atoms: 0,
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: 1,
@@ -2360,7 +2614,13 @@ mod tests {
                                 .unwrap_or(Value::Null)
                         })
                         .collect::<Vec<_>>();
-                    json!({ "result": { "value": values } }).to_string()
+                    json!({
+                        "result": {
+                            "context": { "slot": 42 },
+                            "value": values
+                        }
+                    })
+                    .to_string()
                 }
                 other => panic!("unexpected method {other}"),
             }
@@ -2392,19 +2652,41 @@ mod tests {
         config.state.bootstrap_alt_revision = 1;
         config.signing.bootstrap_balance_lamports = 0;
         config.signing.wallet_ready = false;
+        let owner = config.signing.owner_pubkey.clone();
         let seeded_alt_addresses = alt_addresses.clone();
+        let lookup_table_key_for_rpc = lookup_table_key.clone();
         config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
             match payload["method"].as_str().expect("method") {
                 "getLatestBlockhash" => mock_latest_blockhash_response(seeded_slot).to_string(),
                 "getBalance" => mock_balance_response(seeded_slot, wallet_balance).to_string(),
-                "getMultipleAccounts" => json!({
-                    "result": {
-                        "context": { "slot": seeded_slot },
-                        "value": [rpc_lookup_table_account(&seeded_alt_addresses, seeded_slot - 1)]
-                    }
-                })
-                .to_string(),
+                "getMultipleAccounts" => {
+                    let keys = payload["params"][0].as_array().expect("account keys");
+                    let values = keys
+                        .iter()
+                        .map(|key| {
+                            let key = key.as_str().expect("account key");
+                            if key == lookup_table_key_for_rpc {
+                                rpc_lookup_table_account(&seeded_alt_addresses, seeded_slot - 1)
+                            } else if key == test_pubkey("route-input-ata") {
+                                rpc_token_account(
+                                    &test_pubkey("spl-token-program"),
+                                    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                                    &owner,
+                                )
+                            } else {
+                                Value::Null
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "result": {
+                            "context": { "slot": seeded_slot },
+                            "value": values
+                        }
+                    })
+                    .to_string()
+                }
                 other => panic!("unexpected method {other}"),
             }
         });
@@ -2436,9 +2718,10 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_rejects_missing_derived_ata_for_concentrated_routes() {
+    fn bootstrap_allows_missing_runtime_derivable_ata_for_concentrated_routes() {
         let route = concentrated_route_config();
         let mut config = test_config(route.clone());
+        config.signing.validate_execution_accounts = true;
         let owner = config.signing.owner_pubkey.clone();
         let token_program = match &route.legs[0].execution {
             RouteLegExecutionConfig::OrcaWhirlpool(config) => config.token_program_id.clone(),
@@ -2451,9 +2734,62 @@ mod tests {
             associated_token_address_for_test(&owner, &quote_mint, &token_program),
             rpc_token_account(&token_program, &quote_mint, &owner),
         );
-        // Intentionally omit the base ATA required by the concentrated legs.
-        let missing_base_ata =
+        // Intentionally omit the base ATA required by the concentrated legs. The hot path now
+        // requires these accounts to exist before execution.
+        let _missing_base_ata =
             associated_token_address_for_test(&owner, &base_mint, &token_program);
+
+        config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getLatestBlockhash" => mock_latest_blockhash_response(42).to_string(),
+                "getBalance" => mock_balance_response(42, 1).to_string(),
+                "getMultipleAccounts" => {
+                    let keys = payload["params"][0].as_array().expect("account keys");
+                    let values = keys
+                        .iter()
+                        .map(|key| {
+                            accounts
+                                .get(key.as_str().expect("account key"))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        })
+                        .collect::<Vec<_>>();
+                    json!({
+                        "result": {
+                            "context": { "slot": 42 },
+                            "value": values
+                        }
+                    })
+                    .to_string()
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+        config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
+
+        bootstrap(config).expect("missing derived ATA should be allowed when builder can derive it");
+    }
+
+    #[test]
+    fn bootstrap_still_rejects_missing_configured_simple_route_accounts() {
+        let route = valid_route_config();
+        let mut config = test_config(route.clone());
+        let owner = config.signing.owner_pubkey.clone();
+        let token_program = match &route.legs[0].execution {
+            RouteLegExecutionConfig::OrcaSimplePool(config) => config.token_program_id.clone(),
+            _ => panic!("expected orca simple pool leg"),
+        };
+        let mut accounts = HashMap::new();
+        accounts.insert(
+            test_pubkey("route-input-ata"),
+            rpc_token_account(&token_program, &route.input_mint, &owner),
+        );
+        accounts.insert(
+            test_pubkey("route-output-ata"),
+            rpc_token_account(&token_program, &route.output_mint, &owner),
+        );
+        let missing_mid_ata = test_pubkey("route-mid-ata");
 
         config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
@@ -2479,17 +2815,14 @@ mod tests {
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
 
         let error = match bootstrap(config) {
-            Ok(_) => panic!("missing base ATA should fail bootstrap"),
+            Ok(_) => panic!("missing configured simple route account should fail bootstrap"),
             Err(error) => error,
         };
         let BootstrapError::ExecutionEnvironment { detail } = error else {
             panic!("expected execution environment error");
         };
-        assert!(detail.contains(&missing_base_ata));
-        assert!(
-            detail.contains("route_mint_ata:route-clmm")
-                || detail.contains("derived_whirlpool_ata:route-clmm")
-        );
+        assert!(detail.contains(&missing_mid_ata));
+        assert!(detail.contains("configured_user_destination_account:route-a"));
     }
 
     #[test]
@@ -2497,12 +2830,28 @@ mod tests {
         let mut route = valid_route_config();
         route.execution.max_quote_slot_lag = 32;
         route.execution_protection.enabled = true;
-        route.execution_protection.tight_max_quote_slot_lag = 4;
+        route.execution_protection.tight_max_quote_slot_lag = 24;
         let route_id = RouteId(route.route_id.clone());
         let registry = execution_registry_from_config(&test_config(route));
         let registered = registry.get(&route_id).expect("route should be registered");
 
         assert_eq!(registered.max_quote_slot_lag, 24);
+    }
+
+    #[test]
+    fn execution_protection_rejects_ambiguous_tight_quote_slot_lag() {
+        let mut route = valid_route_config();
+        route.execution.max_quote_slot_lag = 32;
+        route.execution_protection.enabled = true;
+        route.execution_protection.tight_max_quote_slot_lag = 4;
+
+        let error = super::validate_runtime_route_config(&route)
+            .expect_err("tight quote slot lag below the minimum must be rejected");
+        let BootstrapError::InvalidRouteConfig { detail, .. } = error else {
+            panic!("expected invalid route config error");
+        };
+
+        assert!(detail.contains("tight_max_quote_slot_lag=4 is ambiguous"));
     }
 
     #[test]

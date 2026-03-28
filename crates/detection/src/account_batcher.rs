@@ -20,6 +20,7 @@ use crate::rpc::{RpcError, rpc_call};
 const MOCK_SCHEME: &str = "mock://";
 const DEFAULT_GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW: Duration = Duration::from_millis(20);
 const MAX_GET_MULTIPLE_ACCOUNTS_KEYS: usize = 100;
+const DEFAULT_GET_MULTIPLE_ACCOUNTS_PARALLEL_RPC_REQUESTS: usize = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RpcContext {
@@ -158,13 +159,30 @@ pub struct GetMultipleAccountsBatcher {
 
 impl GetMultipleAccountsBatcher {
     pub fn new(endpoint: &str) -> Self {
-        Self::new_with_window(endpoint, DEFAULT_GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW)
+        Self::new_with_window_and_parallel_rpc_requests(
+            endpoint,
+            DEFAULT_GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW,
+            DEFAULT_GET_MULTIPLE_ACCOUNTS_PARALLEL_RPC_REQUESTS,
+        )
     }
 
     pub fn new_with_window(endpoint: &str, batch_window: Duration) -> Self {
+        Self::new_with_window_and_parallel_rpc_requests(
+            endpoint,
+            batch_window,
+            DEFAULT_GET_MULTIPLE_ACCOUNTS_PARALLEL_RPC_REQUESTS,
+        )
+    }
+
+    pub fn new_with_window_and_parallel_rpc_requests(
+        endpoint: &str,
+        batch_window: Duration,
+        parallel_rpc_requests: usize,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let endpoint = endpoint.to_owned();
-        thread::spawn(move || run_batcher(endpoint, receiver, batch_window));
+        let parallel_rpc_requests = parallel_rpc_requests.max(1);
+        thread::spawn(move || run_batcher(endpoint, receiver, batch_window, parallel_rpc_requests));
         Self { sender }
     }
 
@@ -230,7 +248,12 @@ struct BatchRequest {
     response_tx: Sender<Result<FetchedAccounts, RpcError>>,
 }
 
-fn run_batcher(endpoint: String, receiver: Receiver<BatchRequest>, batch_window: Duration) {
+fn run_batcher(
+    endpoint: String,
+    receiver: Receiver<BatchRequest>,
+    batch_window: Duration,
+    parallel_rpc_requests: usize,
+) {
     let http = Client::builder()
         .connect_timeout(Duration::from_millis(300))
         .timeout(Duration::from_millis(1_000))
@@ -270,7 +293,7 @@ fn run_batcher(endpoint: String, receiver: Receiver<BatchRequest>, batch_window:
         }
 
         for group in groups.into_values() {
-            let result = fetch_batch(&http, &endpoint, &group);
+            let result = fetch_batch(&http, &endpoint, &group, parallel_rpc_requests);
             for request in group {
                 let response = result
                     .as_ref()
@@ -290,6 +313,7 @@ fn fetch_batch(
     http: &Client,
     endpoint: &str,
     requests: &[BatchRequest],
+    parallel_rpc_requests: usize,
 ) -> Result<FetchedAccounts, RpcError> {
     if endpoint.is_empty() || endpoint.starts_with(MOCK_SCHEME) {
         return Err(RpcError::RequestFailed {
@@ -317,23 +341,40 @@ fn fetch_batch(
 
     let mut slot = 0u64;
     let mut values_by_key = HashMap::with_capacity(account_keys.len());
-    for chunk in account_keys.chunks(MAX_GET_MULTIPLE_ACCOUNTS_KEYS) {
-        let response = rpc_call::<MultipleAccountsResult>(
-            http,
-            endpoint,
-            "getMultipleAccounts",
-            json!([
-                chunk,
-                {
-                    "commitment": "processed",
-                    "encoding": "base64",
-                    "minContextSlot": min_context_slot
-                }
-            ]),
-        )?;
-        slot = slot.max(response.context.slot);
-        for (key, value) in chunk.iter().cloned().zip(response.value) {
-            values_by_key.insert(key, value);
+    let parallel_rpc_requests = parallel_rpc_requests.max(1);
+    let chunks = account_keys
+        .chunks(MAX_GET_MULTIPLE_ACCOUNTS_KEYS)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+
+    for chunk_group in chunks.chunks(parallel_rpc_requests) {
+        let results = thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(chunk_group.len());
+            for chunk in chunk_group {
+                let http = http.clone();
+                let endpoint = endpoint.to_string();
+                let chunk = chunk.clone();
+                handles.push(scope.spawn(move || {
+                    fetch_accounts_chunk(&http, &endpoint, chunk, min_context_slot)
+                }));
+            }
+
+            let mut results = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let result = handle.join().map_err(|_| RpcError::RequestFailed {
+                    method: "getMultipleAccounts".into(),
+                    detail: "parallel getMultipleAccounts worker panicked".into(),
+                })??;
+                results.push(result);
+            }
+            Ok::<Vec<_>, RpcError>(results)
+        })?;
+
+        for (chunk_keys, response) in results {
+            slot = slot.max(response.context.slot);
+            for (key, value) in chunk_keys.into_iter().zip(response.value) {
+                values_by_key.insert(key, value);
+            }
         }
     }
 
@@ -341,6 +382,28 @@ fn fetch_batch(
         slot,
         values_by_key,
     })
+}
+
+fn fetch_accounts_chunk(
+    http: &Client,
+    endpoint: &str,
+    chunk: Vec<String>,
+    min_context_slot: Option<u64>,
+) -> Result<(Vec<String>, MultipleAccountsResult), RpcError> {
+    let response = rpc_call::<MultipleAccountsResult>(
+        http,
+        endpoint,
+        "getMultipleAccounts",
+        json!([
+            &chunk,
+            {
+                "commitment": "processed",
+                "encoding": "base64",
+                "minContextSlot": min_context_slot
+            }
+        ]),
+    )?;
+    Ok((chunk, response))
 }
 
 #[cfg(test)]
@@ -453,6 +516,58 @@ mod tests {
             &[100, 1]
         );
         assert_eq!(result.values_by_key.len(), 101);
+    }
+
+    #[test]
+    fn large_requests_can_fetch_rpc_chunks_in_parallel() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let current_in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let endpoint = spawn_mock_rpc_server({
+            let call_count = Arc::clone(&call_count);
+            let current_in_flight = Arc::clone(&current_in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+            move |body| {
+                call_count.fetch_add(1, Ordering::SeqCst);
+                let in_flight = current_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut observed = max_in_flight.load(Ordering::SeqCst);
+                while in_flight > observed
+                    && max_in_flight
+                        .compare_exchange(observed, in_flight, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                {
+                    observed = max_in_flight.load(Ordering::SeqCst);
+                }
+                thread::sleep(Duration::from_millis(50));
+                current_in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+                let keys = payload["params"][0]
+                    .as_array()
+                    .expect("keys array")
+                    .iter()
+                    .map(|value| value.as_str().expect("key").to_string())
+                    .collect::<Vec<_>>();
+                multiple_accounts_response(9, &keys)
+            }
+        });
+        let batcher = GetMultipleAccountsBatcher::new_with_window_and_parallel_rpc_requests(
+            &endpoint,
+            Duration::from_millis(1),
+            2,
+        );
+        let keys = (0..200)
+            .map(|index| format!("acct-{index:03}"))
+            .collect::<Vec<_>>();
+
+        let result = batcher.fetch(&keys).expect("parallel batched fetch");
+
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_eq!(result.values_by_key.len(), 200);
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) >= 2,
+            "expected overlapping getMultipleAccounts chunk requests"
+        );
     }
 
     #[test]
@@ -646,12 +761,16 @@ mod tests {
 
         thread::spawn(move || {
             for stream in listener.incoming() {
-                let Ok(mut stream) = stream else {
+                let Ok(stream) = stream else {
                     continue;
                 };
-                let body = read_http_body(&mut stream);
-                let response_body = (handler.as_ref())(&body);
-                write_http_response(&mut stream, &response_body);
+                let handler = Arc::clone(&handler);
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let body = read_http_body(&mut stream);
+                    let response_body = (handler.as_ref())(&body);
+                    write_http_response(&mut stream, &response_body);
+                });
             }
         });
 

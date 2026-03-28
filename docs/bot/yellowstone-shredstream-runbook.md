@@ -312,10 +312,10 @@ grpc_endpoint = "http://127.0.0.1:50051"
 
 [signing]
 owner_pubkey = "..."
-validate_execution_accounts = false
+validate_execution_accounts = true
 ```
 
-`validate_execution_accounts = false` est utile pour un bring-up initial. Pour un run operatoire durable, revalider ensuite avec les comptes d'execution reels.
+`validate_execution_accounts = true` est maintenant le mode operatoire recommande. Ne le basculer a `false` que pour un bring-up de debug tres court.
 
 ## Deploiement du bot dans tmux
 

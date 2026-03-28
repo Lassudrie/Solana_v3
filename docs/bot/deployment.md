@@ -59,12 +59,15 @@ Le script `scripts/render_bot_config.sh` transforme le manifest de routes en con
 - `signing.provider = "secure_unix"`
 - `signing.owner_pubkey = ""`
 - `signing.socket_path = "/run/solana-bot/signerd.sock"`
-- `signing.validate_execution_accounts = false`
+- `signing.validate_execution_accounts = true`
 - `[runtime.event_source] mode = "shredstream"`
 - `[runtime.monitor_server] enabled = true`
 - `[shredstream] grpc_endpoint = "http://127.0.0.1:50051"`
 
 Le `owner_pubkey` est volontairement vide pour laisser le bot interroger `signerd` et recuperer la vraie cle publique de la hot wallet au boot.
+
+Le renderer n'active pas automatiquement la persistance SQLite. C'est volontaire: le bon
+chemin de base depend du mode d'execution et des droits d'ecriture de la machine cible.
 
 ## Mise en service
 
@@ -84,8 +87,25 @@ Points a relire avant premier start:
 
 - le jeu de routes actif
 - les protections de taille et de frais
-- `validate_execution_accounts = false` pour le bring-up initial, puis remise a `true` quand les comptes reels sont valides
+- `validate_execution_accounts = true` par defaut pour bloquer les comptes runtime invalides; ne le forcer a `false` qu'en debug court
 - l'endpoint `shredstream.grpc_endpoint`
+
+Si vous activez la persistance d'audit, ajoutez explicitement:
+
+```toml
+[runtime.persistence]
+enabled = true
+path = "/var/lib/solana-bot/bot_observer.sqlite3"
+batch_size = 128
+flush_interval_millis = 50
+```
+
+Sous `systemd`, utilisez un chemin absolu sous `/var/lib/solana-bot/`.
+L'unité `solana-bot.service` déclare `StateDirectory=solana-bot` et `ProtectSystem=strict`:
+
+- `/var/lib/solana-bot/` est le bon emplacement pour la base
+- le chemin relatif par défaut `data/bot_observer.sqlite3` est adapté au dev local,
+  pas au service `systemd` de production
 
 Demarrage:
 
@@ -107,6 +127,20 @@ Verifier le monitor HTTP:
 ```bash
 curl -sf http://127.0.0.1:8081/monitor/overview
 curl -sf http://127.0.0.1:8081/monitor/edge
+```
+
+Verifier la base SQLite si la persistance est active:
+
+```bash
+sqlite3 /var/lib/solana-bot/bot_observer.sqlite3 \
+  "SELECT COUNT(*) FROM rejection_events;"
+sqlite3 /var/lib/solana-bot/bot_observer.sqlite3 \
+  "SELECT COUNT(*) FROM trade_events;"
+sqlite3 /var/lib/solana-bot/bot_observer.sqlite3 \
+  "SELECT submission_id, outcome, updated_at_unix_millis
+   FROM trade_latest
+   ORDER BY updated_at_unix_millis DESC
+   LIMIT 10;"
 ```
 
 Verifier le resume bot:
@@ -131,3 +165,19 @@ Si `ready=false`, le plus frequent est qu'un maillon live manque encore:
 - `/etc/solana-bot/bot.toml`
 - `/etc/systemd/system/solana-signerd.service`
 - `/etc/systemd/system/solana-bot.service`
+- `/var/lib/solana-bot/` pour l'etat persistant du service, dont la base SQLite si active
+
+## Notes d'exploitation
+
+La persistance SQLite est optimisee pour ne pas ralentir le bot:
+
+- la decision de trading ne touche pas SQLite
+- les ecritures sont batchées sur un thread dedie
+- un flush best-effort est demande a l'arret propre du daemon
+
+Trade-off assume:
+
+- en cas de crash machine ou coupure brutale, le dernier batch peut ne pas etre present
+- si la base reste bloquee longtemps, la file de persistance peut faire monter la memoire
+
+Pour le schema et les requetes d'analyse, voir [`./persistence.md`](./persistence.md).

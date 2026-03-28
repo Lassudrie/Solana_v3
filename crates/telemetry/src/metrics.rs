@@ -67,6 +67,13 @@ pub struct PipelineMetrics {
     shredstream_events_per_second: AtomicU64,
     shredstream_last_observed_second: AtomicU64,
     shredstream_events_in_second: AtomicU64,
+    state_coalesced_updates: AtomicU64,
+    state_dirty_mailboxes: AtomicU64,
+    trigger_queue_depth: AtomicU64,
+    trigger_queue_wait_nanos: AtomicU64,
+    trigger_barrier_wait_nanos: AtomicU64,
+    route_eval_nanos: AtomicU64,
+    state_mailbox_age_nanos: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +98,13 @@ pub struct MetricsSnapshot {
     pub shredstream_interarrival_latency_nanos: u64,
     pub shredstream_interarrival_latency_count: u64,
     pub shredstream_events_per_second: u64,
+    pub state_coalesced_updates: u64,
+    pub state_dirty_mailboxes: u64,
+    pub trigger_queue_depth: u64,
+    pub trigger_queue_wait_nanos: u64,
+    pub trigger_barrier_wait_nanos: u64,
+    pub route_eval_nanos: u64,
+    pub state_mailbox_age_nanos: u64,
 }
 
 impl PipelineMetrics {
@@ -154,6 +168,46 @@ impl PipelineMetrics {
     pub fn increment_shredstream_sequence_duplicate(&self) {
         self.shredstream_sequence_duplicates
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn increment_state_coalesced_updates(&self, count: u64) {
+        self.state_coalesced_updates
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn set_state_dirty_mailboxes(&self, count: usize) {
+        self.state_dirty_mailboxes
+            .store(as_usize_to_u64(count), Ordering::Relaxed);
+    }
+
+    pub fn set_trigger_queue_depth(&self, count: usize) {
+        self.trigger_queue_depth
+            .store(as_usize_to_u64(count), Ordering::Relaxed);
+    }
+
+    pub fn record_trigger_queue_wait(&self, duration: Duration) {
+        saturating_add_atomic(
+            &self.trigger_queue_wait_nanos,
+            as_u128_to_u64(duration.as_nanos()),
+        );
+    }
+
+    pub fn record_trigger_barrier_wait(&self, duration: Duration) {
+        saturating_add_atomic(
+            &self.trigger_barrier_wait_nanos,
+            as_u128_to_u64(duration.as_nanos()),
+        );
+    }
+
+    pub fn record_route_eval(&self, duration: Duration) {
+        saturating_add_atomic(&self.route_eval_nanos, as_u128_to_u64(duration.as_nanos()));
+    }
+
+    pub fn record_state_mailbox_age(&self, duration: Duration) {
+        saturating_add_atomic(
+            &self.state_mailbox_age_nanos,
+            as_u128_to_u64(duration.as_nanos()),
+        );
     }
 
     pub fn record_shredstream_event(
@@ -260,6 +314,15 @@ impl PipelineMetrics {
             shredstream_events_per_second: self
                 .shredstream_events_per_second
                 .load(Ordering::Relaxed),
+            state_coalesced_updates: self.state_coalesced_updates.load(Ordering::Relaxed),
+            state_dirty_mailboxes: self.state_dirty_mailboxes.load(Ordering::Relaxed),
+            trigger_queue_depth: self.trigger_queue_depth.load(Ordering::Relaxed),
+            trigger_queue_wait_nanos: self.trigger_queue_wait_nanos.load(Ordering::Relaxed),
+            trigger_barrier_wait_nanos: self
+                .trigger_barrier_wait_nanos
+                .load(Ordering::Relaxed),
+            route_eval_nanos: self.route_eval_nanos.load(Ordering::Relaxed),
+            state_mailbox_age_nanos: self.state_mailbox_age_nanos.load(Ordering::Relaxed),
         }
     }
 }
@@ -289,12 +352,23 @@ impl Default for PipelineMetrics {
             shredstream_events_per_second: AtomicU64::new(0),
             shredstream_last_observed_second: AtomicU64::new(0),
             shredstream_events_in_second: AtomicU64::new(0),
+            state_coalesced_updates: AtomicU64::new(0),
+            state_dirty_mailboxes: AtomicU64::new(0),
+            trigger_queue_depth: AtomicU64::new(0),
+            trigger_queue_wait_nanos: AtomicU64::new(0),
+            trigger_barrier_wait_nanos: AtomicU64::new(0),
+            route_eval_nanos: AtomicU64::new(0),
+            state_mailbox_age_nanos: AtomicU64::new(0),
         }
     }
 }
 
 fn as_u128_to_u64(value: u128) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn as_usize_to_u64(value: usize) -> u64 {
+    value.min(u64::MAX as usize) as u64
 }
 
 fn saturating_add_atomic(counter: &AtomicU64, delta: u64) {

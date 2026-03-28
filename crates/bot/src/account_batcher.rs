@@ -1,3 +1,4 @@
 pub use detection::{
-    GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcContext, decode_lookup_table,
+    GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcAccountValue, RpcContext,
+    decode_lookup_table,
 };

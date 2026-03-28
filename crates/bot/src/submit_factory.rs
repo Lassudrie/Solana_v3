@@ -1,11 +1,8 @@
 use std::sync::Arc;
 
-use submit::{
-    JitoConfig, JitoSubmitter, RoutedSubmitter, RpcConfig, RpcSubmitter,
-    SingleTransactionRoutingPolicy, SubmitMode, Submitter,
-};
+use submit::{JitoConfig, JitoSubmitter, SubmitMode, Submitter};
 
-use crate::config::{BotConfig, SingleTransactionSubmitPolicyConfig, SubmitModeConfig};
+use crate::config::{BotConfig, SubmitModeConfig};
 
 const API_V1_PATH: &str = "/api/v1";
 const TRANSACTION_PATH: &str = "/api/v1/transactions";
@@ -19,7 +16,7 @@ pub(crate) fn submit_mode_from_config(config: &BotConfig) -> SubmitMode {
 }
 
 pub(crate) fn build_submitter(config: &BotConfig) -> Arc<dyn Submitter> {
-    let jito: Arc<dyn Submitter> = Arc::new(JitoSubmitter::new(JitoConfig {
+    Arc::new(JitoSubmitter::new(JitoConfig {
         endpoint: config.jito.endpoint.clone(),
         auth_token: config.jito.auth_token.clone(),
         bundle_enabled: config.jito.bundle_enabled,
@@ -28,68 +25,15 @@ pub(crate) fn build_submitter(config: &BotConfig) -> Arc<dyn Submitter> {
         retry_attempts: config.jito.retry_attempts,
         retry_backoff_ms: config.jito.retry_backoff_ms,
         idempotency_cache_size: config.jito.idempotency_cache_size,
-    }));
-    let rpc = config.rpc_submit.enabled.then(|| {
-        Arc::new(RpcSubmitter::new(RpcConfig {
-            endpoint: rpc_submit_endpoint(config),
-            connect_timeout_ms: config.rpc_submit.connect_timeout_ms,
-            request_timeout_ms: config.rpc_submit.request_timeout_ms,
-            skip_preflight: config.rpc_submit.skip_preflight,
-            max_retries: config.rpc_submit.max_retries,
-            idempotency_cache_size: config.rpc_submit.idempotency_cache_size,
-        })) as Arc<dyn Submitter>
-    });
-    Arc::new(RoutedSubmitter::new(
-        Some(jito),
-        rpc,
-        single_transaction_policy(config),
-    ))
+    }))
 }
 
 pub(crate) fn submit_endpoint_label(config: &BotConfig, mode: SubmitMode) -> String {
     match mode {
         SubmitMode::Bundle => request_url(&config.jito.endpoint, SubmitMode::Bundle),
         SubmitMode::SingleTransaction => {
-            let rpc_enabled = config.rpc_submit.enabled;
-            match config.submit.single_transaction_policy {
-                SingleTransactionSubmitPolicyConfig::JitoOnly => {
-                    request_url(&config.jito.endpoint, SubmitMode::SingleTransaction)
-                }
-                SingleTransactionSubmitPolicyConfig::RpcOnly if rpc_enabled => {
-                    rpc_submit_endpoint(config)
-                }
-                SingleTransactionSubmitPolicyConfig::Fanout if rpc_enabled => format!(
-                    "fanout://{}|{}",
-                    rpc_submit_endpoint(config),
-                    request_url(&config.jito.endpoint, SubmitMode::SingleTransaction)
-                ),
-                SingleTransactionSubmitPolicyConfig::LeaderAware if rpc_enabled => format!(
-                    "leader-aware://{}|{}",
-                    rpc_submit_endpoint(config),
-                    request_url(&config.jito.endpoint, SubmitMode::SingleTransaction)
-                ),
-                _ => request_url(&config.jito.endpoint, SubmitMode::SingleTransaction),
-            }
+            request_url(&config.jito.endpoint, SubmitMode::SingleTransaction)
         }
-    }
-}
-
-fn single_transaction_policy(config: &BotConfig) -> SingleTransactionRoutingPolicy {
-    match config.submit.single_transaction_policy {
-        SingleTransactionSubmitPolicyConfig::JitoOnly => SingleTransactionRoutingPolicy::JitoOnly,
-        SingleTransactionSubmitPolicyConfig::RpcOnly => SingleTransactionRoutingPolicy::RpcOnly,
-        SingleTransactionSubmitPolicyConfig::Fanout => SingleTransactionRoutingPolicy::Fanout,
-        SingleTransactionSubmitPolicyConfig::LeaderAware => {
-            SingleTransactionRoutingPolicy::LeaderAware
-        }
-    }
-}
-
-fn rpc_submit_endpoint(config: &BotConfig) -> String {
-    if config.rpc_submit.endpoint.is_empty() {
-        config.reconciliation.rpc_http_endpoint.clone()
-    } else {
-        config.rpc_submit.endpoint.clone()
     }
 }
 
@@ -118,24 +62,30 @@ fn request_url(endpoint: &str, mode: SubmitMode) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::rpc_submit_endpoint;
+    use super::submit_endpoint_label;
     use crate::config::BotConfig;
+    use submit::SubmitMode;
 
     #[test]
-    fn falls_back_to_reconciliation_rpc_endpoint_when_rpc_submit_endpoint_is_empty() {
+    fn single_transaction_endpoint_is_always_jito() {
         let mut config = BotConfig::default();
-        config.reconciliation.rpc_http_endpoint = "http://127.0.0.1:8899".into();
-        config.rpc_submit.endpoint.clear();
+        config.jito.endpoint = "https://mainnet.block-engine.jito.wtf".into();
+        config.rpc_submit.enabled = true;
 
-        assert_eq!(rpc_submit_endpoint(&config), "http://127.0.0.1:8899");
+        assert_eq!(
+            submit_endpoint_label(&config, SubmitMode::SingleTransaction),
+            "https://mainnet.block-engine.jito.wtf/api/v1/transactions"
+        );
     }
 
     #[test]
-    fn prefers_explicit_rpc_submit_endpoint_over_reconciliation_endpoint() {
+    fn bundle_endpoint_is_always_jito() {
         let mut config = BotConfig::default();
-        config.reconciliation.rpc_http_endpoint = "http://127.0.0.1:8899".into();
-        config.rpc_submit.endpoint = "http://127.0.0.1:18899".into();
+        config.jito.endpoint = "https://mainnet.block-engine.jito.wtf".into();
 
-        assert_eq!(rpc_submit_endpoint(&config), "http://127.0.0.1:18899");
+        assert_eq!(
+            submit_endpoint_label(&config, SubmitMode::Bundle),
+            "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+        );
     }
 }
