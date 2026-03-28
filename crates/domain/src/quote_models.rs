@@ -32,6 +32,16 @@ impl DirectionalConcentratedQuoteModel {
     pub fn is_executable(&self) -> bool {
         self.loaded_tick_arrays > 0 && !self.windows.is_empty()
     }
+
+    pub fn covers_tick(&self, tick_index: i32) -> bool {
+        self.windows.iter().any(|window| {
+            tick_index >= window.start_tick_index && tick_index <= window.end_tick_index
+        })
+    }
+
+    pub fn is_executable_at(&self, tick_index: i32) -> bool {
+        self.is_executable() && self.covers_tick(tick_index)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,13 +65,13 @@ impl ConcentratedQuoteModel {
             || self
                 .a_to_b
                 .as_ref()
-                .map(DirectionalConcentratedQuoteModel::is_executable)
+                .map(|direction| direction.is_executable_at(self.current_tick_index))
                 .unwrap_or(false))
             && (!self.required_b_to_a
                 || self
                     .b_to_a
                     .as_ref()
-                    .map(DirectionalConcentratedQuoteModel::is_executable)
+                    .map(|direction| direction.is_executable_at(self.current_tick_index))
                     .unwrap_or(false))
     }
 

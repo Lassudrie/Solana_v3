@@ -99,8 +99,10 @@ pub struct RaydiumSimplePoolConfig {
     pub market_coin_vault: String,
     pub market_pc_vault: String,
     pub market_vault_signer: String,
-    pub user_source_token_account: String,
-    pub user_destination_token_account: String,
+    pub user_source_token_account: Option<String>,
+    pub user_destination_token_account: Option<String>,
+    pub user_source_mint: Option<String>,
+    pub user_destination_mint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

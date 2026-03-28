@@ -144,27 +144,30 @@ where
         let mut last_rejection = None;
         let adjustments = route_quote_adjustments(route, active_execution_buffer_bps);
         for trade_size in trade_sizes(route) {
-            let quote = self
-                .quote_engine
-                .quote(
-                    route,
-                    [
-                        PoolPricingView {
-                            snapshot: first,
-                            concentrated: state.concentrated_quote_model(&route.legs[0].pool_id),
-                        },
-                        PoolPricingView {
-                            snapshot: second,
-                            concentrated: state.concentrated_quote_model(&route.legs[1].pool_id),
-                        },
-                    ],
-                    state.latest_slot(),
-                    trade_size,
-                    &adjustments,
-                )
-                .map_err(|error| RejectionReason::QuoteFailed {
-                    detail: error.to_string(),
-                })?;
+            let quote = match self.quote_engine.quote(
+                route,
+                [
+                    PoolPricingView {
+                        snapshot: first,
+                        concentrated: state.concentrated_quote_model(&route.legs[0].pool_id),
+                    },
+                    PoolPricingView {
+                        snapshot: second,
+                        concentrated: state.concentrated_quote_model(&route.legs[1].pool_id),
+                    },
+                ],
+                state.latest_slot(),
+                trade_size,
+                &adjustments,
+            ) {
+                Ok(quote) => quote,
+                Err(error) => {
+                    last_rejection = Some(RejectionReason::QuoteFailed {
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            };
             let quote = quote
                 .with_estimated_execution_cost(
                     route,
@@ -483,6 +486,55 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct FailingDefaultQuoteEngine;
+
+    impl QuoteEngine for FailingDefaultQuoteEngine {
+        fn quote(
+            &self,
+            route: &RouteDefinition,
+            _snapshots: [PoolPricingView<'_>; 2],
+            quoted_slot: u64,
+            input_amount: u64,
+            _adjustments: &QuoteExecutionAdjustments,
+        ) -> Result<RouteQuote, QuoteError> {
+            match input_amount {
+                1_000_000 | 500_000 => Err(QuoteError::ConcentratedWindowExceeded),
+                250_000 => Ok(RouteQuote {
+                    quoted_slot,
+                    input_amount,
+                    gross_output_amount: 250_025,
+                    net_output_amount: 250_025,
+                    expected_gross_profit_quote_atoms: 25,
+                    estimated_execution_cost_lamports: 0,
+                    estimated_execution_cost_quote_atoms: 0,
+                    expected_net_profit_quote_atoms: 25,
+                    leg_quotes: [
+                        LegQuote {
+                            venue: route.legs[0].venue.clone(),
+                            pool_id: route.legs[0].pool_id.clone(),
+                            side: route.legs[0].side,
+                            input_amount,
+                            output_amount: input_amount,
+                            fee_paid: 0,
+                            current_tick_index: None,
+                        },
+                        LegQuote {
+                            venue: route.legs[1].venue.clone(),
+                            pool_id: route.legs[1].pool_id.clone(),
+                            side: route.legs[1].side,
+                            input_amount,
+                            output_amount: 250_025,
+                            fee_paid: 0,
+                            current_tick_index: None,
+                        },
+                    ],
+                }),
+                _ => Err(QuoteError::ConcentratedWindowExceeded),
+            }
+        }
+    }
+
     fn route_definition() -> RouteDefinition {
         RouteDefinition {
             route_id: RouteId("route-a".into()),
@@ -596,6 +648,67 @@ mod tests {
         assert_eq!(candidate.trade_size, 250_000);
         assert_eq!(candidate.expected_net_profit_quote_atoms, 25);
         assert_eq!(candidate.leg_snapshot_slots, [10, 10]);
+    }
+
+    #[test]
+    fn selector_keeps_trying_smaller_trade_sizes_after_quote_failures() {
+        let route = route_definition();
+        let execution_state = ExecutionStateSnapshot {
+            head_slot: 10,
+            rpc_slot: Some(10),
+            latest_blockhash: Some("blockhash-1".into()),
+            blockhash_slot: Some(10),
+            alt_revision: 0,
+            lookup_tables: Vec::new(),
+            wallet_balance_lamports: 1_000_000,
+            wallet_ready: true,
+            kill_switch_enabled: false,
+        };
+        let selector = OpportunitySelector::new(
+            FailingDefaultQuoteEngine,
+            GuardrailSet::new(GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: false,
+                ..GuardrailConfig::default()
+            }),
+        );
+        let mut state = StatePlane::new(2);
+
+        for pool_id in ["pool-a", "pool-b"] {
+            state
+                .apply_event(&NormalizedEvent::pool_snapshot_update(
+                    EventSourceKind::Synthetic,
+                    1,
+                    10,
+                    PoolSnapshotUpdate {
+                        pool_id: pool_id.into(),
+                        price_bps: 10_000,
+                        fee_bps: 4,
+                        reserve_depth: 10_000_000,
+                        reserve_a: Some(10_000_000),
+                        reserve_b: Some(10_000_000),
+                        active_liquidity: Some(10_000_000),
+                        sqrt_price_x64: None,
+                        venue: PoolVenue::OrcaSimplePool,
+                        confidence: SnapshotConfidence::Executable,
+                        repair_pending: Some(false),
+                        token_mint_a: "SOL".into(),
+                        token_mint_b: "USDC".into(),
+                        tick_spacing: 0,
+                        current_tick_index: None,
+                        slot: 10,
+                        write_version: 1,
+                    },
+                ))
+                .expect("snapshot update should apply");
+        }
+
+        let candidate = selector
+            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .expect("smaller trade size should still be selected after quote failures");
+
+        assert_eq!(candidate.trade_size, 250_000);
+        assert_eq!(candidate.expected_net_profit_quote_atoms, 25);
     }
 
     #[test]

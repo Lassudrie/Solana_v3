@@ -22,7 +22,8 @@ solana-sdk.workspace = true
 solana-transaction-legacy = { package = "solana-transaction", version = "=2.2.1" }
 strategy = { path = "../strategy" }
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tonic = { version = "0.13", features = ["tls-webpki-roots"] }
 
 [build-dependencies]

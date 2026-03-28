@@ -18,7 +18,7 @@ use solana_address_lookup_table_interface::{program as alt_program, state::Addre
 use crate::rpc::{RpcError, rpc_call};
 
 const MOCK_SCHEME: &str = "mock://";
-const GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW: Duration = Duration::from_millis(20);
+const DEFAULT_GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW: Duration = Duration::from_millis(20);
 const MAX_GET_MULTIPLE_ACCOUNTS_KEYS: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -158,9 +158,13 @@ pub struct GetMultipleAccountsBatcher {
 
 impl GetMultipleAccountsBatcher {
     pub fn new(endpoint: &str) -> Self {
+        Self::new_with_window(endpoint, DEFAULT_GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW)
+    }
+
+    pub fn new_with_window(endpoint: &str, batch_window: Duration) -> Self {
         let (sender, receiver) = mpsc::channel();
         let endpoint = endpoint.to_owned();
-        thread::spawn(move || run_batcher(endpoint, receiver));
+        thread::spawn(move || run_batcher(endpoint, receiver, batch_window));
         Self { sender }
     }
 
@@ -226,7 +230,7 @@ struct BatchRequest {
     response_tx: Sender<Result<FetchedAccounts, RpcError>>,
 }
 
-fn run_batcher(endpoint: String, receiver: Receiver<BatchRequest>) {
+fn run_batcher(endpoint: String, receiver: Receiver<BatchRequest>, batch_window: Duration) {
     let http = Client::builder()
         .connect_timeout(Duration::from_millis(300))
         .timeout(Duration::from_millis(1_000))
@@ -239,7 +243,7 @@ fn run_batcher(endpoint: String, receiver: Receiver<BatchRequest>) {
             Err(_) => break,
         };
         let mut pending = vec![first_request];
-        let deadline = Instant::now() + GET_MULTIPLE_ACCOUNTS_BATCH_WINDOW;
+        let deadline = Instant::now() + batch_window;
         let mut disconnected = false;
 
         loop {

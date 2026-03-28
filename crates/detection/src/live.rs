@@ -18,6 +18,7 @@ use crate::{
         GetMultipleAccountsBatcher, LookupTableCacheHandle, RpcAccountValue, decode_lookup_table,
     },
     events::SnapshotConfidence,
+    proto::shredstream,
     rpc::{RpcError, RpcRateLimitBackoff},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -236,19 +237,10 @@ pub struct GrpcEntriesConfig {
     pub grpc_connect_timeout_ms: u64,
     pub reconnect_backoff_millis: u64,
     pub max_reconnect_backoff_millis: u64,
+    pub idle_refresh_slot_lag: u64,
     pub max_repair_in_flight: usize,
     pub tracked_pools: Vec<TrackedPool>,
     pub lookup_table_keys: Vec<String>,
-}
-
-#[allow(dead_code)]
-pub mod shared {
-    tonic::include_proto!("shared");
-}
-
-#[allow(dead_code)]
-pub mod proto {
-    tonic::include_proto!("shredstream");
 }
 
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
@@ -261,7 +253,6 @@ const ORCA_TWO_HOP_SWAP_V2_DISCRIMINATOR_NAME: &str = "two_hop_swap_v2";
 const RAYDIUM_CLMM_SWAP_DISCRIMINATOR_NAME: &str = "swap_v2";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const CLMM_REFRESH_GRACE_SLOTS: u64 = 8;
-const IDLE_REFRESH_SLOT_LAG: u64 = 128;
 const ORCA_WHIRLPOOL_ACCOUNT_NAME: &str = "Whirlpool";
 const RAYDIUM_CLMM_ACCOUNT_NAME: &str = "PoolState";
 const ORCA_TICK_ARRAY_ACCOUNT_NAME: &str = "TickArray";
@@ -1093,6 +1084,7 @@ fn spawn_stream_worker(
     let connect_timeout = Duration::from_millis(config.grpc_connect_timeout_ms.max(1));
     let base_backoff = Duration::from_millis(config.reconnect_backoff_millis.max(1));
     let max_backoff = Duration::from_millis(config.max_reconnect_backoff_millis.max(1));
+    let idle_refresh_slot_lag = config.idle_refresh_slot_lag;
 
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1113,8 +1105,10 @@ fn spawn_stream_worker(
                 };
 
                 let connect_result =
-                    proto::shredstream_proxy_client::ShredstreamProxyClient::connect(endpoint)
-                        .await;
+                    shredstream::shredstream_proxy_client::ShredstreamProxyClient::connect(
+                        endpoint,
+                    )
+                    .await;
                 let Ok(mut client) = connect_result else {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(max_backoff);
@@ -1122,7 +1116,7 @@ fn spawn_stream_worker(
                 };
 
                 let subscribe_result = client
-                    .subscribe_entries(proto::SubscribeEntriesRequest {})
+                    .subscribe_entries(shredstream::SubscribeEntriesRequest {})
                     .await;
                 let Ok(response) = subscribe_result else {
                     tokio::time::sleep(backoff).await;
@@ -1160,6 +1154,7 @@ fn spawn_stream_worker(
                         &event_tx,
                         &repair_tx,
                         &sequence,
+                        idle_refresh_slot_lag,
                         hooks.as_ref(),
                     );
                 }
@@ -1184,6 +1179,7 @@ fn handle_entry_batch(
     event_tx: &SyncSender<NormalizedEvent>,
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
+    idle_refresh_slot_lag: u64,
     hooks: &dyn LiveHooks,
 ) {
     let Ok(entries) = bincode::deserialize::<Vec<LegacyEntry>>(payload) else {
@@ -1379,6 +1375,7 @@ fn handle_entry_batch(
         executable_states,
         sync_tracker,
         repair_tx,
+        idle_refresh_slot_lag,
         hooks,
         source_received_at,
     );
@@ -1855,7 +1852,7 @@ where
     let Some(direction) = direction else {
         return ExactMutationOutcome::RefreshRequired;
     };
-    if !direction_is_executable(Some(direction)) {
+    if !direction_is_executable(Some(direction), current_quote_model.current_tick_index) {
         return ExactMutationOutcome::RefreshRequired;
     }
     let domain_direction = to_domain_directional_quote_model(direction);
@@ -1885,6 +1882,7 @@ where
         }
         Err(
             QuoteError::ArithmeticOverflow
+            | QuoteError::ArithmeticOverflowAt(_)
             | QuoteError::InvalidSnapshotLiquidity
             | QuoteError::InvalidSnapshotPrice
             | QuoteError::ExecutionCostNotConvertible
@@ -1906,8 +1904,10 @@ where
     });
     let next_a_to_b = next_a_to_b.flatten();
     let next_b_to_a = next_b_to_a.flatten();
-    let executable = (!required_a_to_b || direction_is_executable(next_a_to_b.as_ref()))
-        && (!required_b_to_a || direction_is_executable(next_b_to_a.as_ref()));
+    let executable = (!required_a_to_b
+        || direction_is_executable(next_a_to_b.as_ref(), swap_result.current_tick_index))
+        && (!required_b_to_a
+            || direction_is_executable(next_b_to_a.as_ref(), swap_result.current_tick_index));
     let (loaded_tick_arrays, expected_tick_arrays) =
         quote_model_union(next_a_to_b.as_ref(), next_b_to_a.as_ref());
     let next_write_version = state.write_version.saturating_add(1);
@@ -2123,7 +2123,8 @@ fn reduce_constant_product_swap(
     }
     next.last_update_slot = slot;
     next.write_version = next.write_version.saturating_add(1);
-    next.confidence = PoolConfidence::Executable;
+    next.last_verified_slot = next.last_verified_slot.max(slot);
+    next.confidence = constant_product_confidence_for_venue(venue);
     next.repair_pending = false;
 
     Some(match venue {
@@ -2163,7 +2164,8 @@ fn reduce_constant_product_swap_exact_out(
     }
     next.last_update_slot = slot;
     next.write_version = next.write_version.saturating_add(1);
-    next.confidence = PoolConfidence::Executable;
+    next.last_verified_slot = next.last_verified_slot.max(slot);
+    next.confidence = constant_product_confidence_for_venue(venue);
     next.repair_pending = false;
 
     Some(match venue {
@@ -2224,6 +2226,29 @@ fn constant_product_amount_in_for_output(
 
     (constant_product_amount_out(reserve_in, reserve_out, amount_in, fee_bps)? >= amount_out)
         .then_some(amount_in)
+}
+
+fn constant_product_confidence_for_venue(venue: PoolVenue) -> PoolConfidence {
+    match venue {
+        PoolVenue::OrcaSimplePool => PoolConfidence::Executable,
+        // Raydium "simple" pools are hybrid AMM/OpenBook markets. We currently
+        // hydrate them from the two AMM vault balances only, so the state is
+        // structurally verified but not safe to treat as executable for quotes.
+        PoolVenue::RaydiumSimplePool => PoolConfidence::Verified,
+        PoolVenue::OrcaWhirlpool | PoolVenue::RaydiumClmm => {
+            unreachable!("constant product reducer only supports constant product venues")
+        }
+    }
+}
+
+fn constant_product_requires_repair(state: &ConstantProductPoolState) -> bool {
+    match state.venue {
+        PoolVenue::OrcaSimplePool => !state.confidence.is_executable() || state.repair_pending,
+        PoolVenue::RaydiumSimplePool => !state.confidence.is_verified() || state.repair_pending,
+        PoolVenue::OrcaWhirlpool | PoolVenue::RaydiumClmm => {
+            unreachable!("constant product reducer only supports constant product venues")
+        }
+    }
 }
 
 fn div_ceil_u128(numerator: u128, denominator: u128) -> Option<u128> {
@@ -2531,6 +2556,7 @@ fn refresh_idle_tracked_pools(
     executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
     sync_tracker: &Arc<Mutex<PoolSyncTracker>>,
     repair_tx: &mpsc::Sender<RepairRequest>,
+    idle_refresh_slot_lag: u64,
     hooks: &dyn LiveHooks,
     source_received_at: SystemTime,
 ) {
@@ -2540,7 +2566,7 @@ fn refresh_idle_tracked_pools(
             .into_iter()
             .filter(|pool_id| {
                 store.get(&PoolId(pool_id.clone())).is_some_and(|state| {
-                    slot.saturating_sub(state.last_update_slot()) >= IDLE_REFRESH_SLOT_LAG
+                    slot.saturating_sub(state.last_update_slot()) >= idle_refresh_slot_lag
                 })
             })
             .filter_map(|pool_id| {
@@ -3444,9 +3470,7 @@ fn pool_requires_repair(
 
     match state {
         ExecutablePoolState::OrcaSimplePool(state)
-        | ExecutablePoolState::RaydiumSimplePool(state) => {
-            !state.confidence.is_executable() || state.repair_pending
-        }
+        | ExecutablePoolState::RaydiumSimplePool(state) => constant_product_requires_repair(state),
         ExecutablePoolState::OrcaWhirlpool(state) | ExecutablePoolState::RaydiumClmm(state) => {
             !state.confidence.is_executable() || state.repair_pending
         }
@@ -3851,9 +3875,25 @@ fn quote_model_union(
     )
 }
 
-fn direction_is_executable(direction: Option<&DirectionalPoolQuoteModelUpdate>) -> bool {
+fn direction_covers_tick(
+    direction: &DirectionalPoolQuoteModelUpdate,
+    current_tick_index: i32,
+) -> bool {
+    direction.windows.iter().any(|window| {
+        current_tick_index >= window.start_tick_index && current_tick_index <= window.end_tick_index
+    })
+}
+
+fn direction_is_executable(
+    direction: Option<&DirectionalPoolQuoteModelUpdate>,
+    current_tick_index: i32,
+) -> bool {
     direction
-        .map(|direction| direction.loaded_tick_arrays > 0 && !direction.windows.is_empty())
+        .map(|direction| {
+            direction.loaded_tick_arrays > 0
+                && !direction.windows.is_empty()
+                && direction_covers_tick(direction, current_tick_index)
+        })
         .unwrap_or(false)
 }
 
@@ -3910,7 +3950,9 @@ fn build_executable_state_from_accounts(
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: PoolConfidence::Executable,
+                    confidence: constant_product_confidence_for_venue(
+                        PoolVenue::RaydiumSimplePool,
+                    ),
                     repair_pending: false,
                 }),
                 quote_model_update: None,
@@ -3959,8 +4001,10 @@ fn build_executable_state_from_accounts(
                 slot,
                 write_version: next_write_version,
             };
-            let executable = (!config.require_a_to_b || direction_is_executable(a_to_b.as_ref()))
-                && (!config.require_b_to_a || direction_is_executable(b_to_a.as_ref()));
+            let executable = (!config.require_a_to_b
+                || direction_is_executable(a_to_b.as_ref(), current_tick_index))
+                && (!config.require_b_to_a
+                    || direction_is_executable(b_to_a.as_ref(), current_tick_index));
             let (loaded_tick_arrays, expected_tick_arrays) =
                 quote_model_union(a_to_b.as_ref(), b_to_a.as_ref());
             Some(RepairBuildResult {
@@ -4043,8 +4087,9 @@ fn build_executable_state_from_accounts(
                 write_version: next_write_version,
             };
             let executable = (!config.require_zero_for_one
-                || direction_is_executable(zero_for_one.as_ref()))
-                && (!config.require_one_for_zero || direction_is_executable(one_for_zero.as_ref()));
+                || direction_is_executable(zero_for_one.as_ref(), current_tick_index))
+                && (!config.require_one_for_zero
+                    || direction_is_executable(one_for_zero.as_ref(), current_tick_index));
             let (loaded_tick_arrays, expected_tick_arrays) =
                 quote_model_union(zero_for_one.as_ref(), one_for_zero.as_ref());
             Some(RepairBuildResult {
@@ -4098,9 +4143,7 @@ fn fetch_accounts_by_key(
 fn state_satisfies_request(state: &ExecutablePoolState, observed_slot: u64) -> bool {
     let requires_repair = match state {
         ExecutablePoolState::OrcaSimplePool(state)
-        | ExecutablePoolState::RaydiumSimplePool(state) => {
-            !state.confidence.is_executable() || state.repair_pending
-        }
+        | ExecutablePoolState::RaydiumSimplePool(state) => constant_product_requires_repair(state),
         ExecutablePoolState::OrcaWhirlpool(state) | ExecutablePoolState::RaydiumClmm(state) => {
             !state.confidence.is_executable() || state.repair_pending
         }
@@ -4289,7 +4332,7 @@ mod tests {
         reduce_orca_simple_swap, reduce_raydium_simple_swap, refresh_idle_tracked_pools,
         required_orca_tick_array_keys, required_raydium_tick_array_keys, resolve_transaction,
         resolve_transaction_with_dynamic_lookup_tables, schedule_exact_refresh,
-        seed_initial_repairs, timestamp_to_system_time,
+        seed_initial_repairs, state_satisfies_request, timestamp_to_system_time,
     };
     use crate::account_batcher::{GetMultipleAccountsBatcher, LookupTableCacheHandle};
 
@@ -4502,6 +4545,7 @@ mod tests {
             grpc_connect_timeout_ms: 100,
             reconnect_backoff_millis: 100,
             max_reconnect_backoff_millis: 1_000,
+            idle_refresh_slot_lag: 32,
             max_repair_in_flight: 2,
             lookup_table_keys: vec!["table-a".into(), "table-b".into()],
             tracked_pools: vec![
@@ -4635,6 +4679,7 @@ mod tests {
         assert_eq!(next.reserve_a, 1_100_000_000);
         assert!(next.reserve_b < 100_000_000);
         assert_eq!(next.write_version, 3);
+        assert_eq!(next.confidence, PoolConfidence::Verified);
     }
 
     #[test]
@@ -4690,6 +4735,7 @@ mod tests {
         assert_eq!(next.reserve_b, 91_000_000);
         assert!(next.reserve_a > 1_000_000_000);
         assert_eq!(next.write_version, 3);
+        assert_eq!(next.confidence, PoolConfidence::Verified);
     }
 
     #[test]
@@ -4733,6 +4779,64 @@ mod tests {
         );
 
         assert_eq!(outcome, ExactMutationOutcome::RefreshRequired);
+    }
+
+    #[test]
+    fn repair_builds_raydium_simple_as_verified_state() {
+        let tracked_pool = TrackedPool {
+            pool_id: "pool-ray".into(),
+            reducer_mode: ReducerRolloutMode::Active,
+            watch_accounts: vec![],
+            kind: TrackedPoolKind::RaydiumSimple(RaydiumSimpleTrackedConfig {
+                program_id: "raydium-program".into(),
+                token_program_id: "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".into(),
+                amm_pool: "amm".into(),
+                token_vault_a: "vault-a".into(),
+                token_vault_b: "vault-b".into(),
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                fee_bps: 25,
+            }),
+        };
+        let accounts = HashMap::from([
+            (
+                "vault-a".into(),
+                rpc_account_with_owner(
+                    {
+                        let mut raw = vec![0u8; 72];
+                        write_u64(&mut raw, 64, 1_000_000);
+                        raw
+                    },
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                ),
+            ),
+            (
+                "vault-b".into(),
+                rpc_account_with_owner(
+                    {
+                        let mut raw = vec![0u8; 72];
+                        write_u64(&mut raw, 64, 2_000_000);
+                        raw
+                    },
+                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                ),
+            ),
+        ]);
+        let states = Arc::new(RwLock::new(LiveExecutableStateStore::default()));
+
+        let next = build_executable_state_from_accounts(&tracked_pool, &accounts, 88, &states)
+            .expect("repair should rebuild the pool state");
+
+        let ExecutablePoolState::RaydiumSimplePool(state) = next.next_state else {
+            panic!("expected raydium simple state");
+        };
+        assert_eq!(state.confidence, PoolConfidence::Verified);
+        assert!(!state.repair_pending);
+        assert_eq!(state.last_verified_slot, 88);
+        assert!(state_satisfies_request(
+            &ExecutablePoolState::RaydiumSimplePool(state),
+            88,
+        ));
     }
 
     #[test]
@@ -5775,6 +5879,96 @@ mod tests {
     }
 
     #[test]
+    fn orca_whirlpool_exact_reducer_refreshes_when_current_tick_leaves_loaded_windows() {
+        let tracked_pool = TrackedPool {
+            pool_id: "pool-orca".into(),
+            reducer_mode: ReducerRolloutMode::Active,
+            watch_accounts: vec![],
+            kind: TrackedPoolKind::OrcaWhirlpool(OrcaWhirlpoolTrackedConfig {
+                program_id: "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".into(),
+                whirlpool: "Ckp1kwZqosaLU1h3zWtuaMBubyWM7LX3cxYezRVin7p2".into(),
+                token_mint_a: "So11111111111111111111111111111111111111112".into(),
+                token_mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+                token_vault_a: "vault-a".into(),
+                token_vault_b: "vault-b".into(),
+                tick_spacing: 4,
+                fee_bps: 4,
+                require_a_to_b: true,
+                require_b_to_a: false,
+            }),
+        };
+        let TrackedPoolKind::OrcaWhirlpool(config) = &tracked_pool.kind else {
+            panic!("expected whirlpool config");
+        };
+        let live_store = Arc::new(RwLock::new(LiveExecutableStateStore::default()));
+        live_store
+            .write()
+            .expect("live store")
+            .upsert_exact_reduction(&ExactReduction {
+                next_state: ExecutablePoolState::OrcaWhirlpool(ConcentratedLiquidityPoolState {
+                    pool_id: PoolId(tracked_pool.pool_id.clone()),
+                    venue: PoolVenue::OrcaWhirlpool,
+                    token_mint_a: config.token_mint_a.clone(),
+                    token_mint_b: config.token_mint_b.clone(),
+                    token_vault_a: config.token_vault_a.clone(),
+                    token_vault_b: config.token_vault_b.clone(),
+                    fee_bps: config.fee_bps,
+                    active_liquidity: 1_000_000,
+                    liquidity: 1_000_000,
+                    sqrt_price_x64: 1u128 << 64,
+                    current_tick_index: 512,
+                    tick_spacing: config.tick_spacing,
+                    loaded_tick_arrays: 1,
+                    expected_tick_arrays: 3,
+                    last_update_slot: 77,
+                    write_version: 1,
+                    last_verified_slot: 77,
+                    confidence: PoolConfidence::Executable,
+                    repair_pending: false,
+                }),
+                quote_model_update: Some(PoolQuoteModelUpdate {
+                    pool_id: tracked_pool.pool_id.clone(),
+                    liquidity: 1_000_000,
+                    sqrt_price_x64: 1u128 << 64,
+                    current_tick_index: 512,
+                    tick_spacing: config.tick_spacing,
+                    required_a_to_b: true,
+                    required_b_to_a: false,
+                    a_to_b: Some(DirectionalPoolQuoteModelUpdate {
+                        loaded_tick_arrays: 1,
+                        expected_tick_arrays: 3,
+                        complete: false,
+                        windows: vec![TickArrayWindowUpdate {
+                            start_tick_index: -352,
+                            end_tick_index: 0,
+                            initialized_tick_count: 0,
+                        }],
+                        initialized_ticks: Vec::new(),
+                    }),
+                    b_to_a: None,
+                    slot: 77,
+                    write_version: 1,
+                }),
+                refresh_required: false,
+            });
+
+        let outcome = apply_mutation_exact(
+            88,
+            &tracked_pool,
+            &PoolMutation::OrcaWhirlpoolSwap {
+                pool_id: tracked_pool.pool_id.clone(),
+                amount: 1_000,
+                other_amount_threshold: 1,
+                exact_out: false,
+                a_to_b: true,
+            },
+            &live_store,
+        );
+
+        assert!(matches!(outcome, ExactMutationOutcome::RefreshRequired));
+    }
+
+    #[test]
     fn raydium_clmm_active_reducer_supports_local_exact_out() {
         let tracked_pool = TrackedPool {
             pool_id: "pool-ray".into(),
@@ -6562,6 +6756,7 @@ mod tests {
             &executable_states,
             &sync_tracker,
             &repair_tx,
+            32,
             &hooks,
             UNIX_EPOCH,
         );
@@ -6593,6 +6788,7 @@ mod tests {
             &executable_states,
             &sync_tracker,
             &repair_tx,
+            32,
             &hooks,
             UNIX_EPOCH,
         );

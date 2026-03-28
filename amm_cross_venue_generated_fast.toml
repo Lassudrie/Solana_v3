@@ -1,0 +1,3494 @@
+[runtime]
+profile = "ultra_fast"
+
+[runtime.control]
+idle_sleep_millis = 0
+max_events_per_tick = 8192
+
+[runtime.refresh]
+enabled = true
+blockhash_refresh_millis = 250
+slot_refresh_millis = 25
+alt_refresh_millis = 250
+wallet_refresh_millis = 500
+
+[state]
+max_snapshot_slot_lag = 256
+
+[strategy]
+max_snapshot_slot_lag = 256
+
+[builder]
+compute_unit_limit = 300000
+compute_unit_price_micro_lamports = 10000
+jito_tip_lamports = 1000
+
+[reconciliation]
+rpc_http_endpoint = "http://127.0.0.1:8899"
+rpc_ws_endpoint = "ws://127.0.0.1:8900"
+poll_interval_millis = 10
+account_batch_window_millis = 5
+
+[submit]
+worker_count = 4
+queue_capacity = 16
+congestion_threshold_pct = 75
+single_transaction_policy = "leader_aware"
+
+[rpc_submit]
+enabled = true
+endpoint = "http://127.0.0.1:8899"
+connect_timeout_ms = 100
+request_timeout_ms = 150
+skip_preflight = true
+max_retries = 0
+idempotency_cache_size = 4096
+
+[shredstream]
+grpc_endpoint = "http://127.0.0.1:50051"
+grpc_connect_timeout_ms = 100
+buffer_capacity = 16384
+reconnect_backoff_millis = 25
+max_reconnect_backoff_millis = 250
+idle_refresh_slot_lag = 24
+max_repair_in_flight = 4
+
+[shredstream.reducers]
+raydium_simple_pool = "active"
+raydium_clmm = "active"
+orca_whirlpool = "active"
+orca_simple_pool = "active"
+
+[signing]
+owner_pubkey = "3KD9WKqrrErCsRp7oFoJ58RLqrNJfz8jS3Do8oJ3Gzx1"
+
+[routes]
+
+# Auto-generated from official Orca and Raydium APIs on 2026-03-28.
+# Shared concentrated pairs: 20. Routes: 40.
+# Selection: Orca tvl >= 50000, Raydium tvl >= 50000, quote mints limited to SOL/USDC.
+
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "jlp-sol-ray-8kbr-orca-6a3m"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+side = "buy_base"
+fee_bps = 3
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+amm_config = "9EeWRCL8CJnikDFCDzG8rtmBs5KQR1jEYKCR5rRZ2NEi"
+observation_state = "4x6ahad88yx6K3GsecTmgMLytt3jMRi7vV6iRYDdzoB7"
+ex_bitmap_account = "ARtUjYroF8Xo6qRKURfjHMA1vhhoY1zzBDA8JiK1VpES"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "39Mtr1jtusGxdCEWYbnZ6HQvVeGbqXnXnY3uAYbYSjVU"
+token_mint_1 = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
+token_vault_1 = "B5iTFHxTua79poaZixTMQhbJ1sATb9jaN5WMmjqp6ksz"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+side = "sell_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "Gg5msGGYPXGt9JpAC5oVdimjWZEXzKpunRDALaJ1Ny1U"
+token_mint_b = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
+token_vault_b = "EQCDoN8WHzYxCRmhxHBSEYCL5muMaZ2HHWbY121fEYsu"
+tick_spacing = 4
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+pool_id = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+pool_id = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "GLCebDVLcqNf8s3sRSE9SQUAiUFaCu1icjvSvdoFRW3W"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "rNFfT7TYkjcXPhudX7rXARZkqkDyRnJNsSnh3FMeXJY"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "jlp-sol-orca-6a3m-ray-8kbr"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+side = "buy_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "Gg5msGGYPXGt9JpAC5oVdimjWZEXzKpunRDALaJ1Ny1U"
+token_mint_b = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
+token_vault_b = "EQCDoN8WHzYxCRmhxHBSEYCL5muMaZ2HHWbY121fEYsu"
+tick_spacing = 4
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+side = "sell_base"
+fee_bps = 3
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+amm_config = "9EeWRCL8CJnikDFCDzG8rtmBs5KQR1jEYKCR5rRZ2NEi"
+observation_state = "4x6ahad88yx6K3GsecTmgMLytt3jMRi7vV6iRYDdzoB7"
+ex_bitmap_account = "ARtUjYroF8Xo6qRKURfjHMA1vhhoY1zzBDA8JiK1VpES"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "39Mtr1jtusGxdCEWYbnZ6HQvVeGbqXnXnY3uAYbYSjVU"
+token_mint_1 = "27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4"
+token_vault_1 = "B5iTFHxTua79poaZixTMQhbJ1sATb9jaN5WMmjqp6ksz"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+pool_id = "8KbrpeSRYXYjWSSdG7gE1tR7Go8MmKKxKaei1gGc4U7Q"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+pool_id = "6a3m2EgFFKfsFuQtP4LJJXPcAe3TQYXNyHUjjZpUxYgd"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "GLCebDVLcqNf8s3sRSE9SQUAiUFaCu1icjvSvdoFRW3W"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "rNFfT7TYkjcXPhudX7rXARZkqkDyRnJNsSnh3FMeXJY"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "wbtc-sol-ray-hcfy-orca-b5ew"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+side = "buy_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+amm_config = "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw"
+observation_state = "ABDR5gEy616aqwMZJ4RoZ1TbKACYfwa3hea5AMcbeeyR"
+ex_bitmap_account = "8NVjnD4frcdHmim6UQSz6zmLnsnNSRsKapia8A97HtgC"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "FnytZ88bXZoPLCtHQ9odBuHtbATxJY5VvzyaAa9LmZWL"
+token_mint_1 = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+token_vault_1 = "FZMUNsPggujx7aQF9RY129fjKfvFTyXBmA8x2Y1P6wSJ"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+side = "sell_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "5qk7fzUy9SYi2oHBDHXvmPuLNaxCvkjMck1g1c1dq9NK"
+token_mint_b = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+token_vault_b = "5xXtGXq5JHB3grdgTGQ4yt7YmJBqBxdffhnkZ8vc6xLB"
+tick_spacing = 8
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+pool_id = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+pool_id = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "G66u95YwxUKLibnT4ZenvPhMXWVqupLX6SNLBDdzH7o8"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "FvZcUvF8KiHNP1LRdiq6WnTAYizGzhJvpkPJTdxisLoD"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "wbtc-sol-orca-b5ew-ray-hcfy"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+side = "buy_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "5qk7fzUy9SYi2oHBDHXvmPuLNaxCvkjMck1g1c1dq9NK"
+token_mint_b = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+token_vault_b = "5xXtGXq5JHB3grdgTGQ4yt7YmJBqBxdffhnkZ8vc6xLB"
+tick_spacing = 8
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+side = "sell_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+amm_config = "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw"
+observation_state = "ABDR5gEy616aqwMZJ4RoZ1TbKACYfwa3hea5AMcbeeyR"
+ex_bitmap_account = "8NVjnD4frcdHmim6UQSz6zmLnsnNSRsKapia8A97HtgC"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "FnytZ88bXZoPLCtHQ9odBuHtbATxJY5VvzyaAa9LmZWL"
+token_mint_1 = "3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh"
+token_vault_1 = "FZMUNsPggujx7aQF9RY129fjKfvFTyXBmA8x2Y1P6wSJ"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+pool_id = "HCfytQ49w6Dn9UhHCqjNYTZYQ6z5SwqmsyYYqW4EKDdA"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+pool_id = "B5EwJVDuAauzUEEdwvbuXzbFFgEYnUqqS37TUM1c4PQA"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "G66u95YwxUKLibnT4ZenvPhMXWVqupLX6SNLBDdzH7o8"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "FvZcUvF8KiHNP1LRdiq6WnTAYizGzhJvpkPJTdxisLoD"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usx-usdc-ray-ewiv-orca-2e3w"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "5J7euRqctRyVarhnupR1ATssV7Mw8HesfUpxTD2SLjCQ"
+ex_bitmap_account = "9qJ9EQjYoYahzS3DswtFwXTJ4Pesinvu52ZH7Tcwv3T8"
+token_mint_0 = "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"
+token_vault_0 = "ETJ8gjHep6enu7QEdwffrqZbSxUpErdYZj9AJGBzXe6J"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "814UNgjAL7V2Z6E4tBKyGFJQcmQLJQotDjTmQfTJfXs6"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+token_mint_a = "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"
+token_vault_a = "AGnUFADs47i8yU8cC4cJ4sVaT8vRrYVMHa4YjS8FMpnK"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "ewP9JtziHzSbcWdCd2Ktrd7C7npkLV2AngrM7cJ7hH6"
+tick_spacing = 1
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+pool_id = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+pool_id = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "CJUbjyfKM1JNsvtSShDqE8DSNjsUbv3NCo17BuNoJqw2"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "4T6wNUghVn7b1XVSunWsz238syMXGvi3RgUA4vjhpXrG"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usx-usdc-orca-2e3w-ray-ewiv"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+token_mint_a = "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"
+token_vault_a = "AGnUFADs47i8yU8cC4cJ4sVaT8vRrYVMHa4YjS8FMpnK"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "ewP9JtziHzSbcWdCd2Ktrd7C7npkLV2AngrM7cJ7hH6"
+tick_spacing = 1
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "5J7euRqctRyVarhnupR1ATssV7Mw8HesfUpxTD2SLjCQ"
+ex_bitmap_account = "9qJ9EQjYoYahzS3DswtFwXTJ4Pesinvu52ZH7Tcwv3T8"
+token_mint_0 = "6FrrzDk5mQARGc1TDYoyVnSyRdds1t4PbtohCD6p3tgG"
+token_vault_0 = "ETJ8gjHep6enu7QEdwffrqZbSxUpErdYZj9AJGBzXe6J"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "814UNgjAL7V2Z6E4tBKyGFJQcmQLJQotDjTmQfTJfXs6"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+pool_id = "EWivkwNtcxuPsU6RyD7Pfvs7u9Yv8nQ79tJ7xgGyPrp6"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+pool_id = "2e3WeM4WwdEqwTtRnWN3gJSbhNg1P6Aj2y7kEdfrYbix"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "CJUbjyfKM1JNsvtSShDqE8DSNjsUbv3NCo17BuNoJqw2"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "4T6wNUghVn7b1XVSunWsz238syMXGvi3RgUA4vjhpXrG"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "geod-usdc-ray-14ik-orca-ig9e"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+side = "buy_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+amm_config = "3XCQJQryqpDvvZBfGxR7CLAw5dpGJ9aa7kt1jRLdyxuZ"
+observation_state = "7sm1JwM8qVp38f2rEKmP8PVL4L9Q8qTbg1HN2rp2Uznw"
+ex_bitmap_account = "CrdFtgSQwdAXUGd97k7cp35MFLTVTZchJW2KwtBYZtsh"
+token_mint_0 = "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu"
+token_vault_0 = "CQF1eeTTK8h55d35eJbdM1YL5ubq74PjE8kU3DmXiEzJ"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "79EBsjq3XBw7YDF5y2iZsBsDcw2mBmoKnj5ugeiFTngk"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+side = "sell_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+token_mint_a = "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu"
+token_vault_a = "GYA3V56HHL5Y1a4PjcWDN2ChnYviVyfkbVKEThBwX913"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "3YQjd7Y9sM5tT3W9Km87L48Di5yrBekfCW6Kj6q6n2JZ"
+tick_spacing = 64
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+pool_id = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+pool_id = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "4PgCZPaPmBmFbpWJJWAhi5meGBekCN3Ly3hJAVLQxnr4"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "C1HkkyrwdGWbeCrbPNTGMD9A7XAf7eamikJdbvqUAF4"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "geod-usdc-orca-ig9e-ray-14ik"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+side = "buy_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+token_mint_a = "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu"
+token_vault_a = "GYA3V56HHL5Y1a4PjcWDN2ChnYviVyfkbVKEThBwX913"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "3YQjd7Y9sM5tT3W9Km87L48Di5yrBekfCW6Kj6q6n2JZ"
+tick_spacing = 64
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+side = "sell_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+amm_config = "3XCQJQryqpDvvZBfGxR7CLAw5dpGJ9aa7kt1jRLdyxuZ"
+observation_state = "7sm1JwM8qVp38f2rEKmP8PVL4L9Q8qTbg1HN2rp2Uznw"
+ex_bitmap_account = "CrdFtgSQwdAXUGd97k7cp35MFLTVTZchJW2KwtBYZtsh"
+token_mint_0 = "7JA5eZdCzztSfQbJvS8aVVxMFfd81Rs9VvwnocV1mKHu"
+token_vault_0 = "CQF1eeTTK8h55d35eJbdM1YL5ubq74PjE8kU3DmXiEzJ"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "79EBsjq3XBw7YDF5y2iZsBsDcw2mBmoKnj5ugeiFTngk"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+pool_id = "14ikayyXmmi96rNqq6kDWGAUbRWLMTjXbXYTfw2Eey1"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+pool_id = "ig9EkJ63zrSRg7BKMGdyfPfNRCRwxGNVV1FByz26QkC"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "4PgCZPaPmBmFbpWJJWAhi5meGBekCN3Ly3hJAVLQxnr4"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "C1HkkyrwdGWbeCrbPNTGMD9A7XAf7eamikJdbvqUAF4"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usdt-usdc-ray-bztg-orca-4fuu"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "3YZE41e4GKm9Uqvx6H4QA1FdyxT15nEjUP8LbvdiDF2t"
+ex_bitmap_account = "HSJS4BrYCZq9DmCNFNfctqq9o2sfTY5YQiy9n4W8djcB"
+token_mint_0 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_0 = "4iJQGzZpys4N13rGXbsB3NqehPkrgrcmDUEcLw7D6GKL"
+token_mint_1 = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_1 = "7NQjToK5NenQZvhPRc1nC1URuKJ4nuLxGPdTbpTiz9EN"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+token_mint_a = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_a = "4oY1eVHJrt7ywuFoQnAZwto4qcQip1QhYMAhD11PU4QL"
+token_mint_b = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_b = "4dSG9tKHZR4CAictyEnH9XuGZyKapodWXq5xyg7uFwE9"
+tick_spacing = 1
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+pool_id = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+pool_id = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8TM3cxoXfnNXU7XUjsAeyN8niu7dQMDf5ZB47nmrTcLD"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "5ybnkzCV87HjBKtoFCBj6gA4beCHSMxndS2pchoS2y6e"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usdt-usdc-orca-4fuu-ray-bztg"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+token_mint_a = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_a = "4oY1eVHJrt7ywuFoQnAZwto4qcQip1QhYMAhD11PU4QL"
+token_mint_b = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_b = "4dSG9tKHZR4CAictyEnH9XuGZyKapodWXq5xyg7uFwE9"
+tick_spacing = 1
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "3YZE41e4GKm9Uqvx6H4QA1FdyxT15nEjUP8LbvdiDF2t"
+ex_bitmap_account = "HSJS4BrYCZq9DmCNFNfctqq9o2sfTY5YQiy9n4W8djcB"
+token_mint_0 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_0 = "4iJQGzZpys4N13rGXbsB3NqehPkrgrcmDUEcLw7D6GKL"
+token_mint_1 = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_1 = "7NQjToK5NenQZvhPRc1nC1URuKJ4nuLxGPdTbpTiz9EN"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+pool_id = "BZtgQEyS6eXUXicYPHecYQ7PybqodXQMvkjUbP4R8mUU"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+pool_id = "4fuUiYxTQ6QCrdSq9ouBYcTM7bqSwYTSyLueGZLTy4T4"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8TM3cxoXfnNXU7XUjsAeyN8niu7dQMDf5ZB47nmrTcLD"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "5ybnkzCV87HjBKtoFCBj6gA4beCHSMxndS2pchoS2y6e"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "eurc-usdc-ray-2zvv-orca-aris"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "2UQncszfVU7igwDiGN3jq2sUKzziLxDZqNsJEXzEob5x"
+ex_bitmap_account = "4HSR9WBSHgw7n5V8WGYYhLW8g92RPSrgnf2CHzbeQrrr"
+token_mint_0 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_0 = "ECw2X1TYbsrqFgdiYApNpn2ggznbj8pL5tREpY9Fb8jY"
+token_mint_1 = "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"
+token_vault_1 = "GFwsANMCPK8W3WhqTnwVP8JiwHaAr3cNDe5TJqgHHSPe"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+token_mint_a = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_a = "6i68TM44UYSawGAS4Bx1vX31Af7QNZaRNBLUbc4r8exB"
+token_mint_b = "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"
+token_vault_b = "8aq9zUXe37KLtXSaEYt7oq65oNAJiu1my2kRNMRPhTD5"
+tick_spacing = 1
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+pool_id = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+pool_id = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "69cxNdLddyKnkLi7boLeywaJXaGKXDQ8v4RUWK7hCy9g"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "EPYFrnPsv9WRg434771t2aYkXFmQLRcK5ZY9AwHMKH6A"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "eurc-usdc-orca-aris-ray-2zvv"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+token_mint_a = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_a = "6i68TM44UYSawGAS4Bx1vX31Af7QNZaRNBLUbc4r8exB"
+token_mint_b = "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"
+token_vault_b = "8aq9zUXe37KLtXSaEYt7oq65oNAJiu1my2kRNMRPhTD5"
+tick_spacing = 1
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "2UQncszfVU7igwDiGN3jq2sUKzziLxDZqNsJEXzEob5x"
+ex_bitmap_account = "4HSR9WBSHgw7n5V8WGYYhLW8g92RPSrgnf2CHzbeQrrr"
+token_mint_0 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_0 = "ECw2X1TYbsrqFgdiYApNpn2ggznbj8pL5tREpY9Fb8jY"
+token_mint_1 = "HzwqbKZw8HxMN6bF2yFZNrht3c2iXXzpKcFu7uBEDKtr"
+token_vault_1 = "GFwsANMCPK8W3WhqTnwVP8JiwHaAr3cNDe5TJqgHHSPe"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+pool_id = "2zVV22uNWdJNmkXpj5vCrMzwHGBoJdsyV7qACh29sK1w"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+pool_id = "ArisQNcbjXPJD7RgPRvysatX3xcfHPTbcTkfD8kDoZ9i"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "69cxNdLddyKnkLi7boLeywaJXaGKXDQ8v4RUWK7hCy9g"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "EPYFrnPsv9WRg434771t2aYkXFmQLRcK5ZY9AwHMKH6A"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "sol-usdc-ray-3ucn-orca-czfq"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+side = "buy_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+amm_config = "3h2e43PunVA5K34vwKCLHWhZF4aZpyaC9RmxvshGAQpL"
+observation_state = "3Y695CuQ8AP4anbwAqiEBeQF9KxqHFr8piEwvw3UePnQ"
+ex_bitmap_account = "4NFvUKqknMpoe6CWTzK758B8ojVLzURL5pC6MtiaJ8TQ"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+side = "sell_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP"
+tick_spacing = 4
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Ghxs1xv8Pmp7fgppzSdrKUvjpx7xQ7H9tyVACdF1QjJG"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "sol-usdc-orca-czfq-ray-3ucn"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+side = "buy_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP"
+tick_spacing = 4
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+side = "sell_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+amm_config = "3h2e43PunVA5K34vwKCLHWhZF4aZpyaC9RmxvshGAQpL"
+observation_state = "3Y695CuQ8AP4anbwAqiEBeQF9KxqHFr8piEwvw3UePnQ"
+ex_bitmap_account = "4NFvUKqknMpoe6CWTzK758B8ojVLzURL5pC6MtiaJ8TQ"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Ghxs1xv8Pmp7fgppzSdrKUvjpx7xQ7H9tyVACdF1QjJG"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "tslax-usdc-ray-8ada-orca-9p7a"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+side = "buy_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "55Nk2ZmPu7uyvehWeik38qztCJVcqkn78jU2Yrkhnd6T"
+ex_bitmap_account = "EmyAhCptv5fNzoP4A6HvHjtczDBL27G14qJicr4Bv4A7"
+token_mint_0 = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+token_vault_0 = "CYfaMvz6ft1YahGnetsGP3E8GWkURdJcDSzfihGrH8Qo"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8JyAULXLSRjxAmzE2MfrgeHhTg8J1DRMqas1gaRn85ot"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+side = "sell_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+token_mint_a = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+token_vault_a = "7AmJBD4kP72fY7xTncNgy1kPVp5TzsYs34zzUeotqbbe"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2NfTohqtneNa5bphKGw1MZNKdyAbV4B7mZDwtkxnYPhN"
+tick_spacing = 2
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+pool_id = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+pool_id = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "87YLNY4JeJFUiZZeFe6hQoqvcjjksuvHiNh74XDT8hmU"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "H14CpKxxStLjnVSnbcbXH1nBBxnHHyLDQCVExdmHtPp4"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "tslax-usdc-orca-9p7a-ray-8ada"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+side = "buy_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+token_mint_a = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+token_vault_a = "7AmJBD4kP72fY7xTncNgy1kPVp5TzsYs34zzUeotqbbe"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2NfTohqtneNa5bphKGw1MZNKdyAbV4B7mZDwtkxnYPhN"
+tick_spacing = 2
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+side = "sell_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "55Nk2ZmPu7uyvehWeik38qztCJVcqkn78jU2Yrkhnd6T"
+ex_bitmap_account = "EmyAhCptv5fNzoP4A6HvHjtczDBL27G14qJicr4Bv4A7"
+token_mint_0 = "XsDoVfqeBukxuZHWhdvWHBhgEHjGNst4MLodqsJHzoB"
+token_vault_0 = "CYfaMvz6ft1YahGnetsGP3E8GWkURdJcDSzfihGrH8Qo"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8JyAULXLSRjxAmzE2MfrgeHhTg8J1DRMqas1gaRn85ot"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+pool_id = "8aDaBQkTrS6HVMjyc6EZebgdiaXhLYGriDWKWWp1NpFF"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+pool_id = "9p7abUFv31ycgu9kckvnoqMMvBy67dqTDM2m6HP9xokN"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "87YLNY4JeJFUiZZeFe6hQoqvcjjksuvHiNh74XDT8hmU"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "H14CpKxxStLjnVSnbcbXH1nBBxnHHyLDQCVExdmHtPp4"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "nvdax-usdc-ray-49im-orca-6r4r"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+side = "buy_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "BhVGr6ZSa3kDc2d1XHXHTfoGQos8RbeDTjJfBaXMoLQH"
+ex_bitmap_account = "4iGbEJNTpdZAUAF8N23w4zXBe1wsq3V3sjRXzMv5EkF6"
+token_mint_0 = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+token_vault_0 = "DyKsypuzQvhi37K8UvjCMBC43h4HtW4r6jhWoqHyrSSe"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "4JEtq7NraU9U5URcCKSv6sWRRgDSuSnUjYDqpSJSWohY"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+side = "sell_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+token_mint_a = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+token_vault_a = "FaHQ9Ny2U2RkcdapsKVr9pvnt4Mg7n92NdKnvyRzuibH"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "5TSHEwRAgHLTYkchrUNiKUL2RvuZgdh3vExbMptWrHoX"
+tick_spacing = 2
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+pool_id = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+pool_id = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "HiPtDaXZ8anguPaQcUJKTvSDeqUUs8b75Lb7Yo1QZfa3"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "AdWxrn8Drx6zYXk6dYzJQ1VWebRssMPu5fTVq5hfwZgW"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "nvdax-usdc-orca-6r4r-ray-49im"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+side = "buy_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+token_mint_a = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+token_vault_a = "FaHQ9Ny2U2RkcdapsKVr9pvnt4Mg7n92NdKnvyRzuibH"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "5TSHEwRAgHLTYkchrUNiKUL2RvuZgdh3vExbMptWrHoX"
+tick_spacing = 2
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+side = "sell_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "BhVGr6ZSa3kDc2d1XHXHTfoGQos8RbeDTjJfBaXMoLQH"
+ex_bitmap_account = "4iGbEJNTpdZAUAF8N23w4zXBe1wsq3V3sjRXzMv5EkF6"
+token_mint_0 = "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"
+token_vault_0 = "DyKsypuzQvhi37K8UvjCMBC43h4HtW4r6jhWoqHyrSSe"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "4JEtq7NraU9U5URcCKSv6sWRRgDSuSnUjYDqpSJSWohY"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+pool_id = "49iMatQtoyabsYAQc8GafVq6aeBFVDxSRH44oiatyyw6"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+pool_id = "6R4r93V5fcMzc13CL2enEepDSYcr4Qx3ptZBDwudTXCo"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "HiPtDaXZ8anguPaQcUJKTvSDeqUUs8b75Lb7Yo1QZfa3"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "AdWxrn8Drx6zYXk6dYzJQ1VWebRssMPu5fTVq5hfwZgW"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "spyx-usdc-ray-6tru-orca-fae5"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+side = "buy_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "GfnPjYVcEdwamhGDNRystmEpNJZSBapzsnyDkqnpYFAj"
+ex_bitmap_account = "bfnAPQbCU6tVz1Uetop624Y51vS7fRv9fMcjCjJkWoU"
+token_mint_0 = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+token_vault_0 = "CiQuPAfYp5v82vijk6u7wqFnaZqtGdJfUUSjDKAtT9ML"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "3EmW8zJDHrfgwpQJAt1oD6nxgQZLUwrCRSKk8Gr3iKRF"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+side = "sell_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+token_mint_a = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+token_vault_a = "EfmaMxuPJaU914gV9N8Z2sDTp249AtEASTLDZdhRsN37"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "5NbsTM8qKWA65oRjZpMARnnxpeR4rGiGdG9vPdCD3sem"
+tick_spacing = 2
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+pool_id = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+pool_id = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "87YLNY4JeJFUiZZeFe6hQoqvcjjksuvHiNh74XDT8hmU"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "EyAKA6XvLArhK7CgNZY98yYAWZWCtcBGmnbWzseXycQN"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "spyx-usdc-orca-fae5-ray-6tru"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+side = "buy_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+token_mint_a = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+token_vault_a = "EfmaMxuPJaU914gV9N8Z2sDTp249AtEASTLDZdhRsN37"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "5NbsTM8qKWA65oRjZpMARnnxpeR4rGiGdG9vPdCD3sem"
+tick_spacing = 2
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+side = "sell_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "GfnPjYVcEdwamhGDNRystmEpNJZSBapzsnyDkqnpYFAj"
+ex_bitmap_account = "bfnAPQbCU6tVz1Uetop624Y51vS7fRv9fMcjCjJkWoU"
+token_mint_0 = "XsoCS1TfEyfFhfvj8EtZ528L3CaKBDBRqRapnBbDF2W"
+token_vault_0 = "CiQuPAfYp5v82vijk6u7wqFnaZqtGdJfUUSjDKAtT9ML"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "3EmW8zJDHrfgwpQJAt1oD6nxgQZLUwrCRSKk8Gr3iKRF"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+pool_id = "6truu3rZuiB9rKQg4VYC3Dt3QwV7DgwGqXrYUcrvnDDE"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+pool_id = "Fae5dWVntUt6zbWu2voXxioDpMii7SqQwtsxBmoVCsHR"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "87YLNY4JeJFUiZZeFe6hQoqvcjjksuvHiNh74XDT8hmU"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "EyAKA6XvLArhK7CgNZY98yYAWZWCtcBGmnbWzseXycQN"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "crclx-usdc-ray-gyqh-orca-5thn"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+side = "buy_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "3qwhkTmToqpJKVzKGqGBEcKdwVgKwyQKDSwNNcjxP5ht"
+ex_bitmap_account = "6kzwwKsgekCH3VJBzrdv44AM1vztGYSemdHbZQJ8dUMf"
+token_mint_0 = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+token_vault_0 = "DMQver7kdMua1ANBY1rJPEFCX594zWn81ihv2yMVFEsF"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8awg4iLSUmmmrkUGgj3T8VuWyvHRPudsLz8skyb3xV92"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+side = "sell_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+token_mint_a = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+token_vault_a = "6ZTUXxfeZTtsB2ph6k5nMstx5ghiowXqiDoZLeGP31hu"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "GvuyfiJm43oD1ZmKo9FMoVWiAj5RaAFY5GckMhhsejLn"
+tick_spacing = 2
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+pool_id = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+pool_id = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "J2rPT7LkmsJEnnYw39Z47T4Ssx61NjQ4u3R6F5p8FPnq"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "4ZHTi33AF1bmQWfGdKYyuqeQVQCgwCYxg3ttx23cHBJS"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "crclx-usdc-orca-5thn-ray-gyqh"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+side = "buy_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+token_mint_a = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+token_vault_a = "6ZTUXxfeZTtsB2ph6k5nMstx5ghiowXqiDoZLeGP31hu"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "GvuyfiJm43oD1ZmKo9FMoVWiAj5RaAFY5GckMhhsejLn"
+tick_spacing = 2
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+side = "sell_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "3qwhkTmToqpJKVzKGqGBEcKdwVgKwyQKDSwNNcjxP5ht"
+ex_bitmap_account = "6kzwwKsgekCH3VJBzrdv44AM1vztGYSemdHbZQJ8dUMf"
+token_mint_0 = "XsueG8BtpquVJX9LVLLEGuViXUungE6WmK5YZ3p3bd1"
+token_vault_0 = "DMQver7kdMua1ANBY1rJPEFCX594zWn81ihv2yMVFEsF"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8awg4iLSUmmmrkUGgj3T8VuWyvHRPudsLz8skyb3xV92"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+pool_id = "GYqHjuDzTiw7i52Xv1qohDE6eJr6eSZpsrBVikGZyaFV"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+pool_id = "5ThN8VGdJvRQUQcejyrGbe6KMpmuurgEw5q9J3L8qsK3"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "J2rPT7LkmsJEnnYw39Z47T4Ssx61NjQ4u3R6F5p8FPnq"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "4ZHTi33AF1bmQWfGdKYyuqeQVQCgwCYxg3ttx23cHBJS"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "gldx-usdc-ray-78re-orca-9cru"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+side = "buy_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "DQCHc73k3EWdPZJAERRVRnwuuwB5xNUwzDSSkK9w6wnW"
+ex_bitmap_account = "4D9oV8zN1FPKb2WfKSexi6yfhGivzHZ6DJo8FHijhttV"
+token_mint_0 = "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re"
+token_vault_0 = "Qf2BrMGurzSMiqeXNKQdG6XzbWeWG9FCP7tndHNikNj"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8BECXqsvkZcWD1MpzYV4p7NXD8xu5ZzquQ52NNGFqUsm"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+side = "sell_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+token_mint_a = "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re"
+token_vault_a = "GrQbV87vjpVeLGG8PAQSVD5aaAqkHinjQXSSYtKvCmiA"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "GA5Enos5qdiMaZ1is9SxgPUdEHSHD5e5sS2uHE5Eu1nc"
+tick_spacing = 64
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+pool_id = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+pool_id = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Bj93b9o1HUZ9SkHtL6Mjo3fBrBZEerY46odJZwe1kZ9o"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "GWL6E3yFwfqZAUdqRCuC5pMtyYdWXiibXtcEnHrK1NMx"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "gldx-usdc-orca-9cru-ray-78re"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+side = "buy_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+token_mint_a = "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re"
+token_vault_a = "GrQbV87vjpVeLGG8PAQSVD5aaAqkHinjQXSSYtKvCmiA"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "GA5Enos5qdiMaZ1is9SxgPUdEHSHD5e5sS2uHE5Eu1nc"
+tick_spacing = 64
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+side = "sell_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "DQCHc73k3EWdPZJAERRVRnwuuwB5xNUwzDSSkK9w6wnW"
+ex_bitmap_account = "4D9oV8zN1FPKb2WfKSexi6yfhGivzHZ6DJo8FHijhttV"
+token_mint_0 = "Xsv9hRk1z5ystj9MhnA7Lq4vjSsLwzL2nxrwmwtD3re"
+token_vault_0 = "Qf2BrMGurzSMiqeXNKQdG6XzbWeWG9FCP7tndHNikNj"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8BECXqsvkZcWD1MpzYV4p7NXD8xu5ZzquQ52NNGFqUsm"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+pool_id = "78ReVNMLGRWmjtf2HmBoHUe2pRcsctXTTbxJnbhchyze"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+pool_id = "9crUEFyBGQ1psMqpEVe4SzriVjZ2BFPpbEBEbQrvgLmx"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Bj93b9o1HUZ9SkHtL6Mjo3fBrBZEerY46odJZwe1kZ9o"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "GWL6E3yFwfqZAUdqRCuC5pMtyYdWXiibXtcEnHrK1NMx"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "msol-usdc-ray-gnfe-orca-aqj5"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+side = "buy_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+amm_config = "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw"
+observation_state = "CHawdSFGMh8f45VAKD3iyJ1Pf5TmJVnkbFFaJWQpaVbf"
+ex_bitmap_account = "3X643awMdryRJrx8yr2W2QXvgSNgfNbhSGtazLHHyheB"
+token_mint_0 = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+token_vault_0 = "Cw2Mv1d7yMEmJ9363Ls7uMj8nUD6suZdCMmyYuckAh4d"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "6XvtJ8wLAjQLUXoXDHztEJKnDspwJpKreRn3h5vbN97K"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+side = "sell_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+token_mint_a = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+token_vault_a = "9YKE7tGczTk5APgamRCJHw1SP9ySHJB7Ltu8xe4P5RF2"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "3uBAzjhC81GUiWQyrfWkLAFv3M1szswdCfwExM14wNMf"
+tick_spacing = 8
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+pool_id = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+pool_id = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "HpYomH7d3krrttNLTnrwBMwvU5PhYgwynxnmYmM2MLGc"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "3zwLnpedDqj5QnRjUtrZRvsXWfaeTpKUytCdRndS687i"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "msol-usdc-orca-aqj5-ray-gnfe"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+side = "buy_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+token_mint_a = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+token_vault_a = "9YKE7tGczTk5APgamRCJHw1SP9ySHJB7Ltu8xe4P5RF2"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "3uBAzjhC81GUiWQyrfWkLAFv3M1szswdCfwExM14wNMf"
+tick_spacing = 8
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+side = "sell_base"
+fee_bps = 5
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+amm_config = "HfERMT5DRA6C1TAqecrJQFpmkf3wsWTMncqnj3RDg5aw"
+observation_state = "CHawdSFGMh8f45VAKD3iyJ1Pf5TmJVnkbFFaJWQpaVbf"
+ex_bitmap_account = "3X643awMdryRJrx8yr2W2QXvgSNgfNbhSGtazLHHyheB"
+token_mint_0 = "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So"
+token_vault_0 = "Cw2Mv1d7yMEmJ9363Ls7uMj8nUD6suZdCMmyYuckAh4d"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "6XvtJ8wLAjQLUXoXDHztEJKnDspwJpKreRn3h5vbN97K"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+pool_id = "GNfeVT5vSWgLYtzveexZJ2Ki9NBtTTzoHAd9oGvoJKW8"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+pool_id = "AqJ5JYNb7ApkJwvbuXxPnTtKeuizjvC1s2fkp382y9LC"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "HpYomH7d3krrttNLTnrwBMwvU5PhYgwynxnmYmM2MLGc"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "3zwLnpedDqj5QnRjUtrZRvsXWfaeTpKUytCdRndS687i"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "pump-usdc-ray-dwga-orca-4afa"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+side = "buy_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+amm_config = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp"
+observation_state = "FUT3VuaagwGQKdFHcTR85o3arSK2JrFmUtG8EnZu2WbE"
+ex_bitmap_account = "9jnq9TXnk4uKpHSpYR4zrLPjr7idygsfhweCLhmUo2iB"
+token_mint_0 = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_0 = "DeS3z2LtEJW8QFE7CuACSgxPVfUztiLiPsSN4AzqCL5W"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8QTgBwxf6gWtHvYhLMTQGmv7qwPqf4VrmrapXx1Bk42h"
+tick_spacing = 60
+zero_for_one = false
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+side = "sell_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+token_mint_a = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_a = "3XWmS4tKXFcyeuKSD6k1QL6zdpDy4Zo5yMGs8oYVXBo5"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "AitcTqqjRXtwVj29pENmNda5kc8qnum2B2d5CZu9kT49"
+tick_spacing = 16
+a_to_b = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+pool_id = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+pool_id = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "3oJPvvAu5pfVwxXbqXuaZVBGcJV3mpXZRaW4XX24m4Wm"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Db4Kyx8pWUwf9u5ZpqDKxGsT2iy1D5NfqYoTcXAtEGzZ"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "pump-usdc-orca-4afa-ray-dwga"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+min_trade_size = 50000
+default_trade_size = 250000
+max_trade_size = 2000000
+size_ladder = [50000, 100000, 250000, 500000, 750000, 1000000, 1500000, 2000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+side = "buy_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+whirlpool = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+token_mint_a = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_a = "3XWmS4tKXFcyeuKSD6k1QL6zdpDy4Zo5yMGs8oYVXBo5"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "AitcTqqjRXtwVj29pENmNda5kc8qnum2B2d5CZu9kT49"
+tick_spacing = 16
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+side = "sell_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+amm_config = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp"
+observation_state = "FUT3VuaagwGQKdFHcTR85o3arSK2JrFmUtG8EnZu2WbE"
+ex_bitmap_account = "9jnq9TXnk4uKpHSpYR4zrLPjr7idygsfhweCLhmUo2iB"
+token_mint_0 = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_0 = "DeS3z2LtEJW8QFE7CuACSgxPVfUztiLiPsSN4AzqCL5W"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "8QTgBwxf6gWtHvYhLMTQGmv7qwPqf4VrmrapXx1Bk42h"
+tick_spacing = 60
+zero_for_one = true
+
+[[routes.definitions.account_dependencies]]
+account_key = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+pool_id = "Dwgaka8QiSkFQ3bGXhZpmncM63DwhjK5zzQRiqt9WA8K"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+pool_id = "4AFAkCSkSNmra64irggEFd8ZtF4WCtFe51qVaFFNBL2D"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "3oJPvvAu5pfVwxXbqXuaZVBGcJV3mpXZRaW4XX24m4Wm"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Db4Kyx8pWUwf9u5ZpqDKxGsT2iy1D5NfqYoTcXAtEGzZ"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usdt-sol-ray-3nmf-orca-fwew"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "Cqb16WaM7dDDP8koxYASDJLWgan4STDB1R3LiSH8r3GR"
+ex_bitmap_account = "2ncinnTcJxbZ1nUHavBVJ3Ap3R4CE7p2LJ6Jtpd1vLzd"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC"
+token_mint_1 = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_1 = "2n6fxuD6PA5NYgEnXXYMh2iWD1JBJ1LGf76kFJAayZmX"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+side = "sell_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "BFAWVmF5aoALggQ9Y2RpTijpYKRESxcdNe6JDNZEpoxC"
+token_mint_b = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_b = "B1qD7GDsKN4kz2ehks71eEpVhUzqaTVXaWfCxXykRAA9"
+tick_spacing = 2
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+pool_id = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "53SgkTf5aoTHzrzkc85kwCW1yvaP9wfJVZVM9gWuK6iM"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usdt-sol-orca-fwew-ray-3nmf"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+side = "buy_base"
+fee_bps = 2
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "BFAWVmF5aoALggQ9Y2RpTijpYKRESxcdNe6JDNZEpoxC"
+token_mint_b = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_b = "B1qD7GDsKN4kz2ehks71eEpVhUzqaTVXaWfCxXykRAA9"
+tick_spacing = 2
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "Cqb16WaM7dDDP8koxYASDJLWgan4STDB1R3LiSH8r3GR"
+ex_bitmap_account = "2ncinnTcJxbZ1nUHavBVJ3Ap3R4CE7p2LJ6Jtpd1vLzd"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "AbcuyoPeYnddzFoFQudsiFka8qd6tTwvLgxwtpTKTpKC"
+token_mint_1 = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_1 = "2n6fxuD6PA5NYgEnXXYMh2iWD1JBJ1LGf76kFJAayZmX"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+pool_id = "3nMFwZXwY1s1M5s8vYAHqd4wGs4iSxXE4LRoUMMYqEgF"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+pool_id = "FwewVm8u6tFPGewAyHmWAqad9hmF7mvqxK4mJ7iNqqGC"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "53SgkTf5aoTHzrzkc85kwCW1yvaP9wfJVZVM9gWuK6iM"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "jitosol-sol-ray-2uok-orca-hp53"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "CPbJctJNpDpV1BVDSq9jwjzz3hjUGSxq2B33g4ciC927"
+ex_bitmap_account = "5Pbw3mJz74orAQpxsgDtwGZSpr67V1DVs9Rk4oWaCQKk"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "AFz1RoY6NfapWZUZ4VhjaKpaE54RYH3f2gRyeF4NP5Cj"
+token_mint_1 = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+token_vault_1 = "6HrrQEWJ6atWo1dYV7zvSock7amZ1HC8M64RW1nB55XY"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "F7tcS67EfP4bBJhWLxCk6ZmPVcsmPnJvPLQcDw5eeR67"
+token_mint_b = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+token_vault_b = "8tfJVFdcogGMmvW1RA1kDZey2BjwdCznF3MD4Pcxi9xn"
+tick_spacing = 1
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+pool_id = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+pool_id = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Enfeg6qw3tYAGdhd514BaxGzGjS1hj6kBjdg7d3jN9Ph"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "jitosol-sol-orca-hp53-ray-2uok"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+side = "buy_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "F7tcS67EfP4bBJhWLxCk6ZmPVcsmPnJvPLQcDw5eeR67"
+token_mint_b = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+token_vault_b = "8tfJVFdcogGMmvW1RA1kDZey2BjwdCznF3MD4Pcxi9xn"
+tick_spacing = 1
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+side = "sell_base"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+amm_config = "9iFER3bpjf1PTTCQCfTRu17EJgvsxo9pVyA9QWwEuX4x"
+observation_state = "CPbJctJNpDpV1BVDSq9jwjzz3hjUGSxq2B33g4ciC927"
+ex_bitmap_account = "5Pbw3mJz74orAQpxsgDtwGZSpr67V1DVs9Rk4oWaCQKk"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "AFz1RoY6NfapWZUZ4VhjaKpaE54RYH3f2gRyeF4NP5Cj"
+token_mint_1 = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn"
+token_vault_1 = "6HrrQEWJ6atWo1dYV7zvSock7amZ1HC8M64RW1nB55XY"
+tick_spacing = 1
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+pool_id = "2uoKbPEidR7KAMYtY4x7xdkHXWqYib5k4CutJauSL3Mc"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+pool_id = "Hp53XEtt4S8SvPCXarsLSdGfZBuUr5mMmZmX2DRNXQKp"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "47Fi43gX1EHVN1LX1Nu73MDpmZ3yooB8fwtBuxufyzX7"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Enfeg6qw3tYAGdhd514BaxGzGjS1hj6kBjdg7d3jN9Ph"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usd1-sol-ray-aqag-orca-j4jb"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+side = "buy_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+amm_config = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp"
+observation_state = "2s8VC2vpZcoUCbvEqwUagvdyHfUeWYQZuKV376acx6iF"
+ex_bitmap_account = "HKcNrRDTFuXVTyMCkp5h3eU4cyqbzteAW1UR7m2CWbVs"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "5QpMZ6MuyKjg8Qa1X8gM5G3YMsd43rpHb2iQ6hdcRM7m"
+token_mint_1 = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+token_vault_1 = "DHY2efKhMcZyAgmPw82C2Gez1e98Ab7oWcXfxz9frUCr"
+tick_spacing = 60
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+side = "sell_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "7mrTW4cB1PpdMm9kkvQio8FY2BQHWA6Y3qcq11iM4F11"
+token_mint_b = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+token_vault_b = "GasXy7fPzdCFgZZ7fUVq1LAWt6nfaSSGwA1py6ZkMvsf"
+tick_spacing = 16
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+pool_id = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+pool_id = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "EM75DnZkbyYpSYhRUoEiY2x2WKPRM4kxF19cfaFLugHb"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Hy3wGqPvpMZQ43VCZH6bHHvHvoKqbBAyXtjBK4mjkjW9"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "usd1-sol-orca-j4jb-ray-aqag"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+side = "buy_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "7mrTW4cB1PpdMm9kkvQio8FY2BQHWA6Y3qcq11iM4F11"
+token_mint_b = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+token_vault_b = "GasXy7fPzdCFgZZ7fUVq1LAWt6nfaSSGwA1py6ZkMvsf"
+tick_spacing = 16
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+side = "sell_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+amm_config = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp"
+observation_state = "2s8VC2vpZcoUCbvEqwUagvdyHfUeWYQZuKV376acx6iF"
+ex_bitmap_account = "HKcNrRDTFuXVTyMCkp5h3eU4cyqbzteAW1UR7m2CWbVs"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "5QpMZ6MuyKjg8Qa1X8gM5G3YMsd43rpHb2iQ6hdcRM7m"
+token_mint_1 = "USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB"
+token_vault_1 = "DHY2efKhMcZyAgmPw82C2Gez1e98Ab7oWcXfxz9frUCr"
+tick_spacing = 60
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+pool_id = "AQAGYQsdU853WAKhXM79CgNdoyhrRwXvYHX6qrDyC1FS"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+pool_id = "J4jbvp8UAfAePYuQqFgzRJb64kTKpzNhvJtGFq5T4fDV"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "EM75DnZkbyYpSYhRUoEiY2x2WKPRM4kxF19cfaFLugHb"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Hy3wGqPvpMZQ43VCZH6bHHvHvoKqbBAyXtjBK4mjkjW9"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "cbbtc-sol-ray-cqxe-orca-ceaz"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+side = "buy_base"
+fee_bps = 100
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+amm_config = "A1BBtTYJd4i3xU8D6Tc2FzU6ZN4oXZWXKZnCxwbHXr8x"
+observation_state = "5aPjDnAkT2S3yKWzYq13D26BGZYmGuD3VPJMaCwcv6iV"
+ex_bitmap_account = "9c2b8uy2Z3qSrpRaPVPiZXinoLVF7QHgWd5vAbdc5YKE"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "8UfCPsTTiuGCsbKx57MjRb2RuNSn9yR4PuzJ3bwmHoMk"
+token_mint_1 = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
+token_vault_1 = "ez8wXMHNDj9WmeUbPx1AoTsgJcLnHPvJmwhCiS9BMKx"
+tick_spacing = 120
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+side = "sell_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "DYkz5CCMUshPUso6Eg25f2kw5cnexYAKSrN6ZMSPM2xS"
+token_mint_b = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
+token_vault_b = "7G26tTFk7VhpqhnRHqvgsWh7NhVeLj7cGNCXs9PWfVR3"
+tick_spacing = 16
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+pool_id = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+pool_id = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Dr7xBVdx8jSvxMVqzPGgzxMQgBcYQ8LPukD2YNXAnHYe"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "G7WzN7ruze2K1Dh2bim8XrqASFU2tT11AjeF5AYZMkCJ"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "cbbtc-sol-orca-ceaz-ray-cqxe"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+side = "buy_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "DYkz5CCMUshPUso6Eg25f2kw5cnexYAKSrN6ZMSPM2xS"
+token_mint_b = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
+token_vault_b = "7G26tTFk7VhpqhnRHqvgsWh7NhVeLj7cGNCXs9PWfVR3"
+tick_spacing = 16
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+side = "sell_base"
+fee_bps = 100
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+amm_config = "A1BBtTYJd4i3xU8D6Tc2FzU6ZN4oXZWXKZnCxwbHXr8x"
+observation_state = "5aPjDnAkT2S3yKWzYq13D26BGZYmGuD3VPJMaCwcv6iV"
+ex_bitmap_account = "9c2b8uy2Z3qSrpRaPVPiZXinoLVF7QHgWd5vAbdc5YKE"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "8UfCPsTTiuGCsbKx57MjRb2RuNSn9yR4PuzJ3bwmHoMk"
+token_mint_1 = "cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij"
+token_vault_1 = "ez8wXMHNDj9WmeUbPx1AoTsgJcLnHPvJmwhCiS9BMKx"
+tick_spacing = 120
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+pool_id = "CqXeBvzvB4BKxLxwoHNdnLV58PfL8W7iVN8kaezkCrJX"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+pool_id = "CeaZcxBNLpJWtxzt58qQmfMBtJY8pQLvursXTJYGQpbN"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "Dr7xBVdx8jSvxMVqzPGgzxMQgBcYQ8LPukD2YNXAnHYe"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "G7WzN7ruze2K1Dh2bim8XrqASFU2tT11AjeF5AYZMkCJ"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "pump-sol-ray-45ss-orca-bofa"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+side = "buy_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "7oVcrScfu1jVKq1DsaVZ8HtX1RZ6sa3oik3uVhowtifK"
+ex_bitmap_account = "GFHU8GNWeYKpLuTvfAJbeVHFiafBVZZwfCbD16NC9Y9t"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "A5VBGEV5ghKGSNFLpSy83ePE1BMpd2hZ8BHxFafNBNf6"
+token_mint_1 = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_1 = "48xDcrnnENiygxTXGu9KPAuew3xRkfyrfb5iU6BNFbQK"
+tick_spacing = 10
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+side = "sell_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "BkSYpPsv11UPDLonxBZf2mFndfuN2MrDwYt4gjDEnk8D"
+token_mint_b = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_b = "2wcLHj441NnqiUon4LcmMo6dGAUqwEW84nfFKnfuTnPt"
+tick_spacing = 16
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+pool_id = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8tQ9LWdYVKH7TsRse4XsRBwXvTxadi7XGHdgnW2rccbg"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "9eVSvjDPJjuC3yLJnW4HV9KfF8noN6PRzcBcQvc5MbdF"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "pump-sol-orca-bofa-ray-45ss"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+side = "buy_base"
+fee_bps = 16
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "BkSYpPsv11UPDLonxBZf2mFndfuN2MrDwYt4gjDEnk8D"
+token_mint_b = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_b = "2wcLHj441NnqiUon4LcmMo6dGAUqwEW84nfFKnfuTnPt"
+tick_spacing = 16
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+side = "sell_base"
+fee_bps = 10
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+amm_config = "DrdecJVzkaRsf1TQu1g7iFncaokikVTHqpzPjenjRySY"
+observation_state = "7oVcrScfu1jVKq1DsaVZ8HtX1RZ6sa3oik3uVhowtifK"
+ex_bitmap_account = "GFHU8GNWeYKpLuTvfAJbeVHFiafBVZZwfCbD16NC9Y9t"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "A5VBGEV5ghKGSNFLpSy83ePE1BMpd2hZ8BHxFafNBNf6"
+token_mint_1 = "pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn"
+token_vault_1 = "48xDcrnnENiygxTXGu9KPAuew3xRkfyrfb5iU6BNFbQK"
+tick_spacing = 10
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+pool_id = "45ssPkUQs1ssbeDqxD2mZrMdJYAXF7GyQyhS5xDXuWC5"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+pool_id = "BofA2ViUSudPBTUms2KRuG6AHNeMawjNfwqTJDgx5BKW"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "8tQ9LWdYVKH7TsRse4XsRBwXvTxadi7XGHdgnW2rccbg"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "9eVSvjDPJjuC3yLJnW4HV9KfF8noN6PRzcBcQvc5MbdF"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "render-sol-ray-fz8m-orca-amxr"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+side = "buy_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+amm_config = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp"
+observation_state = "6SjZ5prggSbXCSLmx23R8VDozRWDSTsMnubTxQj1bcUp"
+ex_bitmap_account = "27bxewgcaB42rWNrk3iY1gerZUoVGmGRXuQQzbJwZ1uT"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "DBGz35qnsRkEJgFshEpKvdVHxxAvcLEUy2w3xPxNw8xh"
+token_mint_1 = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+token_vault_1 = "6UDR4oYk1F992GUsn3iMJcihWBEnxEUJBv5bHerTpTWE"
+tick_spacing = 60
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+side = "sell_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "5Y9X3KpMsTAVGbPKq4syuWreUAUCdKczsmGBY8GJzav4"
+token_mint_b = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+token_vault_b = "8SfmZQUzNi3LY4gTLmYmRRNvKZ1wrnjmBipkwXKyjb2w"
+tick_spacing = 64
+a_to_b = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+pool_id = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+pool_id = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "G66u95YwxUKLibnT4ZenvPhMXWVqupLX6SNLBDdzH7o8"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "3TdYxLAkSfyGtfYsWFPu2rArtNxCnxX9E4RkUTnMqZP9"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3
+[[routes.definitions]]
+enabled = true
+route_class = "amm_fast_path"
+route_id = "render-sol-orca-amxr-ray-fz8m"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "So11111111111111111111111111111111111111112"
+base_mint = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+quote_mint = "So11111111111111111111111111111111111111112"
+min_trade_size = 2500000
+default_trade_size = 10000000
+max_trade_size = 100000000
+size_ladder = [2500000, 5000000, 10000000, 20000000, 50000000, 100000000]
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+side = "buy_base"
+fee_bps = 30
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "5Y9X3KpMsTAVGbPKq4syuWreUAUCdKczsmGBY8GJzav4"
+token_mint_b = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+token_vault_b = "8SfmZQUzNi3LY4gTLmYmRRNvKZ1wrnjmBipkwXKyjb2w"
+tick_spacing = 64
+a_to_b = true
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+side = "sell_base"
+fee_bps = 25
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+amm_config = "E64NGkDLLCdQ2yFNPcavaKptrEgmiQaNykUuLC1Qgwyp"
+observation_state = "6SjZ5prggSbXCSLmx23R8VDozRWDSTsMnubTxQj1bcUp"
+ex_bitmap_account = "27bxewgcaB42rWNrk3iY1gerZUoVGmGRXuQQzbJwZ1uT"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "DBGz35qnsRkEJgFshEpKvdVHxxAvcLEUy2w3xPxNw8xh"
+token_mint_1 = "rndrizKT3MK1iimdxRdWabcF7Zg7AR5T4nud4EkHBof"
+token_vault_1 = "6UDR4oYk1F992GUsn3iMJcihWBEnxEUJBv5bHerTpTWE"
+tick_spacing = 60
+zero_for_one = false
+
+[[routes.definitions.account_dependencies]]
+account_key = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+pool_id = "FZ8MJvdTPbp8juhtFCCzb7LsKunhexgzShGQ59SUJkNL"
+decoder_key = "raydium-clmm-v1"
+
+[[routes.definitions.account_dependencies]]
+account_key = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+pool_id = "AmXR6YeshKfnx23gQpJkktUXoGb7cAXi5hWk3w2pw1a3"
+decoder_key = "orca-whirlpool-v1"
+
+[routes.definitions.execution]
+message_mode = "v0_required"
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 10000
+default_jito_tip_lamports = 1000
+max_quote_slot_lag = 32
+max_alt_slot_lag = 32
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "G66u95YwxUKLibnT4ZenvPhMXWVqupLX6SNLBDdzH7o8"
+
+[[routes.definitions.execution.lookup_tables]]
+account_key = "3TdYxLAkSfyGtfYsWFPu2rArtNxCnxX9E4RkUTnMqZP9"
+
+[routes.definitions.execution_protection]
+enabled = true
+tight_max_quote_slot_lag = 24
+base_extra_buy_leg_slippage_bps = 25
+failure_step_bps = 25
+max_extra_buy_leg_slippage_bps = 100
+recovery_success_count = 3

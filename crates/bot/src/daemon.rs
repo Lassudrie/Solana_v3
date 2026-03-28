@@ -284,8 +284,10 @@ impl BotDaemon {
             config.submit.congestion_threshold_pct,
         )
         .map_err(|source| DaemonError::BuildSignDispatcher { source })?;
-        let account_batcher =
-            GetMultipleAccountsBatcher::new(&config.reconciliation.rpc_http_endpoint);
+        let account_batcher = GetMultipleAccountsBatcher::new_with_window(
+            &config.reconciliation.rpc_http_endpoint,
+            Duration::from_millis(config.reconciliation.account_batch_window_millis),
+        );
         runtime.apply_kill_switch(config.risk.kill_switch_enabled);
         let lookup_table_keys = config
             .routes
@@ -823,6 +825,8 @@ impl BotDaemon {
         let warm_routes = self.runtime.ready_route_count();
         let tradable_routes = self.runtime.tradable_route_count();
         let health_summary = self.runtime.route_health_summary();
+        let has_live_tradable_routes =
+            tradable_routes > 0 && health_summary.eligible_live_routes > 0;
         let inflight_submissions = self
             .runtime
             .pending_submissions()
@@ -836,13 +840,13 @@ impl BotDaemon {
             if total_routes == 0 {
                 return Some(RuntimeIssue::NoRoutesConfigured);
             }
-            if warm_routes < total_routes {
+            if !has_live_tradable_routes && warm_routes < total_routes {
                 return Some(RuntimeIssue::RoutesNotWarm {
                     warm_routes,
                     total_routes,
                 });
             }
-            if tradable_routes == 0 || health_summary.eligible_live_routes == 0 {
+            if !has_live_tradable_routes {
                 return Some(RuntimeIssue::NoTradableRoutes {
                     tradable_routes,
                     eligible_live_routes: health_summary.eligible_live_routes,
@@ -966,6 +970,8 @@ impl BotDaemon {
 
 #[cfg(test)]
 mod tests {
+    use detection::{EventSourceKind, NormalizedEvent};
+    use domain::{PoolSnapshotUpdate, SnapshotConfidence, types::PoolVenue};
     use serde_json::{Value, json};
     use solana_sdk::{hash::hashv, pubkey::Pubkey, signer::keypair::Keypair};
     use std::{
@@ -1090,6 +1096,34 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[test]
+    fn daemon_reports_ready_when_some_routes_are_still_warming() {
+        let path = temp_path("bot-daemon-partial-warm", "jsonl");
+        fs::write(&path, "").unwrap();
+        let mut config = bot_config(path.to_string_lossy().into_owned());
+        config.runtime.health_server.enabled = false;
+        config
+            .routes
+            .definitions
+            .push(unwarmed_route("route-b", "pool-c", "pool-d", "acct-c", "acct-d"));
+        let mut daemon = BotDaemon::from_config(config).unwrap();
+
+        daemon.process_source_event(replay_snapshot_event("pool-a", 1, 12_000));
+        daemon.process_source_event(replay_snapshot_event("pool-b", 2, 12_000));
+        daemon.flush_build_sign_dispatcher();
+        daemon.flush_submit_dispatcher();
+        daemon.flush_reconciliation_worker();
+        let status = daemon.status_snapshot();
+
+        assert_eq!(status.total_routes, 2);
+        assert_eq!(status.warm_routes, 1);
+        assert_eq!(status.tradable_routes, 1);
+        assert!(status.ready);
+        assert_eq!(status.issue, None);
+
+        let _ = fs::remove_file(path);
+    }
+
     fn bot_config(path: String) -> BotConfig {
         let mut config = BotConfig::default();
         let keypair = Keypair::new_from_array([7; 32]);
@@ -1164,8 +1198,10 @@ mod tests {
                                 market_coin_vault: test_pubkey("serum-coin-vault"),
                                 market_pc_vault: test_pubkey("serum-pc-vault"),
                                 market_vault_signer: test_pubkey("serum-vault-signer"),
-                                user_source_token_account: test_pubkey("route-mid-ata"),
-                                user_destination_token_account: test_pubkey("route-output-ata"),
+                                user_source_token_account: Some(test_pubkey("route-mid-ata")),
+                                user_destination_token_account: Some(test_pubkey("route-output-ata")),
+                                user_source_mint: None,
+                                user_destination_mint: None,
                             },
                         ),
                     },
@@ -1198,6 +1234,107 @@ mod tests {
         config
     }
 
+    fn unwarmed_route(
+        route_id: &str,
+        first_pool_id: &str,
+        second_pool_id: &str,
+        first_account_key: &str,
+        second_account_key: &str,
+    ) -> RouteConfig {
+        RouteConfig {
+            enabled: true,
+            route_class: RouteClassConfig::AmmFastPath,
+            route_id: route_id.into(),
+            input_mint: "USDC".into(),
+            output_mint: "USDC".into(),
+            base_mint: None,
+            quote_mint: None,
+            sol_quote_conversion_pool_id: None,
+            min_trade_size: None,
+            default_trade_size: 10_000,
+            max_trade_size: 20_000,
+            size_ladder: Vec::new(),
+            execution_protection: Default::default(),
+            legs: [
+                RouteLegConfig {
+                    venue: "orca".into(),
+                    pool_id: first_pool_id.into(),
+                    side: SwapSideConfig::BuyBase,
+                    fee_bps: None,
+                    execution: RouteLegExecutionConfig::OrcaSimplePool(
+                        OrcaSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("orca-program-unwarmed"),
+                            token_program_id: test_pubkey("spl-token-program-unwarmed"),
+                            swap_account: test_pubkey("orca-swap-unwarmed"),
+                            authority: test_pubkey("orca-authority-unwarmed"),
+                            pool_source_token_account: test_pubkey("orca-pool-source-unwarmed"),
+                            pool_destination_token_account: test_pubkey(
+                                "orca-pool-destination-unwarmed",
+                            ),
+                            pool_mint: test_pubkey("orca-pool-mint-unwarmed"),
+                            fee_account: test_pubkey("orca-fee-account-unwarmed"),
+                            user_source_token_account: test_pubkey("route-input-ata-unwarmed"),
+                            user_destination_token_account: test_pubkey("route-mid-ata-unwarmed"),
+                            host_fee_account: None,
+                        },
+                    ),
+                },
+                RouteLegConfig {
+                    venue: "raydium".into(),
+                    pool_id: second_pool_id.into(),
+                    side: SwapSideConfig::SellBase,
+                    fee_bps: None,
+                    execution: RouteLegExecutionConfig::RaydiumSimplePool(
+                        RaydiumSimplePoolLegExecutionConfig {
+                            program_id: test_pubkey("raydium-program-unwarmed"),
+                            token_program_id: test_pubkey("spl-token-program-unwarmed"),
+                            amm_pool: test_pubkey("raydium-amm-pool-unwarmed"),
+                            amm_authority: test_pubkey("raydium-amm-authority-unwarmed"),
+                            amm_open_orders: test_pubkey("raydium-open-orders-unwarmed"),
+                            amm_coin_vault: test_pubkey("raydium-coin-vault-unwarmed"),
+                            amm_pc_vault: test_pubkey("raydium-pc-vault-unwarmed"),
+                            market_program: test_pubkey("serum-program-unwarmed"),
+                            market: test_pubkey("serum-market-unwarmed"),
+                            market_bids: test_pubkey("serum-bids-unwarmed"),
+                            market_asks: test_pubkey("serum-asks-unwarmed"),
+                            market_event_queue: test_pubkey("serum-event-queue-unwarmed"),
+                            market_coin_vault: test_pubkey("serum-coin-vault-unwarmed"),
+                            market_pc_vault: test_pubkey("serum-pc-vault-unwarmed"),
+                            market_vault_signer: test_pubkey("serum-vault-signer-unwarmed"),
+                            user_source_token_account: Some(test_pubkey("route-mid-ata-unwarmed")),
+                            user_destination_token_account: Some(test_pubkey(
+                                "route-output-ata-unwarmed",
+                            )),
+                            user_source_mint: None,
+                            user_destination_mint: None,
+                        },
+                    ),
+                },
+            ],
+            account_dependencies: vec![
+                AccountDependencyConfig {
+                    account_key: first_account_key.into(),
+                    pool_id: first_pool_id.into(),
+                    decoder_key: "pool-price-v1".into(),
+                },
+                AccountDependencyConfig {
+                    account_key: second_account_key.into(),
+                    pool_id: second_pool_id.into(),
+                    decoder_key: "pool-price-v1".into(),
+                },
+            ],
+            execution: RouteExecutionConfig {
+                message_mode: MessageModeConfig::V0Required,
+                lookup_tables: Vec::new(),
+                default_compute_unit_limit: 300_000,
+                default_compute_unit_price_micro_lamports: 25_000,
+                default_jito_tip_lamports: 5_000,
+                max_quote_slot_lag: 4,
+                max_alt_slot_lag: 4,
+            },
+        }
+    }
+
     fn test_pubkey(label: &str) -> String {
         Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
     }
@@ -1205,6 +1342,33 @@ mod tests {
     fn replay_event(pool_id: &str, sequence: u64, price_bps: u64) -> String {
         format!(
             "{{\"type\":\"pool_snapshot_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pool_id\":\"{pool_id}\",\"price_bps\":{price_bps},\"fee_bps\":4,\"reserve_depth\":100000,\"reserve_a\":100000,\"reserve_b\":100000,\"active_liquidity\":100000,\"sqrt_price_x64\":null,\"venue\":\"orca_simple_pool\",\"confidence\":\"executable\",\"repair_pending\":false,\"token_mint_a\":\"SOL\",\"token_mint_b\":\"USDC\",\"tick_spacing\":0,\"current_tick_index\":null,\"slot\":{sequence},\"write_version\":1}}"
+        )
+    }
+
+    fn replay_snapshot_event(pool_id: &str, sequence: u64, price_bps: u64) -> NormalizedEvent {
+        NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::Replay,
+            sequence,
+            sequence,
+            PoolSnapshotUpdate {
+                pool_id: pool_id.into(),
+                price_bps,
+                fee_bps: 4,
+                reserve_depth: 100_000,
+                reserve_a: Some(100_000),
+                reserve_b: Some(100_000),
+                active_liquidity: Some(100_000),
+                sqrt_price_x64: None,
+                venue: PoolVenue::OrcaSimplePool,
+                confidence: SnapshotConfidence::Executable,
+                repair_pending: Some(false),
+                token_mint_a: "SOL".into(),
+                token_mint_b: "USDC".into(),
+                tick_spacing: 0,
+                current_tick_index: None,
+                slot: sequence,
+                write_version: 1,
+            },
         )
     }
 

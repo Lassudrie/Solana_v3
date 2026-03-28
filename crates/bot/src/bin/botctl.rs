@@ -709,7 +709,7 @@ fn render_filtered_toml(
     source_text: &str,
     eligible: &std::collections::BTreeSet<String>,
 ) -> Result<String, Box<dyn Error>> {
-    let mut value = source_text.parse::<toml::Value>()?;
+    let mut value = toml::from_str::<toml::Value>(source_text)?;
     let Some(route_tables) = value
         .get_mut("routes")
         .and_then(|routes| routes.get_mut("definitions"))
@@ -1558,7 +1558,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use ratatui::backend::TestBackend;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1738,6 +1738,49 @@ mod tests {
                 }],
             },
         }
+    }
+
+    #[test]
+    fn render_filtered_toml_keeps_only_eligible_routes() {
+        let source = r#"
+[runtime]
+profile = "ultra_fast"
+
+[routes]
+
+[[routes.definitions]]
+route_id = "keep-me"
+default_trade_size = 1
+max_trade_size = 1
+legs = []
+account_dependencies = []
+
+[routes.definitions.execution]
+default_compute_unit_limit = 1
+default_compute_unit_price_micro_lamports = 1
+default_jito_tip_lamports = 1
+
+[[routes.definitions]]
+route_id = "drop-me"
+default_trade_size = 1
+max_trade_size = 1
+legs = []
+account_dependencies = []
+
+[routes.definitions.execution]
+default_compute_unit_limit = 1
+default_compute_unit_price_micro_lamports = 1
+default_jito_tip_lamports = 1
+"#;
+
+        let eligible = BTreeSet::from(["keep-me".to_string()]);
+        let rendered = render_filtered_toml(source, &eligible).expect("rendered");
+        let value = toml::from_str::<toml::Value>(&rendered).expect("valid toml");
+        let routes = value["routes"]["definitions"]
+            .as_array()
+            .expect("route definitions");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0]["route_id"].as_str(), Some("keep-me"));
     }
 
     fn test_app() -> App {

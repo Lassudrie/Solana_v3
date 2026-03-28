@@ -78,6 +78,8 @@ pub enum QuoteError {
     InvalidRouteShape,
     #[error("arithmetic overflow during quote")]
     ArithmeticOverflow,
+    #[error("arithmetic overflow during quote ({0})")]
+    ArithmeticOverflowAt(&'static str),
     #[error("invalid snapshot price")]
     InvalidSnapshotPrice,
     #[error("invalid snapshot liquidity")]
@@ -88,6 +90,19 @@ pub enum QuoteError {
     ConcentratedWindowExceeded,
     #[error("unable to convert execution cost into quote atoms")]
     ExecutionCostNotConvertible,
+}
+
+impl QuoteError {
+    fn is_arithmetic_overflow(&self) -> bool {
+        matches!(
+            self,
+            Self::ArithmeticOverflow | Self::ArithmeticOverflowAt(_)
+        )
+    }
+}
+
+fn overflow_at(context: &'static str) -> QuoteError {
+    QuoteError::ArithmeticOverflowAt(context)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,7 +454,10 @@ fn apply_concentrated_price(
     let Some(direction) = model.direction(a_to_b) else {
         return Err(QuoteError::QuoteModelNotExecutable);
     };
-    if !direction.is_executable() || model.tick_spacing == 0 || model.liquidity == 0 {
+    if !direction.is_executable_at(model.current_tick_index)
+        || model.tick_spacing == 0
+        || model.liquidity == 0
+    {
         return Err(QuoteError::QuoteModelNotExecutable);
     }
 
@@ -471,6 +489,12 @@ pub fn apply_concentrated_exact_input_update(
     input_amount: u64,
     fee_bps: u16,
 ) -> Result<ConcentratedSwapState, QuoteError> {
+    if !direction.is_executable_at(model.current_tick_index)
+        || model.tick_spacing == 0
+        || model.liquidity == 0
+    {
+        return Err(QuoteError::QuoteModelNotExecutable);
+    }
     if input_amount == 0 {
         return Ok(ConcentratedSwapState {
             sqrt_price_x64: model.sqrt_price_x64,
@@ -514,7 +538,7 @@ pub fn apply_concentrated_exact_input_update(
                 sqrt_price,
                 liquidity
             );
-            return Err(QuoteError::ArithmeticOverflow);
+            return Err(overflow_at("concentrated_exact_in.iteration_limit"));
         }
 
         let next_tick = next_initialized_tick(direction, current_tick, a_to_b);
@@ -544,7 +568,7 @@ pub fn apply_concentrated_exact_input_update(
             a_to_b,
         )
         .map_err(|error| {
-            if matches!(error, QuoteError::ArithmeticOverflow) {
+            if error.is_arithmetic_overflow() {
                 eprintln!(
                     "concentrated quote step overflow: pool_id={}, venue={:?}, a_to_b={}, input_amount={}, amount_remaining={}, current_tick={}, next_tick={:?}, target_tick={}, sqrt_price_x64={}, target_price_x64={}, liquidity={}",
                     model.pool_id.0,
@@ -568,16 +592,16 @@ pub fn apply_concentrated_exact_input_update(
 
         amount_remaining = amount_remaining
             .checked_sub(step.amount_in.saturating_add(step.fee_amount))
-            .ok_or(QuoteError::ArithmeticOverflow)?;
+            .ok_or_else(|| overflow_at("concentrated_exact_in.amount_remaining_sub"))?;
         amount_out_total = amount_out_total
             .checked_add(step.amount_out)
-            .ok_or(QuoteError::ArithmeticOverflow)?;
+            .ok_or_else(|| overflow_at("concentrated_exact_in.amount_out_accumulate"))?;
         sqrt_price = step.sqrt_price_next_x64;
 
         if let Some(tick) = next_tick {
             if step.sqrt_price_next_x64 == target_price {
                 liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b).map_err(|error| {
-                    if matches!(error, QuoteError::ArithmeticOverflow) {
+                    if error.is_arithmetic_overflow() {
                         eprintln!(
                             "concentrated quote cross overflow: pool_id={}, venue={:?}, a_to_b={}, tick={}, current_tick={}, liquidity={}",
                             model.pool_id.0,
@@ -596,7 +620,7 @@ pub fn apply_concentrated_exact_input_update(
         }
 
         current_tick = tick_from_sqrt_price(Some(venue), sqrt_price).map_err(|error| {
-            if matches!(error, QuoteError::ArithmeticOverflow) {
+            if error.is_arithmetic_overflow() {
                 eprintln!(
                     "concentrated quote tick overflow: pool_id={}, venue={:?}, a_to_b={}, sqrt_price_x64={}, liquidity={}, amount_remaining={}",
                     model.pool_id.0,
@@ -639,6 +663,12 @@ pub fn apply_concentrated_exact_output_update(
     output_amount: u64,
     fee_bps: u16,
 ) -> Result<ConcentratedSwapState, QuoteError> {
+    if !direction.is_executable_at(model.current_tick_index)
+        || model.tick_spacing == 0
+        || model.liquidity == 0
+    {
+        return Err(QuoteError::QuoteModelNotExecutable);
+    }
     if output_amount == 0 {
         return Ok(ConcentratedSwapState {
             sqrt_price_x64: model.sqrt_price_x64,
@@ -682,7 +712,7 @@ pub fn apply_concentrated_exact_output_update(
                 sqrt_price,
                 liquidity
             );
-            return Err(QuoteError::ArithmeticOverflow);
+            return Err(overflow_at("concentrated_exact_out.iteration_limit"));
         }
 
         let next_tick = next_initialized_tick(direction, current_tick, a_to_b);
@@ -713,7 +743,7 @@ pub fn apply_concentrated_exact_output_update(
             a_to_b,
         )
         .map_err(|error| {
-            if matches!(error, QuoteError::ArithmeticOverflow) {
+            if error.is_arithmetic_overflow() {
                 eprintln!(
                     "concentrated exact-out step overflow: pool_id={}, venue={:?}, a_to_b={}, output_amount={}, amount_remaining={}, current_tick={}, next_tick={:?}, target_tick={}, sqrt_price_x64={}, target_price_x64={}, liquidity={}",
                     model.pool_id.0,
@@ -737,16 +767,16 @@ pub fn apply_concentrated_exact_output_update(
 
         amount_remaining = amount_remaining
             .checked_sub(step.amount_out)
-            .ok_or(QuoteError::ArithmeticOverflow)?;
+            .ok_or_else(|| overflow_at("concentrated_exact_out.amount_remaining_sub"))?;
         amount_in_total = amount_in_total
             .checked_add(step.amount_in.saturating_add(step.fee_amount))
-            .ok_or(QuoteError::ArithmeticOverflow)?;
+            .ok_or_else(|| overflow_at("concentrated_exact_out.amount_in_accumulate"))?;
         sqrt_price = step.sqrt_price_next_x64;
 
         if let Some(tick) = next_tick {
             if step.sqrt_price_next_x64 == target_price {
                 liquidity = apply_tick_cross(liquidity, direction, tick, a_to_b).map_err(|error| {
-                    if matches!(error, QuoteError::ArithmeticOverflow) {
+                    if error.is_arithmetic_overflow() {
                         eprintln!(
                             "concentrated exact-out cross overflow: pool_id={}, venue={:?}, a_to_b={}, tick={}, current_tick={}, liquidity={}",
                             model.pool_id.0,
@@ -765,7 +795,7 @@ pub fn apply_concentrated_exact_output_update(
         }
 
         current_tick = tick_from_sqrt_price(Some(venue), sqrt_price).map_err(|error| {
-            if matches!(error, QuoteError::ArithmeticOverflow) {
+            if error.is_arithmetic_overflow() {
                 eprintln!(
                     "concentrated exact-out tick overflow: pool_id={}, venue={:?}, a_to_b={}, sqrt_price_x64={}, liquidity={}, amount_remaining={}",
                     model.pool_id.0,
@@ -1042,24 +1072,22 @@ fn next_sqrt_price_from_amount_0_rounding_up(
     let numerator_1 = U256::from(liquidity) << 64;
     if add {
         let product = U256::from(amount).saturating_mul(U256::from(sqrt_price_x64));
-        let denominator = numerator_1
-            .checked_add(product)
-            .ok_or(QuoteError::ArithmeticOverflow)?;
-        u256_to_u128(mul_div_ceil_u256(
-            numerator_1,
-            U256::from(sqrt_price_x64),
-            denominator,
-        )?)
+        let denominator = numerator_1.checked_add(product).ok_or_else(|| {
+            overflow_at("next_sqrt_price_from_amount_0_rounding_up.add_denominator")
+        })?;
+        u256_to_u128_ctx(
+            mul_div_ceil_u256(numerator_1, U256::from(sqrt_price_x64), denominator)?,
+            "next_sqrt_price_from_amount_0_rounding_up.add_to_u128",
+        )
     } else {
         let product = U256::from(amount).saturating_mul(U256::from(sqrt_price_x64));
-        let denominator = numerator_1
-            .checked_sub(product)
-            .ok_or(QuoteError::ArithmeticOverflow)?;
-        u256_to_u128(mul_div_ceil_u256(
-            numerator_1,
-            U256::from(sqrt_price_x64),
-            denominator,
-        )?)
+        let denominator = numerator_1.checked_sub(product).ok_or_else(|| {
+            overflow_at("next_sqrt_price_from_amount_0_rounding_up.sub_denominator")
+        })?;
+        u256_to_u128_ctx(
+            mul_div_ceil_u256(numerator_1, U256::from(sqrt_price_x64), denominator)?,
+            "next_sqrt_price_from_amount_0_rounding_up.sub_to_u128",
+        )
     }
 }
 
@@ -1072,20 +1100,29 @@ fn next_sqrt_price_from_amount_1_rounding_down(
     let quotient = if add {
         (U256::from(amount) << 64)
             .checked_div(U256::from(liquidity))
-            .ok_or(QuoteError::ArithmeticOverflow)?
+            .ok_or_else(|| {
+                overflow_at("next_sqrt_price_from_amount_1_rounding_down.add_quotient_div")
+            })?
     } else {
-        div_rounding_up_u256(U256::from(amount) << 64, U256::from(liquidity))?
+        div_rounding_up_u256_ctx(
+            U256::from(amount) << 64,
+            U256::from(liquidity),
+            "next_sqrt_price_from_amount_1_rounding_down.sub_quotient_div",
+        )?
     };
     let next = if add {
         U256::from(sqrt_price_x64)
             .checked_add(quotient)
-            .ok_or(QuoteError::ArithmeticOverflow)?
+            .ok_or_else(|| overflow_at("next_sqrt_price_from_amount_1_rounding_down.add_next"))?
     } else {
         U256::from(sqrt_price_x64)
             .checked_sub(quotient)
-            .ok_or(QuoteError::ArithmeticOverflow)?
+            .ok_or_else(|| overflow_at("next_sqrt_price_from_amount_1_rounding_down.sub_next"))?
     };
-    u256_to_u128(next)
+    u256_to_u128_ctx(
+        next,
+        "next_sqrt_price_from_amount_1_rounding_down.next_to_u128",
+    )
 }
 
 fn increasing_price_order(sqrt_price_0: u128, sqrt_price_1: u128) -> (u128, u128) {
@@ -1185,20 +1222,20 @@ fn apply_tick_cross(
         if liquidity_net >= 0 {
             liquidity
                 .checked_sub(liquidity_net as u128)
-                .ok_or(QuoteError::ArithmeticOverflow)
+                .ok_or_else(|| overflow_at("apply_tick_cross.a_to_b.checked_sub"))
         } else {
             liquidity
                 .checked_add(liquidity_net.unsigned_abs())
-                .ok_or(QuoteError::ArithmeticOverflow)
+                .ok_or_else(|| overflow_at("apply_tick_cross.a_to_b.checked_add"))
         }
     } else if liquidity_net >= 0 {
         liquidity
             .checked_add(liquidity_net as u128)
-            .ok_or(QuoteError::ArithmeticOverflow)
+            .ok_or_else(|| overflow_at("apply_tick_cross.b_to_a.checked_add"))
     } else {
         liquidity
             .checked_sub(liquidity_net.unsigned_abs())
-            .ok_or(QuoteError::ArithmeticOverflow)
+            .ok_or_else(|| overflow_at("apply_tick_cross.b_to_a.checked_sub"))
     }
 }
 
@@ -1442,9 +1479,9 @@ fn raydium_sqrt_price_at_tick(tick: i32) -> Result<u128, QuoteError> {
         }
     }
     if tick > 0 {
-        ratio = U256::MAX / ratio;
+        ratio = (U256::one() << 128) / ratio;
     }
-    u256_to_u128(ratio)
+    u256_to_u128_ctx(ratio, "raydium_sqrt_price_at_tick.ratio_to_u128")
 }
 
 fn raydium_tick_from_sqrt_price(sqrt_price_x64: u128) -> Result<i32, QuoteError> {
@@ -1484,45 +1521,54 @@ fn raydium_tick_from_sqrt_price(sqrt_price_x64: u128) -> Result<i32, QuoteError>
 
 fn mul_div_floor_u64(value: u64, numerator: u64, denominator: u64) -> Result<u64, QuoteError> {
     if denominator == 0 {
-        return Err(QuoteError::ArithmeticOverflow);
+        return Err(overflow_at("mul_div_floor_u64.denominator_zero"));
     }
-    u256_to_u64(
+    u256_to_u64_ctx(
         U256::from(value)
             .checked_mul(U256::from(numerator))
-            .ok_or(QuoteError::ArithmeticOverflow)?
+            .ok_or_else(|| overflow_at("mul_div_floor_u64.checked_mul"))?
             / U256::from(denominator),
+        "mul_div_floor_u64.to_u64",
     )
 }
 
 fn mul_div_ceil_u64(value: u64, numerator: u64, denominator: u64) -> Result<u64, QuoteError> {
     if denominator == 0 {
-        return Err(QuoteError::ArithmeticOverflow);
+        return Err(overflow_at("mul_div_ceil_u64.denominator_zero"));
     }
-    u256_to_u64(div_rounding_up_u256(
-        U256::from(value)
-            .checked_mul(U256::from(numerator))
-            .ok_or(QuoteError::ArithmeticOverflow)?,
-        U256::from(denominator),
-    )?)
+    u256_to_u64_ctx(
+        div_rounding_up_u256_ctx(
+            U256::from(value)
+                .checked_mul(U256::from(numerator))
+                .ok_or_else(|| overflow_at("mul_div_ceil_u64.checked_mul"))?,
+            U256::from(denominator),
+            "mul_div_ceil_u64.div_rounding_up",
+        )?,
+        "mul_div_ceil_u64.to_u64",
+    )
 }
 
 fn mul_div_floor_u256(left: U256, right: U256, denominator: U256) -> Result<U256, QuoteError> {
     left.checked_mul(right)
-        .ok_or(QuoteError::ArithmeticOverflow)?
+        .ok_or_else(|| overflow_at("mul_div_floor_u256.checked_mul"))?
         .checked_div(denominator)
-        .ok_or(QuoteError::ArithmeticOverflow)
+        .ok_or_else(|| overflow_at("mul_div_floor_u256.checked_div"))
 }
 
 fn mul_div_ceil_u256(left: U256, right: U256, denominator: U256) -> Result<U256, QuoteError> {
     let numerator = left
         .checked_mul(right)
-        .ok_or(QuoteError::ArithmeticOverflow)?;
-    div_rounding_up_u256(numerator, denominator)
+        .ok_or_else(|| overflow_at("mul_div_ceil_u256.checked_mul"))?;
+    div_rounding_up_u256_ctx(numerator, denominator, "mul_div_ceil_u256.div_rounding_up")
 }
 
-fn div_rounding_up_u256(numerator: U256, denominator: U256) -> Result<U256, QuoteError> {
+fn div_rounding_up_u256_ctx(
+    numerator: U256,
+    denominator: U256,
+    context: &'static str,
+) -> Result<U256, QuoteError> {
     if denominator.is_zero() {
-        return Err(QuoteError::ArithmeticOverflow);
+        return Err(overflow_at(context));
     }
     let quotient = numerator / denominator;
     let remainder = numerator % denominator;
@@ -1531,20 +1577,28 @@ fn div_rounding_up_u256(numerator: U256, denominator: U256) -> Result<U256, Quot
     } else {
         quotient
             .checked_add(U256::one())
-            .ok_or(QuoteError::ArithmeticOverflow)
+            .ok_or_else(|| overflow_at(context))
     }
 }
 
-fn u256_to_u64(value: U256) -> Result<u64, QuoteError> {
+fn div_rounding_up_u256(numerator: U256, denominator: U256) -> Result<U256, QuoteError> {
+    div_rounding_up_u256_ctx(numerator, denominator, "div_rounding_up_u256")
+}
+
+fn u256_to_u64_ctx(value: U256, context: &'static str) -> Result<u64, QuoteError> {
     if value > U256::from(u64::MAX) {
-        return Err(QuoteError::ArithmeticOverflow);
+        return Err(overflow_at(context));
     }
     Ok(value.low_u64())
 }
 
-fn u256_to_u128(value: U256) -> Result<u128, QuoteError> {
+fn u256_to_u64(value: U256) -> Result<u64, QuoteError> {
+    u256_to_u64_ctx(value, "u256_to_u64")
+}
+
+fn u256_to_u128_ctx(value: U256, context: &'static str) -> Result<u128, QuoteError> {
     if value > U256::from(u128::MAX) {
-        return Err(QuoteError::ArithmeticOverflow);
+        return Err(overflow_at(context));
     }
     Ok(value.low_u128())
 }
@@ -1563,8 +1617,9 @@ mod tests {
     use crate::{
         quote::{
             QuoteError, RouteQuote, SOL_MINT, amount_in_between_prices_u256,
-            apply_concentrated_price, compute_concentrated_swap_step, orca_sqrt_price_at_tick,
-            orca_tick_from_sqrt_price,
+            apply_concentrated_exact_input_update, apply_concentrated_price,
+            compute_concentrated_swap_step, orca_sqrt_price_at_tick, orca_tick_from_sqrt_price,
+            raydium_sqrt_price_at_tick, raydium_tick_from_sqrt_price,
         },
         route_registry::{RouteDefinition, RouteLeg, SwapSide},
     };
@@ -1838,10 +1893,60 @@ mod tests {
     }
 
     #[test]
+    fn concentrated_quote_rejects_direction_that_does_not_cover_current_tick() {
+        let snapshot = concentrated_snapshot(Some(PoolVenue::OrcaWhirlpool));
+        let mut model = concentrated_model();
+        model.current_tick_index = 128;
+        model.a_to_b = Some(DirectionalConcentratedQuoteModel {
+            loaded_tick_arrays: 1,
+            expected_tick_arrays: 3,
+            complete: false,
+            windows: vec![TickArrayWindow {
+                start_tick_index: -64,
+                end_tick_index: 0,
+                initialized_tick_count: 0,
+            }],
+            initialized_ticks: Vec::new(),
+        });
+        let direction = model.a_to_b.as_ref().expect("a_to_b quote model");
+
+        assert!(matches!(
+            apply_concentrated_price(&snapshot, Some(&model), "SOL", "USDC", 1_000, 30),
+            Err(QuoteError::QuoteModelNotExecutable)
+        ));
+        assert!(matches!(
+            apply_concentrated_exact_input_update(
+                PoolVenue::OrcaWhirlpool,
+                &model,
+                direction,
+                true,
+                1_000,
+                30,
+            ),
+            Err(QuoteError::QuoteModelNotExecutable)
+        ));
+    }
+
+    #[test]
     fn orca_negative_tick_sqrt_price_round_trips_large_ticks() {
         for tick in [-1, -32, -1_024, -100_000, -221_818] {
             let sqrt_price = orca_sqrt_price_at_tick(tick);
             assert_eq!(orca_tick_from_sqrt_price(sqrt_price), tick);
+        }
+    }
+
+    #[test]
+    fn raydium_sqrt_price_round_trips_large_positive_and_negative_ticks() {
+        for tick in [
+            -1, -32, -1_024, -100_000, -221_818, 1, 32, 1_024, 100_000, 221_818,
+        ] {
+            let sqrt_price =
+                raydium_sqrt_price_at_tick(tick).expect("raydium sqrt price should be computed");
+            assert_eq!(
+                raydium_tick_from_sqrt_price(sqrt_price)
+                    .expect("raydium tick should round-trip from sqrt price"),
+                tick
+            );
         }
     }
 

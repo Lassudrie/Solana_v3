@@ -1,11 +1,22 @@
 [runtime]
 profile = "ultra_fast"
 
+[runtime.control]
+idle_sleep_millis = 0
+max_events_per_tick = 8192
+
+[runtime.refresh]
+enabled = true
+blockhash_refresh_millis = 250
+slot_refresh_millis = 25
+alt_refresh_millis = 250
+wallet_refresh_millis = 500
+
 [state]
-max_snapshot_slot_lag = 2048
+max_snapshot_slot_lag = 256
 
 [strategy]
-max_snapshot_slot_lag = 2048
+max_snapshot_slot_lag = 256
 
 [builder]
 compute_unit_limit = 300000
@@ -15,6 +26,32 @@ jito_tip_lamports = 1000
 [reconciliation]
 rpc_http_endpoint = "http://127.0.0.1:8899"
 rpc_ws_endpoint = "ws://127.0.0.1:8900"
+poll_interval_millis = 10
+account_batch_window_millis = 5
+
+[submit]
+worker_count = 4
+queue_capacity = 16
+congestion_threshold_pct = 75
+single_transaction_policy = "leader_aware"
+
+[rpc_submit]
+enabled = true
+endpoint = "http://127.0.0.1:8899"
+connect_timeout_ms = 100
+request_timeout_ms = 150
+skip_preflight = true
+max_retries = 0
+idempotency_cache_size = 4096
+
+[shredstream]
+grpc_endpoint = "http://127.0.0.1:50051"
+grpc_connect_timeout_ms = 100
+buffer_capacity = 16384
+reconnect_backoff_millis = 25
+max_reconnect_backoff_millis = 250
+idle_refresh_slot_lag = 24
+max_repair_in_flight = 4
 
 [shredstream.reducers]
 raydium_simple_pool = "active"
@@ -700,7 +737,7 @@ max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
 
 [[routes.definitions]]
-enabled = true
+enabled = false
 route_class = "amm_fast_path"
 route_id = "trump-sol-ray-gqsp-orca-ckp1"
 input_mint = "So11111111111111111111111111111111111111112"
@@ -783,7 +820,7 @@ max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
 
 [[routes.definitions]]
-enabled = true
+enabled = false
 route_class = "amm_fast_path"
 route_id = "trump-sol-orca-ckp1-ray-gqsp"
 input_mint = "So11111111111111111111111111111111111111112"
@@ -1868,7 +1905,7 @@ max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
 
 [[routes.definitions]]
-enabled = true
+enabled = false
 route_class = "amm_fast_path"
 route_id = "psol-sol-ray-7pqk-orca-3xlk"
 input_mint = "So11111111111111111111111111111111111111112"
@@ -1951,7 +1988,7 @@ max_extra_buy_leg_slippage_bps = 100
 recovery_success_count = 3
 
 [[routes.definitions]]
-enabled = true
+enabled = false
 route_class = "amm_fast_path"
 route_id = "psol-sol-orca-3xlk-ray-7pqk"
 input_mint = "So11111111111111111111111111111111111111112"

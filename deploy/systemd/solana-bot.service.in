@@ -1,0 +1,33 @@
+[Unit]
+Description=Solana Execution Bot
+After=network-online.target solana-signerd.service
+Wants=network-online.target
+Requires=solana-signerd.service
+RequiresMountsFor=__BOT_CONFIG__
+
+[Service]
+Type=simple
+User=__BOT_USER__
+Group=__BOT_GROUP__
+WorkingDirectory=__WORKDIR__
+StateDirectory=solana-bot
+RuntimeDirectory=solana-bot
+RuntimeDirectoryMode=0750
+ExecStart=__BIN_DIR__/bot --config __BOT_CONFIG__
+Restart=always
+RestartSec=1
+Environment=RUST_BACKTRACE=1
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=__BOT_CONFIG__
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+

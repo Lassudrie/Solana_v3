@@ -48,7 +48,12 @@ impl AtomicTwoLegTemplate {
                     // The first leg fallback stays exact-in when the venue does
                     // not support exact-out for the bridge direction.
                     SwapAmountMode::ExactIn => second.input_amount,
-                    SwapAmountMode::ExactOut => first.input_amount,
+                    SwapAmountMode::ExactOut => {
+                        apply_input_buffer(
+                            first.input_amount,
+                            candidate.active_execution_buffer_bps.unwrap_or(0),
+                        )
+                    }
                 },
                 current_tick_index: first.current_tick_index,
             },
@@ -107,6 +112,19 @@ fn leg_mode_label(mode: &SwapAmountMode) -> &'static str {
 
 fn route_minimum_acceptable_output(candidate: &OpportunityCandidate) -> u64 {
     candidate.minimum_acceptable_output
+}
+
+fn apply_input_buffer(amount: u64, buffer_bps: u16) -> u64 {
+    if buffer_bps == 0 {
+        return amount;
+    }
+
+    let numerator = u128::from(amount).saturating_mul(10_000u128 + u128::from(buffer_bps));
+    numerator
+        .saturating_add(9_999)
+        .checked_div(10_000)
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -260,5 +278,18 @@ mod tests {
             first.other_amount_threshold,
             candidate.leg_quotes[0].input_amount
         );
+    }
+
+    #[test]
+    fn exact_out_first_leg_applies_active_execution_buffer_to_max_input() {
+        let mut candidate = candidate();
+        candidate.active_execution_buffer_bps = Some(25);
+
+        let template = AtomicTwoLegTemplate::default();
+        let [first, _] = template.materialize_leg_plans(&candidate, &route_execution(true));
+
+        assert_eq!(first.amount_mode, SwapAmountMode::ExactOut);
+        assert_eq!(first.specified_amount, candidate.leg_quotes[1].input_amount);
+        assert_eq!(first.other_amount_threshold, 10_025);
     }
 }

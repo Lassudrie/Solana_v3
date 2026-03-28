@@ -29,10 +29,14 @@ Point important :
 - Les manifests fast du bot pointent deja le RPC local :
   - [`sol_usdc_routes_amm_fast.toml`](/root/bot/Solana_v3/sol_usdc_routes_amm_fast.toml)
   - [`amm_12_pairs_fast.toml`](/root/bot/Solana_v3/amm_12_pairs_fast.toml)
+- Un scaffold de proxy gRPC Shredstream :
+  - [`crates/detection/src/proxy.rs`](/root/bot/Solana_v3/crates/detection/src/proxy.rs)
+  - [`crates/detection/src/bin/shredstream_proxy.rs`](/root/bot/Solana_v3/crates/detection/src/bin/shredstream_proxy.rs)
 
 Ce que le repo ne fournit pas explicitement :
 
-- un service documente dans ce repo qui transforme Yellowstone gRPC `10000` en `ShredstreamProxy` gRPC `50051`
+- le bridge Yellowstone gRPC `10000` -> `ShredstreamProxy` gRPC `50051`
+- le mapping d'un flux upstream reel vers `Entry.entries`
 
 ## Prerequis
 
@@ -258,12 +262,20 @@ Dans le code actuel, `shredstream.grpc_endpoint` vaut par defaut :
 Le service attendu par le bot est :
 
 - `ShredstreamProxy.SubscribeEntries`
+- `Shredstream.SendHeartbeat`
 
 Reference proto :
 
 - [`crates/detection/proto/shredstream.proto`](/root/bot/Solana_v3/crates/detection/proto/shredstream.proto)
 
-Cela signifie qu'il faut un composant supplementaire entre Yellowstone et le bot si votre stack n'expose que `127.0.0.1:10000`.
+Le repo fournit maintenant le squelette du serveur gRPC correspondant :
+
+- `cargo run -p detection --bin shredstream_proxy`
+- ecoute par defaut sur `127.0.0.1:50051`
+- expose deja `SubscribeEntries` et `SendHeartbeat`
+- n'est pas encore branche a un producteur amont d'`Entry`
+
+Cela signifie qu'il faut encore un composant supplementaire entre Yellowstone et le bot si votre stack n'expose que `127.0.0.1:10000`.
 
 Checklist simple :
 

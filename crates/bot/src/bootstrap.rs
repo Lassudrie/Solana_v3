@@ -539,14 +539,35 @@ fn collect_required_token_accounts(
                     )?;
                 }
                 RouteLegExecutionConfig::RaydiumSimplePool(config) => {
+                    let user_source_address = if let Some(mint) = &config.user_source_mint {
+                        associated_token_address(wallet_owner, mint, &config.token_program_id)?
+                    } else {
+                        config.user_source_token_account.clone().ok_or_else(|| {
+                            BootstrapError::InvalidRouteConfig {
+                                route_id: route.route_id.clone(),
+                                detail: "raydium_simple_pool leg requires user_source_token_account or user_source_mint".into(),
+                            }
+                        })?
+                    };
+                    let user_destination_address =
+                        if let Some(mint) = &config.user_destination_mint {
+                            associated_token_address(wallet_owner, mint, &config.token_program_id)?
+                        } else {
+                            config.user_destination_token_account.clone().ok_or_else(|| {
+                                BootstrapError::InvalidRouteConfig {
+                                    route_id: route.route_id.clone(),
+                                    detail: "raydium_simple_pool leg requires user_destination_token_account or user_destination_mint".into(),
+                                }
+                            })?
+                        };
                     insert_required_token_account(
                         &mut requirements,
                         route,
                         RequiredTokenAccount {
-                            address: config.user_source_token_account.clone(),
+                            address: user_source_address,
                             token_program_id: config.token_program_id.clone(),
                             wallet_owner: wallet_owner.into(),
-                            expected_mint: None,
+                            expected_mint: config.user_source_mint.clone(),
                             sources: BTreeSet::new(),
                         },
                         "configured_user_source_account",
@@ -555,10 +576,10 @@ fn collect_required_token_accounts(
                         &mut requirements,
                         route,
                         RequiredTokenAccount {
-                            address: config.user_destination_token_account.clone(),
+                            address: user_destination_address,
                             token_program_id: config.token_program_id.clone(),
                             wallet_owner: wallet_owner.into(),
-                            expected_mint: None,
+                            expected_mint: config.user_destination_mint.clone(),
                             sources: BTreeSet::new(),
                         },
                         "configured_user_destination_account",
@@ -974,6 +995,8 @@ fn effective_u64(value: u64, default_value: u64) -> u64 {
     if value == 0 { default_value } else { value }
 }
 
+const MIN_EXECUTION_PROTECTION_QUOTE_SLOT_LAG: u64 = 24;
+
 fn map_execution_protection(
     config: &crate::config::RouteExecutionProtectionConfig,
 ) -> Option<ExecutionProtectionPolicy> {
@@ -992,7 +1015,11 @@ fn effective_max_quote_slot_lag(route: &crate::config::RouteConfig) -> u64 {
     if !protection.enabled || protection.tight_max_quote_slot_lag == 0 {
         configured
     } else {
-        configured.min(protection.tight_max_quote_slot_lag)
+        configured.min(
+            protection
+                .tight_max_quote_slot_lag
+                .max(MIN_EXECUTION_PROTECTION_QUOTE_SLOT_LAG),
+        )
     }
 }
 
@@ -1045,6 +1072,8 @@ fn map_leg_execution(config: &RouteLegExecutionConfig) -> VenueExecutionConfig {
                 market_vault_signer: config.market_vault_signer.clone(),
                 user_source_token_account: config.user_source_token_account.clone(),
                 user_destination_token_account: config.user_destination_token_account.clone(),
+                user_source_mint: config.user_source_mint.clone(),
+                user_destination_mint: config.user_destination_mint.clone(),
             })
         }
         RouteLegExecutionConfig::RaydiumClmm(config) => {
@@ -1244,8 +1273,10 @@ mod tests {
                             market_coin_vault: test_pubkey("serum-coin-vault"),
                             market_pc_vault: test_pubkey("serum-pc-vault"),
                             market_vault_signer: test_pubkey("serum-vault-signer"),
-                            user_source_token_account: test_pubkey("route-mid-ata"),
-                            user_destination_token_account: test_pubkey("route-output-ata"),
+                            user_source_token_account: Some(test_pubkey("route-mid-ata")),
+                            user_destination_token_account: Some(test_pubkey("route-output-ata")),
+                            user_source_mint: None,
+                            user_destination_mint: None,
                         },
                     ),
                 },
@@ -1827,7 +1858,7 @@ mod tests {
         let registry = execution_registry_from_config(&test_config(route));
         let registered = registry.get(&route_id).expect("route should be registered");
 
-        assert_eq!(registered.max_quote_slot_lag, 4);
+        assert_eq!(registered.max_quote_slot_lag, 24);
     }
 
     #[test]
@@ -1837,8 +1868,6 @@ mod tests {
         let route_ids = [
             "jto-sol-ray-jvop-orca-2uhf",
             "jto-sol-orca-2uhf-ray-jvop",
-            "trump-sol-orca-ckp1-ray-gqsp",
-            "trump-sol-ray-gqsp-orca-ckp1",
             "trump-usdc-orca-6nd6-ray-7xzv",
             "trump-usdc-ray-7xzv-orca-6nd6",
         ];
@@ -1877,7 +1906,7 @@ mod tests {
             .filter(|route| route.enabled)
             .collect::<Vec<_>>();
 
-        assert_eq!(enabled.len(), 24);
+        assert_eq!(enabled.len(), 20);
         assert!(
             enabled
                 .iter()
@@ -1939,10 +1968,6 @@ mod tests {
             ),
             (
                 "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
-                "So11111111111111111111111111111111111111112",
-            ),
-            (
-                "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN",
                 "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
             ),
             (
@@ -1963,10 +1988,6 @@ mod tests {
             ),
             (
                 "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
-                "So11111111111111111111111111111111111111112",
-            ),
-            (
-                "pSo1f9nQXWgXibFtKf7NWYxb5enAM4qfP6UJSiXRQfL",
                 "So11111111111111111111111111111111111111112",
             ),
         ]

@@ -93,27 +93,100 @@ impl BotConfig {
             return;
         }
 
+        let defaults = Self::default();
         let shredstream_live = self.runtime.event_source.mode == EventSourceMode::Shredstream;
 
         // Ultra-fast mode keeps the async submit path short and fail-fast.
-        self.submit.worker_count = 2;
-        self.submit.queue_capacity = 4;
-        self.submit.congestion_threshold_pct = 50;
-        self.submit.single_transaction_policy = SingleTransactionSubmitPolicyConfig::LeaderAware;
-        self.jito.request_timeout_ms = 250;
-        self.jito.retry_attempts = 1;
-        self.jito.retry_backoff_ms = 0;
-        self.rpc_submit.enabled = true;
-        self.rpc_submit.request_timeout_ms = 250;
-        self.rpc_submit.max_retries = 0;
-        self.runtime.control.idle_sleep_millis = 0;
-        self.runtime.control.max_events_per_tick = 4_096;
-        self.reconciliation.poll_interval_millis = 25;
-        self.runtime.refresh.enabled = true;
-        self.runtime.refresh.blockhash_refresh_millis = if shredstream_live { 5_000 } else { 500 };
-        self.runtime.refresh.slot_refresh_millis = if shredstream_live { 0 } else { 250 };
-        self.runtime.refresh.alt_refresh_millis = if shredstream_live { 0 } else { 2_000 };
-        self.runtime.refresh.wallet_refresh_millis = if shredstream_live { 0 } else { 2_000 };
+        set_if_default(
+            &mut self.submit.worker_count,
+            defaults.submit.worker_count,
+            2,
+        );
+        set_if_default(
+            &mut self.submit.queue_capacity,
+            defaults.submit.queue_capacity,
+            4,
+        );
+        set_if_default(
+            &mut self.submit.congestion_threshold_pct,
+            defaults.submit.congestion_threshold_pct,
+            50,
+        );
+        set_if_default(
+            &mut self.submit.single_transaction_policy,
+            defaults.submit.single_transaction_policy,
+            SingleTransactionSubmitPolicyConfig::LeaderAware,
+        );
+        set_if_default(
+            &mut self.jito.request_timeout_ms,
+            defaults.jito.request_timeout_ms,
+            250,
+        );
+        set_if_default(
+            &mut self.jito.retry_attempts,
+            defaults.jito.retry_attempts,
+            1,
+        );
+        set_if_default(
+            &mut self.jito.retry_backoff_ms,
+            defaults.jito.retry_backoff_ms,
+            0,
+        );
+        set_if_default(
+            &mut self.rpc_submit.enabled,
+            defaults.rpc_submit.enabled,
+            true,
+        );
+        set_if_default(
+            &mut self.rpc_submit.request_timeout_ms,
+            defaults.rpc_submit.request_timeout_ms,
+            250,
+        );
+        set_if_default(
+            &mut self.rpc_submit.max_retries,
+            defaults.rpc_submit.max_retries,
+            0,
+        );
+        set_if_default(
+            &mut self.runtime.control.idle_sleep_millis,
+            defaults.runtime.control.idle_sleep_millis,
+            0,
+        );
+        set_if_default(
+            &mut self.runtime.control.max_events_per_tick,
+            defaults.runtime.control.max_events_per_tick,
+            4_096,
+        );
+        set_if_default(
+            &mut self.reconciliation.poll_interval_millis,
+            defaults.reconciliation.poll_interval_millis,
+            25,
+        );
+        set_if_default(
+            &mut self.runtime.refresh.enabled,
+            defaults.runtime.refresh.enabled,
+            true,
+        );
+        set_if_default(
+            &mut self.runtime.refresh.blockhash_refresh_millis,
+            defaults.runtime.refresh.blockhash_refresh_millis,
+            if shredstream_live { 5_000 } else { 500 },
+        );
+        set_if_default(
+            &mut self.runtime.refresh.slot_refresh_millis,
+            defaults.runtime.refresh.slot_refresh_millis,
+            if shredstream_live { 0 } else { 250 },
+        );
+        set_if_default(
+            &mut self.runtime.refresh.alt_refresh_millis,
+            defaults.runtime.refresh.alt_refresh_millis,
+            if shredstream_live { 0 } else { 2_000 },
+        );
+        set_if_default(
+            &mut self.runtime.refresh.wallet_refresh_millis,
+            defaults.runtime.refresh.wallet_refresh_millis,
+            if shredstream_live { 0 } else { 2_000 },
+        );
 
         if shredstream_live {
             promote_shadow_reducer(&mut self.shredstream.reducers.raydium_simple_pool);
@@ -171,6 +244,12 @@ impl BotConfig {
     }
 }
 
+fn set_if_default<T: PartialEq>(slot: &mut T, default: T, desired: T) {
+    if *slot == default {
+        *slot = desired;
+    }
+}
+
 fn merge_json_value(base: &mut JsonValue, overlay: JsonValue) {
     match (base, overlay) {
         (JsonValue::Object(base_map), JsonValue::Object(overlay_map)) => {
@@ -193,6 +272,14 @@ fn promote_shadow_reducer(mode: &mut ReducerRolloutMode) {
     }
 }
 
+fn default_shredstream_idle_refresh_slot_lag() -> u64 {
+    128
+}
+
+fn default_account_batch_window_millis() -> u64 {
+    20
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ShredstreamConfig {
@@ -202,6 +289,9 @@ pub struct ShredstreamConfig {
     pub buffer_capacity: usize,
     pub reconnect_backoff_millis: u64,
     pub max_reconnect_backoff_millis: u64,
+    #[serde(default = "default_shredstream_idle_refresh_slot_lag")]
+    pub idle_refresh_slot_lag: u64,
+    pub max_repair_in_flight: usize,
     #[serde(default)]
     pub reducers: LiveReducerConfig,
 }
@@ -214,6 +304,8 @@ impl Default for ShredstreamConfig {
             buffer_capacity: 4_096,
             reconnect_backoff_millis: 250,
             max_reconnect_backoff_millis: 5_000,
+            idle_refresh_slot_lag: default_shredstream_idle_refresh_slot_lag(),
+            max_repair_in_flight: 0,
             reducers: LiveReducerConfig::default(),
         }
     }
@@ -434,8 +526,10 @@ pub struct RaydiumSimplePoolLegExecutionConfig {
     pub market_coin_vault: String,
     pub market_pc_vault: String,
     pub market_vault_signer: String,
-    pub user_source_token_account: String,
-    pub user_destination_token_account: String,
+    pub user_source_token_account: Option<String>,
+    pub user_destination_token_account: Option<String>,
+    pub user_source_mint: Option<String>,
+    pub user_destination_mint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -683,6 +777,8 @@ pub struct ReconciliationConfig {
     pub search_transaction_history: bool,
     pub poll_interval_millis: u64,
     pub max_pending_slots: u64,
+    #[serde(default = "default_account_batch_window_millis")]
+    pub account_batch_window_millis: u64,
 }
 
 impl Default for ReconciliationConfig {
@@ -696,6 +792,7 @@ impl Default for ReconciliationConfig {
             search_transaction_history: true,
             poll_interval_millis: 100,
             max_pending_slots: 150,
+            account_batch_window_millis: default_account_batch_window_millis(),
         }
     }
 }
@@ -1013,6 +1110,28 @@ mod tests {
     }
 
     #[test]
+    fn ultra_fast_profile_preserves_explicit_rpc_aggressive_overrides() {
+        let mut config = BotConfig::default();
+        config.runtime.profile = RuntimeProfileConfig::UltraFast;
+        config.runtime.event_source.mode = EventSourceMode::Shredstream;
+        config.reconciliation.poll_interval_millis = 10;
+        config.runtime.refresh.blockhash_refresh_millis = 250;
+        config.runtime.refresh.slot_refresh_millis = 25;
+        config.runtime.refresh.alt_refresh_millis = 250;
+        config.runtime.refresh.wallet_refresh_millis = 500;
+        config.submit.queue_capacity = 16;
+
+        config.apply_runtime_profile_defaults();
+
+        assert_eq!(config.reconciliation.poll_interval_millis, 10);
+        assert_eq!(config.runtime.refresh.blockhash_refresh_millis, 250);
+        assert_eq!(config.runtime.refresh.slot_refresh_millis, 25);
+        assert_eq!(config.runtime.refresh.alt_refresh_millis, 250);
+        assert_eq!(config.runtime.refresh.wallet_refresh_millis, 500);
+        assert_eq!(config.submit.queue_capacity, 16);
+    }
+
+    #[test]
     fn live_reducer_defaults_are_active() {
         let reducers = super::LiveReducerConfig::default();
 
@@ -1160,10 +1279,16 @@ default_jito_tip_lamports = 5000
             loaded.reconciliation.rpc_http_endpoint,
             "http://127.0.0.1:8899"
         );
-        assert_eq!(
-            loaded.reconciliation.rpc_ws_endpoint,
-            "ws://127.0.0.1:8900"
-        );
+        assert_eq!(loaded.reconciliation.rpc_ws_endpoint, "ws://127.0.0.1:8900");
+        assert_eq!(loaded.reconciliation.poll_interval_millis, 10);
+        assert_eq!(loaded.reconciliation.account_batch_window_millis, 5);
+        assert_eq!(loaded.runtime.refresh.blockhash_refresh_millis, 250);
+        assert_eq!(loaded.runtime.refresh.slot_refresh_millis, 25);
+        assert_eq!(loaded.runtime.refresh.alt_refresh_millis, 250);
+        assert_eq!(loaded.runtime.refresh.wallet_refresh_millis, 500);
+        assert_eq!(loaded.submit.queue_capacity, 16);
+        assert_eq!(loaded.shredstream.idle_refresh_slot_lag, 24);
+        assert_eq!(loaded.shredstream.max_repair_in_flight, 4);
         assert_eq!(
             loaded.shredstream.reducers.orca_simple_pool,
             ReducerRolloutMode::Active
@@ -1188,10 +1313,7 @@ default_jito_tip_lamports = 5000
             loaded.reconciliation.rpc_http_endpoint,
             "http://127.0.0.1:8899"
         );
-        assert_eq!(
-            loaded.reconciliation.rpc_ws_endpoint,
-            "ws://127.0.0.1:8900"
-        );
+        assert_eq!(loaded.reconciliation.rpc_ws_endpoint, "ws://127.0.0.1:8900");
         assert!(loaded.rpc_submit.enabled);
     }
 

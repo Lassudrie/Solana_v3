@@ -163,7 +163,7 @@ impl StatePlane {
             return false;
         };
         match snapshot.liquidity_model {
-            LiquidityModel::ConstantProduct => true,
+            LiquidityModel::ConstantProduct => snapshot.has_executable_quote_model(),
             LiquidityModel::ConcentratedLiquidity => self
                 .aligned_concentrated_quote_model(pool_id)
                 .map(|model| model.has_required_directions())
@@ -1063,6 +1063,71 @@ mod tests {
     }
 
     #[test]
+    fn tradable_route_count_excludes_constant_product_without_reserves() {
+        let route_id = RouteId("route-cp".into());
+        let pool_a = PoolId("pool-a".into());
+        let pool_b = PoolId("pool-b".into());
+        let mut plane = StatePlane::new(2);
+        plane.register_route(route_id, vec![pool_a.clone(), pool_b.clone()]);
+
+        plane
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                1,
+                10,
+                PoolSnapshotUpdate {
+                    pool_id: pool_a.0.clone(),
+                    price_bps: 10_000,
+                    fee_bps: 4,
+                    reserve_depth: 1_000,
+                    reserve_a: Some(0),
+                    reserve_b: Some(1_000),
+                    active_liquidity: Some(1_000),
+                    sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
+                    confidence: SnapshotConfidence::Executable,
+                    repair_pending: Some(false),
+                    token_mint_a: "mint-a".into(),
+                    token_mint_b: "mint-b".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+        plane
+            .apply_event(&NormalizedEvent::pool_snapshot_update(
+                EventSourceKind::ShredStream,
+                2,
+                10,
+                PoolSnapshotUpdate {
+                    pool_id: pool_b.0.clone(),
+                    price_bps: 10_000,
+                    fee_bps: 4,
+                    reserve_depth: 1_000,
+                    reserve_a: Some(1_000),
+                    reserve_b: Some(1_000),
+                    active_liquidity: Some(1_000),
+                    sqrt_price_x64: None,
+                    venue: PoolVenue::OrcaSimplePool,
+                    confidence: SnapshotConfidence::Executable,
+                    repair_pending: Some(false),
+                    token_mint_a: "mint-a".into(),
+                    token_mint_b: "mint-b".into(),
+                    tick_spacing: 0,
+                    current_tick_index: None,
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+
+        assert!(!plane.pool_has_executable_quote_model(&pool_a));
+        assert_eq!(plane.tradable_route_count(), 0);
+    }
+
+    #[test]
     fn stale_concentrated_quote_model_does_not_match_new_snapshot_version() {
         let route_id = RouteId("route-clmm".into());
         let pool_a = PoolId("pool-a".into());
@@ -1144,6 +1209,49 @@ mod tests {
             .unwrap();
 
         assert!(plane.pool_has_executable_quote_model(&pool_id));
+        assert!(plane.concentrated_quote_model(&pool_id).is_some());
+    }
+
+    #[test]
+    fn concentrated_quote_model_missing_current_tick_is_not_executable() {
+        let pool_id = PoolId("pool-clmm".into());
+        let mut plane = StatePlane::new(2);
+
+        plane
+            .apply_event(&concentrated_snapshot_event(1, &pool_id, 10, 1))
+            .unwrap();
+        plane
+            .apply_event(&NormalizedEvent::pool_quote_model_update(
+                EventSourceKind::ShredStream,
+                2,
+                10,
+                PoolQuoteModelUpdate {
+                    pool_id: pool_id.0.clone(),
+                    liquidity: 1_000,
+                    sqrt_price_x64: 1u128 << 64,
+                    current_tick_index: 128,
+                    tick_spacing: 64,
+                    required_a_to_b: true,
+                    required_b_to_a: false,
+                    a_to_b: Some(DirectionalPoolQuoteModelUpdate {
+                        loaded_tick_arrays: 1,
+                        expected_tick_arrays: 3,
+                        complete: false,
+                        windows: vec![TickArrayWindowUpdate {
+                            start_tick_index: -64,
+                            end_tick_index: 0,
+                            initialized_tick_count: 0,
+                        }],
+                        initialized_ticks: Vec::new(),
+                    }),
+                    b_to_a: None,
+                    slot: 10,
+                    write_version: 1,
+                },
+            ))
+            .unwrap();
+
+        assert!(!plane.pool_has_executable_quote_model(&pool_id));
         assert!(plane.concentrated_quote_model(&pool_id).is_some());
     }
 }

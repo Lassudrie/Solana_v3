@@ -132,6 +132,28 @@ impl GuardrailSet {
             });
         }
         if quote.expected_net_profit_quote_atoms < self.config.min_profit_quote_atoms {
+            eprintln!(
+                "profit below threshold: route_id={}, input_amount={}, gross_output={}, net_output={}, expected_gross={}, expected_net={}, estimated_cost_quote_atoms={}, leg0={{venue={}, pool_id={}, input={}, output={}, fee={}, tick={:?}}}, leg1={{venue={}, pool_id={}, input={}, output={}, fee={}, tick={:?}}}",
+                route.route_id.0,
+                quote.input_amount,
+                quote.gross_output_amount,
+                quote.net_output_amount,
+                quote.expected_gross_profit_quote_atoms,
+                quote.expected_net_profit_quote_atoms,
+                quote.estimated_execution_cost_quote_atoms,
+                quote.leg_quotes[0].venue,
+                quote.leg_quotes[0].pool_id.0,
+                quote.leg_quotes[0].input_amount,
+                quote.leg_quotes[0].output_amount,
+                quote.leg_quotes[0].fee_paid,
+                quote.leg_quotes[0].current_tick_index,
+                quote.leg_quotes[1].venue,
+                quote.leg_quotes[1].pool_id.0,
+                quote.leg_quotes[1].input_amount,
+                quote.leg_quotes[1].output_amount,
+                quote.leg_quotes[1].fee_paid,
+                quote.leg_quotes[1].current_tick_index,
+            );
             return Err(RejectionReason::ProfitBelowThreshold {
                 expected: quote.expected_net_profit_quote_atoms,
                 minimum: self.config.min_profit_quote_atoms,

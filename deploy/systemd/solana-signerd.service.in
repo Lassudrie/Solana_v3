@@ -1,0 +1,31 @@
+[Unit]
+Description=Solana Bot Secure Signer
+After=local-fs.target
+RequiresMountsFor=__SIGNER_KEYPAIR__
+
+[Service]
+Type=simple
+User=__BOT_USER__
+Group=__BOT_GROUP__
+WorkingDirectory=__WORKDIR__
+StateDirectory=solana-bot
+RuntimeDirectory=solana-bot
+RuntimeDirectoryMode=0750
+ExecStart=__BIN_DIR__/signerd --socket __SIGNER_SOCKET__ --keypair-path __SIGNER_KEYPAIR__
+Restart=always
+RestartSec=1
+UMask=0077
+LimitNOFILE=4096
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=__SIGNER_KEYPAIR__
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
+

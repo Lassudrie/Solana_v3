@@ -377,7 +377,13 @@ impl PoolSnapshot {
     }
 
     pub fn has_executable_quote_model(&self) -> bool {
-        self.liquidity_model == LiquidityModel::ConstantProduct
+        match self.liquidity_model {
+            LiquidityModel::ConstantProduct => matches!(
+                (self.reserve_a, self.reserve_b),
+                (Some(reserve_a), Some(reserve_b)) if reserve_a > 0 && reserve_b > 0
+            ),
+            LiquidityModel::ConcentratedLiquidity | LiquidityModel::Unknown => false,
+        }
     }
 
     pub fn constant_product_reserves_for(

@@ -1,4 +1,7 @@
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{BTreeSet, HashMap},
+    str::FromStr,
+};
 
 use bincode::serialize;
 use domain::quote_models::{derive_orca_tick_arrays, derive_raydium_tick_arrays};
@@ -29,6 +32,7 @@ const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
 const DEFAULT_JITO_TIP_ACCOUNT: &str = "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5";
 const COMPUTE_BUDGET_PROGRAM_ID: &str = "ComputeBudget111111111111111111111111111111";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
 const ORCA_SWAP_INSTRUCTION_TAG: u8 = 1;
 const RAYDIUM_SWAP_BASE_IN_TAG: u8 = 9;
 const RAYDIUM_SWAP_BASE_OUT_TAG: u8 = 11;
@@ -119,26 +123,42 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
             route_execution.default_jito_tip_lamports,
         );
 
-        let mut runtime_instructions = vec![
-            compute_budget_set_compute_unit_limit(compute_unit_limit),
-            compute_budget_set_compute_unit_price(compute_unit_price_micro_lamports),
+        let mut labeled_instructions = vec![
+            LabeledInstruction::new(
+                "compute-budget-limit",
+                compute_budget_set_compute_unit_limit(compute_unit_limit),
+            ),
+            LabeledInstruction::new(
+                "compute-budget-price",
+                compute_budget_set_compute_unit_price(compute_unit_price_micro_lamports),
+            ),
         ];
+        match associated_token_setup_instructions(route_execution, fee_payer) {
+            Ok(setup_instructions) => labeled_instructions.extend(setup_instructions),
+            Err(reason) => return rejected(reason),
+        }
         for (index, leg_plan) in leg_plans.iter().enumerate() {
             let instruction =
                 match compile_leg_instruction(&route_execution.legs[index], fee_payer, leg_plan) {
                     Ok(instruction) => instruction,
                     Err(reason) => return rejected(reason),
                 };
-            runtime_instructions.push(instruction);
+            labeled_instructions.push(LabeledInstruction::new(
+                format!("{}-leg-{}", request.candidate.route_id.0, index + 1),
+                instruction,
+            ));
         }
         if jito_tip_lamports > 0 {
             let tip_account = parse_static_pubkey(DEFAULT_JITO_TIP_ACCOUNT);
-            runtime_instructions.push(instruction::transfer(
-                &fee_payer,
-                &tip_account,
-                jito_tip_lamports,
+            labeled_instructions.push(LabeledInstruction::new(
+                "jito-tip",
+                instruction::transfer(&fee_payer, &tip_account, jito_tip_lamports),
             ));
         }
+        let runtime_instructions = labeled_instructions
+            .iter()
+            .map(|labeled| labeled.instruction.clone())
+            .collect::<Vec<_>>();
 
         let (versioned_message, message_format) = match compile_message(
             route_execution,
@@ -161,34 +181,16 @@ impl TransactionBuilder for AtomicArbTransactionBuilder {
         let resolved_lookup_tables =
             used_lookup_tables(&versioned_message, &route_lookup_tables).unwrap_or_default();
 
-        let mut instructions = Vec::with_capacity(runtime_instructions.len());
-        instructions.push(describe_instruction(
-            "compute-budget-limit",
-            &runtime_instructions[0],
-            &resolved_lookup_tables,
-        ));
-        instructions.push(describe_instruction(
-            "compute-budget-price",
-            &runtime_instructions[1],
-            &resolved_lookup_tables,
-        ));
-        instructions.push(describe_instruction(
-            &format!("{}-leg-1", request.candidate.route_id.0),
-            &runtime_instructions[2],
-            &resolved_lookup_tables,
-        ));
-        instructions.push(describe_instruction(
-            &format!("{}-leg-2", request.candidate.route_id.0),
-            &runtime_instructions[3],
-            &resolved_lookup_tables,
-        ));
-        if let Some(tip_instruction) = runtime_instructions.get(4) {
-            instructions.push(describe_instruction(
-                "jito-tip",
-                tip_instruction,
-                &resolved_lookup_tables,
-            ));
-        }
+        let instructions = labeled_instructions
+            .iter()
+            .map(|labeled| {
+                describe_instruction(
+                    &labeled.label,
+                    &labeled.instruction,
+                    &resolved_lookup_tables,
+                )
+            })
+            .collect();
 
         let priority_fee_lamports =
             priority_fee_lamports(compute_unit_limit, compute_unit_price_micro_lamports);
@@ -367,6 +369,78 @@ fn compile_leg_instruction(
     }
 }
 
+fn associated_token_setup_instructions(
+    route_execution: &RouteExecutionConfig,
+    fee_payer: Pubkey,
+) -> Result<Vec<LabeledInstruction>, BuildRejectionReason> {
+    let mut seen = BTreeSet::new();
+    let mut instructions = Vec::new();
+
+    for execution in &route_execution.legs {
+        match execution {
+            VenueExecutionConfig::OrcaWhirlpool(config) => {
+                register_associated_token_account_setup(
+                    &mut seen,
+                    &mut instructions,
+                    fee_payer,
+                    &config.token_mint_a,
+                    &config.token_program_id,
+                )?;
+                register_associated_token_account_setup(
+                    &mut seen,
+                    &mut instructions,
+                    fee_payer,
+                    &config.token_mint_b,
+                    &config.token_program_id,
+                )?;
+            }
+            VenueExecutionConfig::RaydiumClmm(config) => {
+                register_associated_token_account_setup(
+                    &mut seen,
+                    &mut instructions,
+                    fee_payer,
+                    &config.token_mint_0,
+                    &config.token_program_id,
+                )?;
+                register_associated_token_account_setup(
+                    &mut seen,
+                    &mut instructions,
+                    fee_payer,
+                    &config.token_mint_1,
+                    &config.token_program_id,
+                )?;
+            }
+            VenueExecutionConfig::OrcaSimplePool(_) | VenueExecutionConfig::RaydiumSimplePool(_) => {}
+        }
+    }
+
+    Ok(instructions)
+}
+
+fn register_associated_token_account_setup(
+    seen: &mut BTreeSet<(String, String)>,
+    instructions: &mut Vec<LabeledInstruction>,
+    fee_payer: Pubkey,
+    mint: &str,
+    token_program: &str,
+) -> Result<(), BuildRejectionReason> {
+    let mint_pubkey = parse_pubkey(mint)?;
+    let token_program_pubkey = parse_pubkey(token_program)?;
+    let key = (mint.to_string(), token_program.to_string());
+    if !seen.insert(key) {
+        return Ok(());
+    }
+    instructions.push(LabeledInstruction::new(
+        format!("ata-create-{}", short_label(mint)),
+        create_associated_token_account_idempotent(
+            fee_payer,
+            mint_pubkey,
+            token_program_pubkey,
+        ),
+    ));
+    Ok(())
+}
+
 fn compile_orca_simple_pool(
     config: &OrcaSimplePoolConfig,
     fee_payer: Pubkey,
@@ -409,18 +483,35 @@ fn compile_raydium_simple_pool(
     leg_plan: &AtomicLegPlan,
 ) -> Result<Instruction, BuildRejectionReason> {
     let mut data = Vec::with_capacity(17);
-    let tag = match leg_plan.amount_mode {
-        SwapAmountMode::ExactIn => RAYDIUM_SWAP_BASE_IN_TAG,
+    match leg_plan.amount_mode {
+        SwapAmountMode::ExactIn => {
+            data.push(RAYDIUM_SWAP_BASE_IN_TAG);
+            data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
+            data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
+        }
         SwapAmountMode::ExactOut
             if leg_plan.side == strategy::route_registry::SwapSide::BuyBase =>
         {
-            RAYDIUM_SWAP_BASE_OUT_TAG
+            // Raydium V4 SwapBaseOut expects `max_amount_in` first, then `amount_out`.
+            data.push(RAYDIUM_SWAP_BASE_OUT_TAG);
+            data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
+            data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
         }
         SwapAmountMode::ExactOut => return Err(BuildRejectionReason::UnsupportedVenue),
-    };
-    data.push(tag);
-    data.extend_from_slice(&leg_plan.specified_amount.to_le_bytes());
-    data.extend_from_slice(&leg_plan.other_amount_threshold.to_le_bytes());
+    }
+
+    let user_source_token_account = resolve_raydium_simple_user_token_account(
+        config.user_source_token_account.as_deref(),
+        config.user_source_mint.as_deref(),
+        &config.token_program_id,
+        fee_payer,
+    )?;
+    let user_destination_token_account = resolve_raydium_simple_user_token_account(
+        config.user_destination_token_account.as_deref(),
+        config.user_destination_mint.as_deref(),
+        &config.token_program_id,
+        fee_payer,
+    )?;
 
     Ok(Instruction {
         program_id: parse_pubkey(&config.program_id)?,
@@ -439,8 +530,8 @@ fn compile_raydium_simple_pool(
             AccountMeta::new(parse_pubkey(&config.market_coin_vault)?, false),
             AccountMeta::new(parse_pubkey(&config.market_pc_vault)?, false),
             AccountMeta::new_readonly(parse_pubkey(&config.market_vault_signer)?, false),
-            AccountMeta::new(parse_pubkey(&config.user_source_token_account)?, false),
-            AccountMeta::new(parse_pubkey(&config.user_destination_token_account)?, false),
+            AccountMeta::new(user_source_token_account, false),
+            AccountMeta::new(user_destination_token_account, false),
             AccountMeta::new_readonly(fee_payer, true),
         ],
         data,
@@ -677,6 +768,7 @@ mod tests {
         signature::Signature,
         transaction::VersionedTransaction,
     };
+    use domain::RouteId;
 
     use crate::types::SwapAmountMode;
 
@@ -817,6 +909,75 @@ mod tests {
     }
 
     #[test]
+    fn associated_token_setup_instructions_deduplicate_clmm_route_mints() {
+        let route_execution = RouteExecutionConfig {
+            route_id: RouteId("route-clmm".into()),
+            message_mode: MessageMode::V0Required,
+            lookup_tables: Vec::new(),
+            default_compute_unit_limit: 300_000,
+            default_compute_unit_price_micro_lamports: 25_000,
+            default_jito_tip_lamports: 5_000,
+            max_quote_slot_lag: 32,
+            max_alt_slot_lag: 32,
+            legs: [
+                VenueExecutionConfig::OrcaWhirlpool(OrcaWhirlpoolConfig {
+                    program_id: test_pubkey("orca-program"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    whirlpool: test_pubkey("whirlpool"),
+                    token_mint_a: test_pubkey("mint-a"),
+                    token_vault_a: test_pubkey("vault-a"),
+                    token_mint_b: test_pubkey("mint-b"),
+                    token_vault_b: test_pubkey("vault-b"),
+                    tick_spacing: 64,
+                    a_to_b: true,
+                }),
+                VenueExecutionConfig::RaydiumClmm(RaydiumClmmConfig {
+                    program_id: test_pubkey("raydium-clmm-program"),
+                    token_program_id: test_pubkey("spl-token-program"),
+                    token_program_2022_id: test_pubkey("spl-token-2022"),
+                    memo_program_id: test_pubkey("memo-program"),
+                    pool_state: test_pubkey("pool-state"),
+                    amm_config: test_pubkey("amm-config"),
+                    observation_state: test_pubkey("observation-state"),
+                    ex_bitmap_account: None,
+                    token_mint_0: test_pubkey("mint-a"),
+                    token_vault_0: test_pubkey("vault-0"),
+                    token_mint_1: test_pubkey("mint-b"),
+                    token_vault_1: test_pubkey("vault-1"),
+                    tick_spacing: 60,
+                    zero_for_one: true,
+                }),
+            ],
+        };
+
+        let fee_payer = parse_static_pubkey(&test_pubkey("fee-payer"));
+        let setup = associated_token_setup_instructions(&route_execution, fee_payer)
+            .expect("setup instructions");
+
+        assert_eq!(setup.len(), 2);
+        assert_eq!(setup[0].instruction.program_id, parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID));
+        assert_eq!(setup[1].instruction.program_id, parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID));
+        assert_eq!(setup[0].instruction.data, vec![1]);
+        assert_eq!(setup[1].instruction.data, vec![1]);
+        assert_eq!(
+            setup[0].instruction.accounts[1].pubkey,
+            associated_token_address(
+                &fee_payer,
+                &parse_static_pubkey(&test_pubkey("mint-a")),
+                &parse_static_pubkey(&test_pubkey("spl-token-program")),
+            )
+        );
+        assert_eq!(
+            setup[1].instruction.accounts[1].pubkey,
+            associated_token_address(
+                &fee_payer,
+                &parse_static_pubkey(&test_pubkey("mint-b")),
+                &parse_static_pubkey(&test_pubkey("spl-token-program")),
+            )
+        );
+    }
+
+    #[test]
     fn raydium_simple_buy_base_exact_out_uses_base_out_tag() {
         let config = RaydiumSimplePoolConfig {
             program_id: test_pubkey("raydium-program"),
@@ -834,8 +995,10 @@ mod tests {
             market_coin_vault: test_pubkey("market-coin-vault"),
             market_pc_vault: test_pubkey("market-pc-vault"),
             market_vault_signer: test_pubkey("market-vault-signer"),
-            user_source_token_account: test_pubkey("user-source"),
-            user_destination_token_account: test_pubkey("user-destination"),
+            user_source_token_account: Some(test_pubkey("user-source")),
+            user_destination_token_account: Some(test_pubkey("user-destination")),
+            user_source_mint: None,
+            user_destination_mint: None,
         };
         let fee_payer = parse_static_pubkey(&test_pubkey("fee-payer"));
         let instruction = compile_raydium_simple_pool(
@@ -854,8 +1017,8 @@ mod tests {
         .expect("raydium simple exact-out instruction");
 
         assert_eq!(instruction.data[0], RAYDIUM_SWAP_BASE_OUT_TAG);
-        assert_eq!(read_u64(&instruction.data, 1), 777);
-        assert_eq!(read_u64(&instruction.data, 9), 888);
+        assert_eq!(read_u64(&instruction.data, 1), 888);
+        assert_eq!(read_u64(&instruction.data, 9), 777);
     }
 
     #[test]
@@ -942,6 +1105,21 @@ fn associated_token_address(owner: &Pubkey, mint: &Pubkey, token_program: &Pubke
     .0
 }
 
+fn resolve_raydium_simple_user_token_account(
+    configured_account: Option<&str>,
+    derived_mint: Option<&str>,
+    token_program_id: &str,
+    fee_payer: Pubkey,
+) -> Result<Pubkey, BuildRejectionReason> {
+    if let Some(mint) = derived_mint {
+        let token_program = parse_pubkey(token_program_id)?;
+        let mint = parse_pubkey(mint)?;
+        return Ok(associated_token_address(&fee_payer, &mint, &token_program));
+    }
+
+    parse_pubkey(configured_account.ok_or(BuildRejectionReason::MessageCompilationFailed)?)
+}
+
 fn derive_orca_oracle(program_id: Pubkey, whirlpool: Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"oracle", whirlpool.as_ref()], &program_id).0
 }
@@ -985,6 +1163,28 @@ fn compute_budget_set_compute_unit_price(micro_lamports: u64) -> Instruction {
     }
 }
 
+fn create_associated_token_account_idempotent(
+    fee_payer: Pubkey,
+    mint: Pubkey,
+    token_program: Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID),
+        accounts: vec![
+            AccountMeta::new(fee_payer, true),
+            AccountMeta::new(
+                associated_token_address(&fee_payer, &mint, &token_program),
+                false,
+            ),
+            AccountMeta::new_readonly(fee_payer, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(parse_static_pubkey(SYSTEM_PROGRAM_ID), false),
+            AccountMeta::new_readonly(token_program, false),
+        ],
+        data: vec![1],
+    }
+}
+
 fn describe_instruction(
     label: &str,
     instruction: &Instruction,
@@ -1005,6 +1205,10 @@ fn describe_instruction(
             .collect(),
         data: instruction.data.clone(),
     }
+}
+
+fn short_label(value: &str) -> String {
+    value.chars().take(4).collect::<String>().to_ascii_lowercase()
 }
 
 fn account_source(
@@ -1035,4 +1239,19 @@ fn account_source(
 struct RouteLookupTable {
     account: AddressLookupTableAccount,
     metadata: ResolvedAddressLookupTable,
+}
+
+#[derive(Debug, Clone)]
+struct LabeledInstruction {
+    label: String,
+    instruction: Instruction,
+}
+
+impl LabeledInstruction {
+    fn new(label: impl Into<String>, instruction: Instruction) -> Self {
+        Self {
+            label: label.into(),
+            instruction,
+        }
+    }
 }
