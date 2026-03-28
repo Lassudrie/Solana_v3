@@ -276,6 +276,14 @@ fn default_shredstream_idle_refresh_slot_lag() -> u64 {
     128
 }
 
+fn default_shredstream_price_impact_trigger_bps() -> u16 {
+    1
+}
+
+fn default_shredstream_price_dislocation_trigger_bps() -> u16 {
+    5
+}
+
 fn default_account_batch_window_millis() -> u64 {
     20
 }
@@ -291,6 +299,10 @@ pub struct ShredstreamConfig {
     pub max_reconnect_backoff_millis: u64,
     #[serde(default = "default_shredstream_idle_refresh_slot_lag")]
     pub idle_refresh_slot_lag: u64,
+    #[serde(default = "default_shredstream_price_impact_trigger_bps")]
+    pub price_impact_trigger_bps: u16,
+    #[serde(default = "default_shredstream_price_dislocation_trigger_bps")]
+    pub price_dislocation_trigger_bps: u16,
     pub max_repair_in_flight: usize,
     #[serde(default)]
     pub reducers: LiveReducerConfig,
@@ -305,6 +317,8 @@ impl Default for ShredstreamConfig {
             reconnect_backoff_millis: 250,
             max_reconnect_backoff_millis: 5_000,
             idle_refresh_slot_lag: default_shredstream_idle_refresh_slot_lag(),
+            price_impact_trigger_bps: default_shredstream_price_impact_trigger_bps(),
+            price_dislocation_trigger_bps: default_shredstream_price_dislocation_trigger_bps(),
             max_repair_in_flight: 0,
             reducers: LiveReducerConfig::default(),
         }
@@ -376,18 +390,30 @@ impl Default for RouteClassConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteKindConfig {
+    #[default]
+    TwoLeg,
+    Triangular,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteConfig {
     #[serde(default = "default_route_enabled")]
     pub enabled: bool,
     #[serde(default)]
     pub route_class: RouteClassConfig,
+    #[serde(default)]
+    pub kind: RouteKindConfig,
     pub route_id: String,
     pub input_mint: String,
     pub output_mint: String,
     pub base_mint: Option<String>,
     pub quote_mint: Option<String>,
     pub sol_quote_conversion_pool_id: Option<String>,
+    #[serde(default)]
+    pub min_profit_quote_atoms: Option<i64>,
     pub default_trade_size: u64,
     pub max_trade_size: u64,
     #[serde(default)]
@@ -398,7 +424,7 @@ pub struct RouteConfig {
     pub sizing: RouteSizingConfig,
     #[serde(default)]
     pub execution_protection: RouteExecutionProtectionConfig,
-    pub legs: [RouteLegConfig; 2],
+    pub legs: Vec<RouteLegConfig>,
     pub account_dependencies: Vec<AccountDependencyConfig>,
     pub execution: RouteExecutionConfig,
 }
@@ -442,6 +468,10 @@ pub struct RouteLegConfig {
     pub venue: String,
     pub pool_id: String,
     pub side: SwapSideConfig,
+    #[serde(default)]
+    pub input_mint: Option<String>,
+    #[serde(default)]
+    pub output_mint: Option<String>,
     pub fee_bps: Option<u16>,
     pub execution: RouteLegExecutionConfig,
 }
@@ -467,6 +497,8 @@ pub struct RouteExecutionConfig {
     #[serde(default)]
     pub lookup_tables: Vec<LookupTableConfig>,
     pub default_compute_unit_limit: u32,
+    #[serde(default)]
+    pub minimum_compute_unit_limit: u32,
     pub default_compute_unit_price_micro_lamports: u64,
     pub default_jito_tip_lamports: u64,
     #[serde(default = "default_max_quote_slot_lag")]
@@ -583,6 +615,8 @@ fn default_max_alt_slot_lag() -> u64 {
 pub struct StrategyConfig {
     #[serde(alias = "min_profit_lamports")]
     pub min_profit_quote_atoms: i64,
+    #[serde(default)]
+    pub min_profit_bps: u16,
     pub max_snapshot_slot_lag: u64,
     pub require_route_warm: bool,
     pub max_inflight_submissions: usize,
@@ -596,6 +630,7 @@ impl Default for StrategyConfig {
     fn default() -> Self {
         Self {
             min_profit_quote_atoms: 10,
+            min_profit_bps: 0,
             max_snapshot_slot_lag: 2,
             require_route_warm: true,
             max_inflight_submissions: 64,
@@ -610,6 +645,7 @@ impl Default for StrategyConfig {
 #[serde(default)]
 pub struct StrategySizingConfig {
     pub mode: SizingModeConfig,
+    pub fixed_trade_size: bool,
     pub min_trade_floor_sol_lamports: u64,
     pub base_landing_rate_bps: u16,
     pub ewma_alpha_bps: u16,
@@ -627,6 +663,7 @@ impl Default for StrategySizingConfig {
     fn default() -> Self {
         Self {
             mode: SizingModeConfig::Legacy,
+            fixed_trade_size: false,
             min_trade_floor_sol_lamports: 100_000_000,
             base_landing_rate_bps: 8_500,
             ewma_alpha_bps: 2_000,
@@ -1057,7 +1094,7 @@ mod tests {
     };
 
     use super::{
-        BotConfig, EventSourceMode, ReducerRolloutMode, RuntimeProfileConfig,
+        BotConfig, EventSourceMode, ReducerRolloutMode, RouteKindConfig, RuntimeProfileConfig,
         SingleTransactionSubmitPolicyConfig,
     };
 
@@ -1189,6 +1226,190 @@ mod tests {
         assert_eq!(config.runtime.refresh.alt_refresh_millis, 250);
         assert_eq!(config.runtime.refresh.wallet_refresh_millis, 500);
         assert_eq!(config.submit.queue_capacity, 16);
+    }
+
+    #[test]
+    fn loads_triangular_route_manifest_fragment() {
+        let path = temp_path("bot-config-triangular", "toml");
+        let source = r#"
+[routes]
+
+[[routes.definitions]]
+kind = "triangular"
+route_id = "tri-sol-usdc-usdt"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+min_profit_quote_atoms = 500
+default_trade_size = 1000000
+max_trade_size = 5000000
+account_dependencies = []
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+side = "buy_base"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "So11111111111111111111111111111111111111112"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP"
+tick_spacing = 4
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3nMFqGfpkQkS5s3x2LqAoRrB5bkZ8kDz7mrR7b4qqEgF"
+side = "sell_base"
+input_mint = "So11111111111111111111111111111111111111112"
+output_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3nMFqGfpkQkS5s3x2LqAoRrB5bkZ8kDz7mrR7b4qqEgF"
+amm_config = "8Fa4bQ4wBq74UeX2TnQ1m4ZjtqQ3k6eXyJ6nLr4vj3ye"
+observation_state = "5xFfKLVwV1wXciP6Azh9QhP6vLwJhz6Yk5okioTZD2SW"
+ex_bitmap_account = "6L7vD5tqG7H3yWkVudRwyY6B9k4tQ6N7Fv9H8iA1m2Pq"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A"
+token_mint_1 = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_1 = "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo"
+tick_spacing = 1
+zero_for_one = true
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "4fuU3xhx6sqt8gmxsMUbEoQAcfEiZ2tXYWf1XhQxy4T4"
+side = "sell_base"
+input_mint = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+fee_bps = 1
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "4fuU3xhx6sqt8gmxsMUbEoQAcfEiZ2tXYWf1XhQxy4T4"
+token_mint_a = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+token_vault_a = "9SgM2Apxm7UQx6qgB2SUdkGFUTkqJCJSy9FHn5Vf3L7h"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "8vDk6X6Ka7N8xY2LBVmWHgrnJp4y8S6Wq5Zbgx5caGV5"
+tick_spacing = 1
+a_to_b = true
+
+[routes.definitions.execution]
+default_compute_unit_limit = 450000
+minimum_compute_unit_limit = 420000
+default_compute_unit_price_micro_lamports = 25000
+default_jito_tip_lamports = 5000
+"#;
+
+        fs::write(&path, source).unwrap();
+        let loaded = BotConfig::from_path(&path).expect("triangular manifest should load");
+
+        assert_eq!(loaded.routes.definitions.len(), 1);
+        let route = &loaded.routes.definitions[0];
+        assert_eq!(route.kind, RouteKindConfig::Triangular);
+        assert_eq!(route.min_profit_quote_atoms, Some(500));
+        assert_eq!(route.legs.len(), 3);
+        assert_eq!(
+            route.legs[1].input_mint.as_deref(),
+            Some("So11111111111111111111111111111111111111112")
+        );
+        assert_eq!(route.execution.minimum_compute_unit_limit, 420_000);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn two_leg_route_kind_defaults_when_omitted() {
+        let path = temp_path("bot-config-two-leg-default", "toml");
+        let source = r#"
+[routes]
+
+[[routes.definitions]]
+route_id = "legacy-two-leg"
+input_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+output_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+base_mint = "So11111111111111111111111111111111111111112"
+quote_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+sol_quote_conversion_pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+default_trade_size = 1000000
+max_trade_size = 5000000
+account_dependencies = []
+
+[[routes.definitions.legs]]
+venue = "orca_whirlpool"
+pool_id = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+side = "buy_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "orca_whirlpool"
+program_id = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+whirlpool = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+token_mint_a = "So11111111111111111111111111111111111111112"
+token_vault_a = "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9"
+token_mint_b = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_b = "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP"
+tick_spacing = 4
+a_to_b = false
+
+[[routes.definitions.legs]]
+venue = "raydium_clmm"
+pool_id = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+side = "sell_base"
+fee_bps = 4
+
+[routes.definitions.legs.execution]
+kind = "raydium_clmm"
+program_id = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"
+token_program_id = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+token_program_2022_id = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+memo_program_id = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+pool_state = "3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv"
+amm_config = "3h2e43PunVA5K34vwKCLHWhZF4aZpyaC9RmxvshGAQpL"
+observation_state = "3Y695CuQ8AP4anbwAqiEBeQF9KxqHFr8piEwvw3UePnQ"
+ex_bitmap_account = "4NFvUKqknMpoe6CWTzK758B8ojVLzURL5pC6MtiaJ8TQ"
+token_mint_0 = "So11111111111111111111111111111111111111112"
+token_vault_0 = "4ct7br2vTPzfdmY3S5HLtTxcGSBfn6pnw98hsS6v359A"
+token_mint_1 = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+token_vault_1 = "5it83u57VRrVgc51oNV19TTmAJuffPx5GtGwQr7gQNUo"
+tick_spacing = 1
+zero_for_one = true
+
+[routes.definitions.execution]
+default_compute_unit_limit = 300000
+default_compute_unit_price_micro_lamports = 25000
+default_jito_tip_lamports = 5000
+"#;
+
+        fs::write(&path, source).unwrap();
+        let loaded = BotConfig::from_path(&path).expect("legacy two-leg manifest should load");
+
+        assert_eq!(loaded.routes.definitions.len(), 1);
+        let route = &loaded.routes.definitions[0];
+        assert_eq!(route.kind, RouteKindConfig::TwoLeg);
+        assert_eq!(route.legs.len(), 2);
+        assert_eq!(route.legs[0].input_mint, None);
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1375,6 +1596,47 @@ default_jito_tip_lamports = 5000
         );
         assert_eq!(loaded.reconciliation.rpc_ws_endpoint, "ws://127.0.0.1:8900");
         assert!(loaded.rpc_submit.enabled);
+    }
+
+    #[test]
+    fn loads_generated_triangular_manifest_with_closed_three_leg_routes() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("amm_12_pairs_triangular_fast.toml");
+        let loaded = BotConfig::from_path(path).unwrap();
+
+        assert_eq!(loaded.runtime.profile, RuntimeProfileConfig::UltraFast);
+        assert_eq!(loaded.routes.definitions.len(), 96);
+        assert!(
+            loaded
+                .routes
+                .definitions
+                .iter()
+                .all(|route| route.kind == RouteKindConfig::Triangular)
+        );
+        assert!(
+            loaded
+                .routes
+                .definitions
+                .iter()
+                .all(|route| route.legs.len() == 3)
+        );
+        assert!(
+            loaded
+                .routes
+                .definitions
+                .iter()
+                .all(|route| route.input_mint == route.output_mint)
+        );
+        assert!(loaded.routes.definitions.iter().all(|route| {
+            route.execution.minimum_compute_unit_limit >= 420_000
+                && route
+                    .legs
+                    .windows(2)
+                    .all(|legs| legs[0].output_mint == legs[1].input_mint)
+                && route.legs[2].output_mint.as_deref() == Some(route.input_mint.as_str())
+        }));
     }
 
     fn temp_path(prefix: &str, extension: &str) -> PathBuf {

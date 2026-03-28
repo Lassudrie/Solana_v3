@@ -24,10 +24,10 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use domain::{
     ConcentratedLiquidityPoolState, ConcentratedQuoteModel, ConstantProductPoolState,
-    DirectionalConcentratedQuoteModel, ExecutablePoolState, ExecutablePoolStateStore,
-    LookupTableSnapshot, ORCA_WHIRLPOOL_TICK_ARRAY_SIZE, PoolConfidence, PoolId, PoolVenue,
-    RAYDIUM_CLMM_TICK_ARRAY_SIZE, derive_orca_tick_arrays, derive_raydium_tick_arrays,
-    tick_array_end_index, tick_array_start_index,
+    DestabilizingTransaction, DirectionalConcentratedQuoteModel, ExecutablePoolState,
+    ExecutablePoolStateStore, LookupTableSnapshot, ORCA_WHIRLPOOL_TICK_ARRAY_SIZE, PoolConfidence,
+    PoolId, PoolVenue, RAYDIUM_CLMM_TICK_ARRAY_SIZE, derive_orca_tick_arrays,
+    derive_raydium_tick_arrays, tick_array_end_index, tick_array_start_index,
 };
 use prost_types::Timestamp as ProstTimestamp;
 use solana_entry_legacy::entry::Entry as LegacyEntry;
@@ -84,6 +84,26 @@ pub enum LiveRepairTransition {
     RepairSucceeded,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveDestabilizationKind {
+    Unclassified,
+    Candidate,
+    Triggered,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveDestabilizationEvent {
+    pub pool_id: String,
+    pub observed_slot: u64,
+    pub kind: LiveDestabilizationKind,
+    pub input_amount: Option<u64>,
+    pub estimated_price_impact_bps: Option<u16>,
+    pub estimated_price_dislocation_bps: Option<u16>,
+    pub estimated_net_edge_bps: Option<u16>,
+    pub impact_floor_bps: u16,
+    pub dislocation_trigger_bps: u16,
+}
+
 pub trait LiveHooks: Send + Sync {
     fn pool_is_blocked_from_repair(&self, _pool_id: &str, _observed_slot: u64) -> bool {
         false
@@ -98,6 +118,8 @@ pub trait LiveHooks: Send + Sync {
         _observed_slot: u64,
     ) {
     }
+
+    fn publish_destabilization(&self, _event: LiveDestabilizationEvent) {}
 }
 
 #[derive(Debug, Default)]
@@ -238,6 +260,8 @@ pub struct GrpcEntriesConfig {
     pub reconnect_backoff_millis: u64,
     pub max_reconnect_backoff_millis: u64,
     pub idle_refresh_slot_lag: u64,
+    pub price_impact_trigger_bps: u16,
+    pub price_dislocation_trigger_bps: u16,
     pub max_repair_in_flight: usize,
     pub tracked_pools: Vec<TrackedPool>,
     pub lookup_table_keys: Vec<String>,
@@ -412,6 +436,15 @@ pub struct TrackedPool {
 }
 
 impl TrackedPool {
+    fn token_pair(&self) -> (&str, &str) {
+        match &self.kind {
+            TrackedPoolKind::OrcaSimple(config) => (&config.token_mint_a, &config.token_mint_b),
+            TrackedPoolKind::RaydiumSimple(config) => (&config.token_mint_a, &config.token_mint_b),
+            TrackedPoolKind::OrcaWhirlpool(config) => (&config.token_mint_a, &config.token_mint_b),
+            TrackedPoolKind::RaydiumClmm(config) => (&config.token_mint_a, &config.token_mint_b),
+        }
+    }
+
     fn repair_account_keys(&self) -> Vec<String> {
         match &self.kind {
             TrackedPoolKind::OrcaSimple(config) => vec![
@@ -998,6 +1031,7 @@ struct ResolvedInstruction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedTransaction {
+    signature: Option<String>,
     account_keys: Vec<String>,
     writable_account_keys: Vec<String>,
     instructions: Vec<ResolvedInstruction>,
@@ -1046,6 +1080,43 @@ impl PoolMutation {
             | Self::RaydiumClmmSwap { pool_id, .. } => pool_id,
         }
     }
+
+    fn reference_input_amount(&self) -> Option<u64> {
+        let amount = match self {
+            Self::OrcaSimpleSwap { amount_in, .. } => *amount_in,
+            Self::RaydiumSimpleSwap {
+                exact_out,
+                amount_specified,
+                min_output_amount,
+                ..
+            } => {
+                if *exact_out {
+                    (*amount_specified).max(*min_output_amount)
+                } else {
+                    *amount_specified
+                }
+            }
+            Self::OrcaWhirlpoolSwap {
+                amount,
+                other_amount_threshold,
+                exact_out,
+                ..
+            }
+            | Self::RaydiumClmmSwap {
+                amount,
+                other_amount_threshold,
+                exact_out,
+                ..
+            } => {
+                if *exact_out {
+                    (*amount).max(*other_amount_threshold)
+                } else {
+                    *amount
+                }
+            }
+        };
+        (amount > 0).then_some(amount)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1068,6 +1139,24 @@ struct ExactReduction {
     refresh_required: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingDestabilization {
+    pool_id: String,
+    venue: domain::PoolVenue,
+    signature: Option<String>,
+    baseline_snapshot: domain::PoolSnapshot,
+    input_amount: u64,
+    estimated_price_impact_bps: u16,
+    estimated_price_dislocation_bps: u16,
+    estimated_net_edge_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrossPoolEdgeEstimate {
+    dislocation_bps: u16,
+    net_edge_bps: u16,
+}
+
 fn spawn_stream_worker(
     config: &GrpcEntriesConfig,
     registry: Arc<TrackedPoolRegistry>,
@@ -1085,6 +1174,8 @@ fn spawn_stream_worker(
     let base_backoff = Duration::from_millis(config.reconnect_backoff_millis.max(1));
     let max_backoff = Duration::from_millis(config.max_reconnect_backoff_millis.max(1));
     let idle_refresh_slot_lag = config.idle_refresh_slot_lag;
+    let price_impact_trigger_bps = config.price_impact_trigger_bps;
+    let price_dislocation_trigger_bps = config.price_dislocation_trigger_bps;
 
     thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1155,6 +1246,8 @@ fn spawn_stream_worker(
                         &repair_tx,
                         &sequence,
                         idle_refresh_slot_lag,
+                        price_impact_trigger_bps,
+                        price_dislocation_trigger_bps,
                         hooks.as_ref(),
                     );
                 }
@@ -1180,6 +1273,8 @@ fn handle_entry_batch(
     repair_tx: &mpsc::Sender<RepairRequest>,
     sequence: &Arc<AtomicU64>,
     idle_refresh_slot_lag: u64,
+    price_impact_trigger_bps: u16,
+    price_dislocation_trigger_bps: u16,
     hooks: &dyn LiveHooks,
 ) {
     let Ok(entries) = bincode::deserialize::<Vec<LegacyEntry>>(payload) else {
@@ -1213,6 +1308,8 @@ fn handle_entry_batch(
                 continue;
             };
             let mut handled_pools = HashSet::new();
+            let mut pending_destabilizations = HashMap::new();
+            let mut observed_destabilization_pools = HashSet::new();
 
             for instruction in &resolved.instructions {
                 let Some(mutation) = registry.decode_instruction(instruction) else {
@@ -1224,57 +1321,54 @@ fn handle_entry_batch(
                     continue;
                 };
                 match tracked_pool.reducer_mode {
-                    ReducerRolloutMode::Active => match apply_mutation_exact(
-                        slot,
-                        &tracked_pool,
-                        &mutation,
-                        executable_states,
-                    ) {
-                        ExactMutationOutcome::Applied(reduction) => {
-                            publish_pool_snapshot_update(
-                                event_tx,
-                                sequence,
-                                slot,
-                                source_received_at,
-                                source_latency,
-                                &reduction.next_state,
-                            );
-                            if let Some(quote_model_update) = reduction.quote_model_update {
-                                publish_pool_quote_model_update(
+                    ReducerRolloutMode::Active => {
+                        observed_destabilization_pools.insert(pool_id.clone());
+                        accumulate_destabilization_candidate(
+                            slot,
+                            &resolved,
+                            &tracked_pool,
+                            &mutation,
+                            executable_states,
+                            &mut pending_destabilizations,
+                        );
+                        match apply_mutation_exact(
+                            slot,
+                            &tracked_pool,
+                            &mutation,
+                            executable_states,
+                        ) {
+                            ExactMutationOutcome::Applied(reduction) => {
+                                publish_pool_snapshot_update(
                                     event_tx,
                                     sequence,
                                     slot,
                                     source_received_at,
                                     source_latency,
-                                    quote_model_update,
+                                    &reduction.next_state,
                                 );
+                                if let Some(quote_model_update) = reduction.quote_model_update {
+                                    publish_pool_quote_model_update(
+                                        event_tx,
+                                        sequence,
+                                        slot,
+                                        source_received_at,
+                                        source_latency,
+                                        quote_model_update,
+                                    );
+                                }
+                                if reduction.refresh_required {
+                                    schedule_background_refresh(
+                                        &tracked_pool,
+                                        slot,
+                                        slot,
+                                        sync_tracker,
+                                        repair_tx,
+                                        hooks,
+                                        source_received_at,
+                                    );
+                                }
                             }
-                            if reduction.refresh_required {
-                                schedule_background_refresh(
-                                    &tracked_pool,
-                                    slot,
-                                    slot,
-                                    sync_tracker,
-                                    repair_tx,
-                                    hooks,
-                                    source_received_at,
-                                );
-                            }
-                        }
-                        ExactMutationOutcome::RefreshRequired => schedule_exact_refresh(
-                            &tracked_pool,
-                            slot,
-                            source_received_at,
-                            source_latency,
-                            executable_states,
-                            sync_tracker,
-                            event_tx,
-                            repair_tx,
-                            sequence,
-                            hooks,
-                        ),
-                        ExactMutationOutcome::Invalid if tracked_pool.uses_hybrid_refresh() => {
-                            schedule_exact_refresh(
+                            ExactMutationOutcome::RefreshRequired => schedule_exact_refresh(
                                 &tracked_pool,
                                 slot,
                                 source_received_at,
@@ -1285,22 +1379,36 @@ fn handle_entry_batch(
                                 repair_tx,
                                 sequence,
                                 hooks,
-                            )
+                            ),
+                            ExactMutationOutcome::Invalid if tracked_pool.uses_hybrid_refresh() => {
+                                schedule_exact_refresh(
+                                    &tracked_pool,
+                                    slot,
+                                    source_received_at,
+                                    source_latency,
+                                    executable_states,
+                                    sync_tracker,
+                                    event_tx,
+                                    repair_tx,
+                                    sequence,
+                                    hooks,
+                                )
+                            }
+                            ExactMutationOutcome::Invalid => invalidate_and_repair(
+                                &tracked_pool,
+                                slot,
+                                source_received_at,
+                                source_latency,
+                                executable_states,
+                                sync_tracker,
+                                event_tx,
+                                repair_tx,
+                                sequence,
+                                hooks,
+                                &mut invalidated_pools,
+                            ),
                         }
-                        ExactMutationOutcome::Invalid => invalidate_and_repair(
-                            &tracked_pool,
-                            slot,
-                            source_received_at,
-                            source_latency,
-                            executable_states,
-                            sync_tracker,
-                            event_tx,
-                            repair_tx,
-                            sequence,
-                            hooks,
-                            &mut invalidated_pools,
-                        ),
-                    },
+                    }
                     ReducerRolloutMode::Shadow => {
                         apply_mutation_shadow(slot, &tracked_pool, &mutation, executable_states);
                         invalidate_and_repair(
@@ -1331,6 +1439,73 @@ fn handle_entry_batch(
                         &mut invalidated_pools,
                     ),
                 }
+            }
+
+            for pool_id in observed_destabilization_pools {
+                let Some(mut destabilization) = pending_destabilizations.remove(&pool_id) else {
+                    hooks.publish_destabilization(LiveDestabilizationEvent {
+                        pool_id,
+                        observed_slot: slot,
+                        kind: LiveDestabilizationKind::Unclassified,
+                        input_amount: None,
+                        estimated_price_impact_bps: None,
+                        estimated_price_dislocation_bps: None,
+                        estimated_net_edge_bps: None,
+                        impact_floor_bps: price_impact_trigger_bps,
+                        dislocation_trigger_bps: price_dislocation_trigger_bps,
+                    });
+                    continue;
+                };
+                if let Some(edge_estimate) = estimate_cross_pool_edge_bps(
+                    registry,
+                    executable_states,
+                    slot,
+                    &destabilization.pool_id,
+                    destabilization.input_amount,
+                ) {
+                    destabilization.estimated_price_dislocation_bps = edge_estimate.dislocation_bps;
+                    destabilization.estimated_net_edge_bps = edge_estimate.net_edge_bps;
+                }
+                hooks.publish_destabilization(LiveDestabilizationEvent {
+                    pool_id: destabilization.pool_id.clone(),
+                    observed_slot: slot,
+                    kind: LiveDestabilizationKind::Candidate,
+                    input_amount: Some(destabilization.input_amount),
+                    estimated_price_impact_bps: Some(destabilization.estimated_price_impact_bps),
+                    estimated_price_dislocation_bps: Some(
+                        destabilization.estimated_price_dislocation_bps,
+                    ),
+                    estimated_net_edge_bps: Some(destabilization.estimated_net_edge_bps),
+                    impact_floor_bps: price_impact_trigger_bps,
+                    dislocation_trigger_bps: price_dislocation_trigger_bps,
+                });
+                if destabilization.estimated_price_impact_bps < price_impact_trigger_bps
+                    || destabilization.estimated_net_edge_bps < price_dislocation_trigger_bps
+                {
+                    continue;
+                }
+                hooks.publish_destabilization(LiveDestabilizationEvent {
+                    pool_id: destabilization.pool_id.clone(),
+                    observed_slot: slot,
+                    kind: LiveDestabilizationKind::Triggered,
+                    input_amount: Some(destabilization.input_amount),
+                    estimated_price_impact_bps: Some(destabilization.estimated_price_impact_bps),
+                    estimated_price_dislocation_bps: Some(
+                        destabilization.estimated_price_dislocation_bps,
+                    ),
+                    estimated_net_edge_bps: Some(destabilization.estimated_net_edge_bps),
+                    impact_floor_bps: price_impact_trigger_bps,
+                    dislocation_trigger_bps: price_dislocation_trigger_bps,
+                });
+                publish_destabilizing_transaction(
+                    event_tx,
+                    sequence,
+                    slot,
+                    source_received_at,
+                    source_latency,
+                    price_dislocation_trigger_bps,
+                    destabilization,
+                );
             }
 
             for tracked_pool in registry.touched_pools(&resolved.writable_account_keys) {
@@ -1432,6 +1607,10 @@ fn resolve_transaction(
                 resolved_account_keys.push(account_key);
             }
             return Some(ResolvedTransaction {
+                signature: transaction
+                    .signatures
+                    .first()
+                    .map(|signature| signature.to_string()),
                 account_keys: resolved_account_keys,
                 writable_account_keys,
                 instructions: transaction
@@ -1461,6 +1640,10 @@ fn resolve_transaction(
         resolved_account_keys.push(account_key);
     }
     Some(ResolvedTransaction {
+        signature: transaction
+            .signatures
+            .first()
+            .map(|signature| signature.to_string()),
         account_keys: resolved_account_keys,
         writable_account_keys,
         instructions: transaction
@@ -1886,7 +2069,8 @@ where
             | QuoteError::InvalidSnapshotLiquidity
             | QuoteError::InvalidSnapshotPrice
             | QuoteError::ExecutionCostNotConvertible
-            | QuoteError::InvalidRouteShape,
+            | QuoteError::InvalidRouteShape
+            | QuoteError::ZeroOutput { .. },
         ) => return ExactMutationOutcome::Invalid,
     };
 
@@ -2775,6 +2959,182 @@ fn publish_pool_quote_model_update(
         source_received_at,
         source_latency,
         crate::MarketEvent::PoolQuoteModelUpdate(update),
+    );
+    send_lossless_event(event_tx, event);
+}
+
+fn current_snapshot_for_destabilization(
+    executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
+    pool_id: &str,
+    slot: u64,
+) -> Option<domain::PoolSnapshot> {
+    let pool_id = PoolId(pool_id.to_string());
+    let store = executable_states.read().ok()?;
+    let state = store.get(&pool_id)?;
+    Some(state.to_pool_snapshot(slot, 0))
+}
+
+fn accumulate_destabilization_candidate(
+    slot: u64,
+    resolved: &ResolvedTransaction,
+    tracked_pool: &TrackedPool,
+    mutation: &PoolMutation,
+    executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
+    pending: &mut HashMap<String, PendingDestabilization>,
+) {
+    let Some(reference_input_amount) = mutation.reference_input_amount() else {
+        return;
+    };
+    let pool_id = tracked_pool.pool_id.clone();
+    if !pending.contains_key(&pool_id) {
+        let Some(snapshot) =
+            current_snapshot_for_destabilization(executable_states, &pool_id, slot)
+        else {
+            return;
+        };
+        pending.insert(
+            pool_id.clone(),
+            PendingDestabilization {
+                pool_id: pool_id.clone(),
+                venue: snapshot.venue.unwrap_or(domain::PoolVenue::OrcaSimplePool),
+                signature: resolved.signature.clone(),
+                baseline_snapshot: snapshot,
+                input_amount: 0,
+                estimated_price_impact_bps: 0,
+                estimated_price_dislocation_bps: 0,
+                estimated_net_edge_bps: 0,
+            },
+        );
+    }
+    let Some(candidate) = pending.get_mut(&pool_id) else {
+        return;
+    };
+    candidate.input_amount = candidate
+        .input_amount
+        .saturating_add(reference_input_amount);
+    candidate.estimated_price_impact_bps = candidate
+        .baseline_snapshot
+        .estimated_slippage_bps(candidate.input_amount);
+}
+
+fn estimate_cross_pool_edge_bps(
+    registry: &TrackedPoolRegistry,
+    executable_states: &Arc<RwLock<LiveExecutableStateStore>>,
+    slot: u64,
+    pool_id: &str,
+    input_amount: u64,
+) -> Option<CrossPoolEdgeEstimate> {
+    let tracked_pool = registry.tracked_pool(pool_id)?;
+    let (token_mint_a, token_mint_b) = tracked_pool.token_pair();
+    let target_snapshot = current_snapshot_for_destabilization(executable_states, pool_id, slot)?;
+    if !target_snapshot.is_executable() {
+        return None;
+    }
+    let target_price_bps =
+        normalize_price_bps(&target_snapshot, token_mint_a, token_mint_b)?.max(1);
+    let target_slippage_bps = target_snapshot.estimated_slippage_bps(input_amount);
+    let mut best_estimate: Option<CrossPoolEdgeEstimate> = None;
+    for peer in registry.pools_by_id.values() {
+        if peer.pool_id == pool_id {
+            continue;
+        }
+        let (peer_mint_a, peer_mint_b) = peer.token_pair();
+        let same_pair = (peer_mint_a == token_mint_a && peer_mint_b == token_mint_b)
+            || (peer_mint_a == token_mint_b && peer_mint_b == token_mint_a);
+        if !same_pair {
+            continue;
+        }
+        let Some(peer_snapshot) =
+            current_snapshot_for_destabilization(executable_states, &peer.pool_id, slot)
+        else {
+            continue;
+        };
+        if !peer_snapshot.is_executable() {
+            continue;
+        }
+        let Some(peer_price_bps) = normalize_price_bps(&peer_snapshot, token_mint_a, token_mint_b)
+        else {
+            continue;
+        };
+        let dislocation_bps = relative_price_dislocation_bps(target_price_bps, peer_price_bps);
+        let peer_slippage_bps = peer_snapshot.estimated_slippage_bps(input_amount);
+        let total_cost_bps = u32::from(target_snapshot.fee_bps)
+            .saturating_add(u32::from(peer_snapshot.fee_bps))
+            .saturating_add(u32::from(target_slippage_bps))
+            .saturating_add(u32::from(peer_slippage_bps));
+        let net_edge_bps =
+            dislocation_bps.saturating_sub(total_cost_bps.min(u32::from(u16::MAX)) as u16);
+        let candidate = CrossPoolEdgeEstimate {
+            dislocation_bps,
+            net_edge_bps,
+        };
+        best_estimate = Some(match best_estimate {
+            Some(current)
+                if current.net_edge_bps > candidate.net_edge_bps
+                    || (current.net_edge_bps == candidate.net_edge_bps
+                        && current.dislocation_bps >= candidate.dislocation_bps) =>
+            {
+                current
+            }
+            _ => candidate,
+        });
+    }
+    best_estimate
+}
+
+fn normalize_price_bps(
+    snapshot: &domain::PoolSnapshot,
+    token_mint_a: &str,
+    token_mint_b: &str,
+) -> Option<u64> {
+    let price_bps = snapshot.price_bps.max(1);
+    if snapshot.token_mint_a == token_mint_a && snapshot.token_mint_b == token_mint_b {
+        Some(price_bps)
+    } else if snapshot.token_mint_a == token_mint_b && snapshot.token_mint_b == token_mint_a {
+        let numerator = 10_000u128.saturating_mul(10_000u128);
+        Some(
+            numerator
+                .saturating_add(u128::from(price_bps).saturating_sub(1))
+                .saturating_div(u128::from(price_bps))
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    } else {
+        None
+    }
+}
+
+fn relative_price_dislocation_bps(left_price_bps: u64, right_price_bps: u64) -> u16 {
+    let low = left_price_bps.min(right_price_bps).max(1);
+    let high = left_price_bps.max(right_price_bps);
+    let spread = u128::from(high.saturating_sub(low))
+        .saturating_mul(10_000)
+        .saturating_div(u128::from(low));
+    spread.min(u128::from(u16::MAX)) as u16
+}
+
+fn publish_destabilizing_transaction(
+    event_tx: &SyncSender<NormalizedEvent>,
+    sequence: &Arc<AtomicU64>,
+    slot: u64,
+    source_received_at: SystemTime,
+    source_latency: Option<Duration>,
+    trigger_threshold_bps: u16,
+    destabilization: PendingDestabilization,
+) {
+    let event = event_with_timing(
+        next_sequence(sequence),
+        slot,
+        source_received_at,
+        source_latency,
+        crate::MarketEvent::DestabilizingTransaction(DestabilizingTransaction {
+            pool_id: destabilization.pool_id,
+            venue: destabilization.venue,
+            slot,
+            signature: destabilization.signature,
+            input_amount: destabilization.input_amount,
+            estimated_price_impact_bps: destabilization.estimated_price_impact_bps,
+            trigger_threshold_bps,
+        }),
     );
     send_lossless_event(event_tx, event);
 }
@@ -4544,6 +4904,8 @@ mod tests {
             reconnect_backoff_millis: 100,
             max_reconnect_backoff_millis: 1_000,
             idle_refresh_slot_lag: 32,
+            price_impact_trigger_bps: 5,
+            price_dislocation_trigger_bps: 5,
             max_repair_in_flight: 2,
             lookup_table_keys: vec!["table-a".into(), "table-b".into()],
             tracked_pools: vec![

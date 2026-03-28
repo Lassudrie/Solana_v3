@@ -8,9 +8,9 @@ use std::{
 };
 
 use bot::observer::{
-    MonitorOverview, MonitorSignalsResponse, MonitorSnapshot, MonitorTradeEvent,
-    MonitorTradesResponse, PoolsResponse, RejectionEvent, RejectionsResponse, RouteMonitorView,
-    RoutesResponse,
+    MonitorEdgeResponse, MonitorEdgeRouteView, MonitorOverview, MonitorSignalsResponse,
+    MonitorSnapshot, MonitorTradeEvent, MonitorTradesResponse, PoolsResponse, RejectionEvent,
+    RejectionsResponse, RouteMonitorView, RoutesResponse,
 };
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -72,6 +72,16 @@ enum Command {
     Trades {
         #[arg(long, default_value = "all")]
         status: String,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        watch: bool,
+    },
+    Edge {
+        #[arg(long, default_value = "captured")]
+        sort: String,
+        #[arg(long)]
+        filter: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
@@ -154,6 +164,20 @@ impl ApiClient {
 
     fn snapshot(&self) -> Result<MonitorSnapshot, Box<dyn Error>> {
         self.get_json("/monitor/snapshot")
+    }
+
+    fn edge(
+        &self,
+        sort: &str,
+        filter: Option<&str>,
+        limit: usize,
+    ) -> Result<MonitorEdgeResponse, Box<dyn Error>> {
+        let mut path = format!("/monitor/edge?sort={sort}&limit={limit}");
+        if let Some(filter) = filter {
+            path.push_str("&filter=");
+            path.push_str(filter);
+        }
+        self.get_json(&path)
     }
 
     fn routes(
@@ -420,6 +444,12 @@ fn run() -> Result<(), Box<dyn Error>> {
             limit,
             watch,
         } => watch_or_once(watch, || print_trades(&api, &status, limit)),
+        Command::Edge {
+            sort,
+            filter,
+            limit,
+            watch,
+        } => watch_or_once(watch, || print_edge(&api, &sort, filter.as_deref(), limit)),
         Command::Routes {
             status,
             filter,
@@ -505,6 +535,70 @@ fn print_status(api: &ApiClient) -> Result<(), Box<dyn Error>> {
         "shredstream_eps: {}",
         overview.shredstream_events_per_second
     );
+    println!(
+        "destabilization: impact_floor_bps={} dislocation_trigger_bps={} candidates={} triggers={} unclassified={}",
+        overview.destabilizing_price_impact_floor_bps,
+        overview.destabilizing_price_dislocation_trigger_bps,
+        overview.destabilizing_candidate_count,
+        overview.destabilizing_trigger_count,
+        overview.destabilizing_unclassified_count
+    );
+    println!(
+        "destabilization_impacts_bps: p95={} max={}",
+        overview
+            .destabilizing_candidate_p95_price_impact_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .destabilizing_candidate_max_price_impact_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "destabilization_dislocations_bps: p95={} max={}",
+        overview
+            .destabilizing_candidate_p95_price_dislocation_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .destabilizing_candidate_max_price_dislocation_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "destabilization_net_edge_bps: p95={} max={}",
+        overview
+            .destabilizing_candidate_p95_net_edge_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .destabilizing_candidate_max_net_edge_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
+    println!(
+        "last_destabilizing_trigger: pool={} slot={} impact_bps={} dislocation_bps={} net_edge_bps={}",
+        overview
+            .last_destabilizing_trigger_pool_id
+            .clone()
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .last_destabilizing_trigger_slot
+            .map(|slot| slot.to_string())
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .last_destabilizing_trigger_price_impact_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .last_destabilizing_trigger_price_dislocation_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into()),
+        overview
+            .last_destabilizing_trigger_net_edge_bps
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    );
     println!("detect_events: {}", overview.detect_events);
     println!("rejections: {}", overview.rejection_count);
     println!("submits: {}", overview.submit_count);
@@ -515,6 +609,15 @@ fn print_status(api: &ApiClient) -> Result<(), Box<dyn Error>> {
         "expected_session_pnl_quote_atoms: {}",
         overview.expected_session_pnl_quote_atoms
     );
+    println!(
+        "captured_expected_session_pnl_quote_atoms: {}",
+        overview.captured_expected_session_pnl_quote_atoms
+    );
+    println!(
+        "missed_expected_session_pnl_quote_atoms: {}",
+        overview.missed_expected_session_pnl_quote_atoms
+    );
+    println!("edge_capture_rate_bps: {}", overview.edge_capture_rate_bps);
     println!(
         "realized_session_pnl_quote_atoms: {}",
         overview.realized_session_pnl_quote_atoms
@@ -619,6 +722,58 @@ fn print_rejects(api: &ApiClient, stage: &str, limit: usize) -> Result<(), Box<d
 fn print_trades(api: &ApiClient, status: &str, limit: usize) -> Result<(), Box<dyn Error>> {
     let response = api.trades(status, limit)?;
     print_trade_table(response.items);
+    Ok(())
+}
+
+fn print_edge(
+    api: &ApiClient,
+    sort: &str,
+    filter: Option<&str>,
+    limit: usize,
+) -> Result<(), Box<dyn Error>> {
+    let response = api.edge(sort, filter, limit)?;
+    println!("trade_count: {}", response.overview.trade_count);
+    println!("pending_count: {}", response.overview.pending_count);
+    println!("included_count: {}", response.overview.included_count);
+    println!("failed_count: {}", response.overview.failed_count);
+    println!(
+        "submit_rejected_count: {}",
+        response.overview.submit_rejected_count
+    );
+    println!(
+        "expected_session_pnl_quote_atoms: {}",
+        response.overview.expected_session_pnl_quote_atoms
+    );
+    println!(
+        "captured_expected_session_pnl_quote_atoms: {}",
+        response.overview.captured_expected_session_pnl_quote_atoms
+    );
+    println!(
+        "missed_expected_session_pnl_quote_atoms: {}",
+        response.overview.missed_expected_session_pnl_quote_atoms
+    );
+    println!(
+        "edge_capture_rate_bps: {}",
+        response.overview.edge_capture_rate_bps
+    );
+    println!(
+        "realized_session_pnl_quote_atoms: {}",
+        response.overview.realized_session_pnl_quote_atoms
+    );
+    println!(
+        "pnl_realization_rate_bps: {}",
+        response.overview.pnl_realization_rate_bps
+    );
+    println!(
+        "avg_source_to_submit_nanos: {}",
+        display_optional_u64(response.overview.avg_source_to_submit_nanos)
+    );
+    println!(
+        "avg_source_to_terminal_nanos: {}",
+        display_optional_u64(response.overview.avg_source_to_terminal_nanos)
+    );
+    println!();
+    print_edge_table(response.routes);
     Ok(())
 }
 
@@ -801,6 +956,54 @@ fn print_trade_table(items: Vec<MonitorTradeEvent>) {
                     .unwrap_or_else(|| "-".into()),
                 display_optional_u64(item.submitted_slot),
                 item.submission_id,
+            ]
+        }),
+    );
+}
+
+fn print_edge_table(items: Vec<MonitorEdgeRouteView>) {
+    print_table(
+        [
+            "route",
+            "state",
+            "live",
+            "sel",
+            "inc",
+            "fail",
+            "cap_bps",
+            "real_bps",
+            "exp_pnl",
+            "cap_pnl",
+            "miss_pnl",
+            "real_pnl",
+            "avg_submit_ns",
+            "avg_term_ns",
+            "buffer_bps",
+        ],
+        items.into_iter().map(|item| {
+            [
+                item.route_id,
+                item.health_state
+                    .map(route_health_label)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                item.eligible_live
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                item.selected_count.to_string(),
+                item.included_count.to_string(),
+                item.failed_count.to_string(),
+                item.edge_capture_rate_bps.to_string(),
+                item.pnl_realization_rate_bps.to_string(),
+                item.expected_pnl_quote_atoms.to_string(),
+                item.captured_expected_pnl_quote_atoms.to_string(),
+                item.missed_expected_pnl_quote_atoms.to_string(),
+                item.realized_pnl_quote_atoms.to_string(),
+                display_optional_u64(item.avg_source_to_submit_nanos),
+                display_optional_u64(item.avg_source_to_terminal_nanos),
+                item.last_active_execution_buffer_bps
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
             ]
         }),
     );
@@ -1600,9 +1803,28 @@ mod tests {
                 inclusion_count: 0,
                 submit_rejected_count: 0,
                 shredstream_events_per_second: 1,
+                destabilizing_unclassified_count: 0,
+                destabilizing_candidate_count: 0,
+                destabilizing_trigger_count: 0,
+                destabilizing_price_impact_floor_bps: 1,
+                destabilizing_price_dislocation_trigger_bps: 5,
+                last_destabilizing_trigger_pool_id: None,
+                last_destabilizing_trigger_slot: None,
+                last_destabilizing_trigger_price_impact_bps: None,
+                last_destabilizing_trigger_price_dislocation_bps: None,
+                last_destabilizing_trigger_net_edge_bps: None,
+                destabilizing_candidate_max_price_impact_bps: None,
+                destabilizing_candidate_p95_price_impact_bps: None,
+                destabilizing_candidate_max_price_dislocation_bps: None,
+                destabilizing_candidate_p95_price_dislocation_bps: None,
+                destabilizing_candidate_max_net_edge_bps: None,
+                destabilizing_candidate_p95_net_edge_bps: None,
                 landed_rate_bps: 0,
                 reject_rate_bps: 0,
                 expected_session_pnl_quote_atoms: 0,
+                captured_expected_session_pnl_quote_atoms: 0,
+                missed_expected_session_pnl_quote_atoms: 0,
+                edge_capture_rate_bps: 0,
                 realized_session_pnl_quote_atoms: 0,
                 observer_drop_count: 0,
                 poll_interval_millis: 100,
@@ -1700,6 +1922,8 @@ mod tests {
                     seq: 1,
                     stage: "strategy".into(),
                     route_id: "route-1".into(),
+                    route_kind: Some("two_leg".into()),
+                    leg_count: 2,
                     reason_code: "guard".into(),
                     reason_detail: "guard detail".into(),
                     observed_slot: 10,
@@ -1711,6 +1935,8 @@ mod tests {
                 items: vec![MonitorTradeEvent {
                     seq: 1,
                     route_id: "route-1".into(),
+                    route_kind: "two_leg".into(),
+                    leg_count: 2,
                     submission_id: "sub-1".into(),
                     signature: "sig-1".into(),
                     submit_status: "pending".into(),
@@ -1724,6 +1950,8 @@ mod tests {
                     expected_value_quote_atoms: Some(1),
                     p_land_bps: Some(10_000),
                     expected_shortfall_quote_atoms: Some(0),
+                    intermediate_output_amounts: vec![10_100],
+                    leg_snapshot_slots: vec![10, 10],
                     shadow_selected_by: Some("ev".into()),
                     shadow_trade_size: Some(10_000),
                     shadow_ranking_score_quote_atoms: Some(1),

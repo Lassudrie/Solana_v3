@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use detection::live::{
-    OrcaSimpleTrackedConfig, OrcaWhirlpoolTrackedConfig, RaydiumClmmTrackedConfig,
-    RaydiumSimpleTrackedConfig,
+    LiveDestabilizationEvent, LiveDestabilizationKind, OrcaSimpleTrackedConfig,
+    OrcaWhirlpoolTrackedConfig, RaydiumClmmTrackedConfig, RaydiumSimpleTrackedConfig,
 };
 use detection::{
     EventSourceKind, GetMultipleAccountsBatcher, GrpcEntriesConfig,
@@ -15,7 +15,10 @@ use crate::{
     config::{
         BotConfig, EventSourceMode, RouteClassConfig, RouteLegExecutionConfig, RuntimeProfileConfig,
     },
-    observer::{ObserverHandle, RepairEvent, RepairEventKind},
+    observer::{
+        DestabilizationEvent, DestabilizationEventKind, ObserverHandle, RepairEvent,
+        RepairEventKind,
+    },
     route_health::{PoolHealthTransition, SharedRouteHealth},
 };
 
@@ -51,6 +54,24 @@ impl LiveHooks for BotLiveHooks {
         if let Ok(mut health) = self.route_health.lock() {
             health.on_repair_transition(pool_id, map_repair_transition(transition), observed_slot);
         }
+    }
+
+    fn publish_destabilization(&self, event: LiveDestabilizationEvent) {
+        self.observer.publish_destabilization(DestabilizationEvent {
+            pool_id: event.pool_id,
+            observed_slot: event.observed_slot,
+            kind: match event.kind {
+                LiveDestabilizationKind::Unclassified => DestabilizationEventKind::Unclassified,
+                LiveDestabilizationKind::Candidate => DestabilizationEventKind::Candidate,
+                LiveDestabilizationKind::Triggered => DestabilizationEventKind::Triggered,
+            },
+            input_amount: event.input_amount,
+            estimated_price_impact_bps: event.estimated_price_impact_bps,
+            estimated_price_dislocation_bps: event.estimated_price_dislocation_bps,
+            estimated_net_edge_bps: event.estimated_net_edge_bps,
+            impact_floor_bps: event.impact_floor_bps,
+            dislocation_trigger_bps: event.dislocation_trigger_bps,
+        });
     }
 }
 
@@ -343,6 +364,8 @@ fn build_grpc_entries_config(config: &BotConfig) -> GrpcEntriesConfig {
         reconnect_backoff_millis: config.shredstream.reconnect_backoff_millis,
         max_reconnect_backoff_millis: config.shredstream.max_reconnect_backoff_millis,
         idle_refresh_slot_lag: config.shredstream.idle_refresh_slot_lag,
+        price_impact_trigger_bps: config.shredstream.price_impact_trigger_bps,
+        price_dislocation_trigger_bps: config.shredstream.price_dislocation_trigger_bps,
         max_repair_in_flight: configured_repair_workers(
             config.shredstream.max_repair_in_flight,
             ultra_fast,

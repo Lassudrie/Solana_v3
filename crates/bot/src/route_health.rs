@@ -110,24 +110,33 @@ struct RouteHealthRecord {
 #[derive(Debug, Default)]
 pub struct RouteHealthRegistry {
     config: LiveSetHealthConfig,
+    default_max_snapshot_slot_lag: u64,
     pools: BTreeMap<String, PoolHealthRecord>,
     routes: BTreeMap<String, RouteHealthRecord>,
     route_pools: BTreeMap<String, Vec<String>>,
+    route_execution_max_slot_lag: BTreeMap<String, u64>,
     pool_routes: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl RouteHealthRegistry {
-    pub fn new(config: LiveSetHealthConfig) -> Self {
+    pub fn new(config: LiveSetHealthConfig, default_max_snapshot_slot_lag: u64) -> Self {
         Self {
             config,
+            default_max_snapshot_slot_lag,
             pools: BTreeMap::new(),
             routes: BTreeMap::new(),
             route_pools: BTreeMap::new(),
+            route_execution_max_slot_lag: BTreeMap::new(),
             pool_routes: BTreeMap::new(),
         }
     }
 
-    pub fn register_route(&mut self, route_id: RouteId, pool_ids: &[PoolId]) {
+    pub fn register_route(
+        &mut self,
+        route_id: RouteId,
+        pool_ids: &[PoolId],
+        max_quote_slot_lag: u64,
+    ) {
         let route_key = route_id.0;
         let pool_ids = pool_ids
             .iter()
@@ -135,6 +144,8 @@ impl RouteHealthRegistry {
             .collect::<Vec<_>>();
         self.routes.entry(route_key.clone()).or_default();
         self.route_pools.insert(route_key.clone(), pool_ids.clone());
+        self.route_execution_max_slot_lag
+            .insert(route_key.clone(), max_quote_slot_lag);
         for pool_id in pool_ids {
             self.pools.entry(pool_id.clone()).or_default();
             self.pool_routes
@@ -354,9 +365,14 @@ impl RouteHealthRegistry {
     fn route_state(&self, route_id: &str, observed_slot: u64) -> Option<RouteMonitorView> {
         let pool_ids = self.route_pools.get(route_id)?.clone();
         let route_record = self.routes.get(route_id).cloned().unwrap_or_default();
+        let max_quote_slot_lag = self
+            .route_execution_max_slot_lag
+            .get(route_id)
+            .copied()
+            .unwrap_or(self.default_max_snapshot_slot_lag);
         for pool_id in &pool_ids {
             let route_pool_ids = pool_ids.clone();
-            match self.pool_block(pool_id, observed_slot) {
+            match self.pool_block(pool_id, observed_slot, max_quote_slot_lag) {
                 PoolBlock::None => {}
                 PoolBlock::Disabled => {
                     return Some(RouteMonitorView {
@@ -523,7 +539,7 @@ impl RouteHealthRegistry {
         })
     }
 
-    fn pool_block(&self, pool_id: &str, observed_slot: u64) -> PoolBlock {
+    fn pool_block(&self, pool_id: &str, observed_slot: u64, max_quote_slot_lag: u64) -> PoolBlock {
         let Some(record) = self.pools.get(pool_id) else {
             return PoolBlock::NotExecutable;
         };
@@ -541,7 +557,7 @@ impl RouteHealthRegistry {
         {
             return PoolBlock::Repair;
         }
-        if record.snapshot_stale {
+        if snapshot_stale(record, observed_slot, max_quote_slot_lag) {
             return PoolBlock::Stale;
         }
         if !record.snapshot_executable {
@@ -554,7 +570,7 @@ impl RouteHealthRegistry {
     }
 
     fn pool_health_state(&self, pool_id: &str, observed_slot: u64) -> PoolHealthState {
-        match self.pool_block(pool_id, observed_slot) {
+        match self.pool_block(pool_id, observed_slot, self.default_max_snapshot_slot_lag) {
             PoolBlock::None => PoolHealthState::Healthy,
             PoolBlock::Disabled => PoolHealthState::Disabled,
             PoolBlock::Quarantined => PoolHealthState::Quarantined,
@@ -651,6 +667,14 @@ fn recent_failures(slots: &VecDeque<u64>, observed_slot: u64, window_slots: u64)
         .count()
 }
 
+fn snapshot_stale(record: &PoolHealthRecord, observed_slot: u64, max_quote_slot_lag: u64) -> bool {
+    record.snapshot_stale
+        || record
+            .last_snapshot_slot
+            .map(|slot| observed_slot.saturating_sub(slot) > max_quote_slot_lag)
+            .unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use reconciliation::FailureClass;
@@ -695,13 +719,14 @@ mod tests {
 
     #[test]
     fn route_is_eligible_only_when_both_pools_are_healthy() {
-        let mut registry = RouteHealthRegistry::new(LiveSetHealthConfig::default());
+        let mut registry = RouteHealthRegistry::new(LiveSetHealthConfig::default(), 2);
         registry.register_route(
             RouteId("route-a".into()),
             &[
                 state::types::PoolId("pool-a".into()),
                 state::types::PoolId("pool-b".into()),
             ],
+            32,
         );
         registry.on_pool_snapshot(
             &snapshot("pool-a", 10, 10, PoolConfidence::Executable, false),
@@ -728,13 +753,14 @@ mod tests {
         config.pool_quarantine_after_repair_failures = 2;
         config.pool_disable_after_quarantine_count = 2;
         config.pool_disable_window_slots = 20;
-        let mut registry = RouteHealthRegistry::new(config);
+        let mut registry = RouteHealthRegistry::new(config, 2);
         registry.register_route(
             RouteId("route-a".into()),
             &[
                 state::types::PoolId("pool-a".into()),
                 state::types::PoolId("pool-b".into()),
             ],
+            32,
         );
         registry.on_repair_transition("pool-a", PoolHealthTransition::RepairFailed, 10);
         registry.on_repair_transition("pool-a", PoolHealthTransition::RepairFailed, 11);
@@ -761,13 +787,14 @@ mod tests {
         let mut config = LiveSetHealthConfig::default();
         config.route_shadow_after_chain_failures = 2;
         config.route_reentry_cooldown_slots = 8;
-        let mut registry = RouteHealthRegistry::new(config);
+        let mut registry = RouteHealthRegistry::new(config, 2);
         registry.register_route(
             RouteId("route-a".into()),
             &[
                 state::types::PoolId("pool-a".into()),
                 state::types::PoolId("pool-b".into()),
             ],
+            32,
         );
         registry.on_pool_snapshot(
             &snapshot("pool-a", 10, 10, PoolConfidence::Executable, false),
@@ -795,5 +822,60 @@ mod tests {
 
         let route = registry.route_views(21).pop().unwrap();
         assert_eq!(route.health_state, RouteHealthState::Eligible);
+    }
+
+    #[test]
+    fn route_becomes_stale_when_observed_slot_exceeds_route_execution_lag() {
+        let mut registry = RouteHealthRegistry::new(LiveSetHealthConfig::default(), 256);
+        registry.register_route(
+            RouteId("route-a".into()),
+            &[
+                state::types::PoolId("pool-a".into()),
+                state::types::PoolId("pool-b".into()),
+            ],
+            16,
+        );
+        registry.on_pool_snapshot(
+            &snapshot("pool-a", 100, 100, PoolConfidence::Executable, false),
+            true,
+            100,
+        );
+        registry.on_pool_snapshot(
+            &snapshot("pool-b", 100, 100, PoolConfidence::Executable, false),
+            true,
+            100,
+        );
+
+        let route = registry.route_views(116).pop().unwrap();
+        assert_eq!(route.health_state, RouteHealthState::Eligible);
+
+        let route = registry.route_views(117).pop().unwrap();
+        assert_eq!(route.health_state, RouteHealthState::BlockedPoolStale);
+        assert_eq!(route.blocking_reason.as_deref(), Some("snapshot_stale"));
+    }
+
+    #[test]
+    fn route_specific_execution_lag_is_respected() {
+        let mut registry = RouteHealthRegistry::new(LiveSetHealthConfig::default(), 256);
+        let shared_pool = state::types::PoolId("pool-a".into());
+        registry.register_route(
+            RouteId("fast".into()),
+            std::slice::from_ref(&shared_pool),
+            16,
+        );
+        registry.register_route(RouteId("slow".into()), &[shared_pool], 32);
+        registry.on_pool_snapshot(
+            &snapshot("pool-a", 100, 100, PoolConfidence::Executable, false),
+            true,
+            100,
+        );
+
+        let views = registry
+            .route_views(125)
+            .into_iter()
+            .map(|view| (view.route_id, view.health_state))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(views.get("fast"), Some(&RouteHealthState::BlockedPoolStale));
+        assert_eq!(views.get("slow"), Some(&RouteHealthState::Eligible));
     }
 }
