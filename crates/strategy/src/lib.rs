@@ -11,7 +11,7 @@ use domain::{ExecutionSnapshot, RouteId};
 use guards::{GuardrailConfig, GuardrailSet};
 use opportunity::SelectionOutcome;
 use quote::LocalTwoLegQuoteEngine;
-use route_registry::{RouteDefinition, RouteRegistry};
+use route_registry::{RouteDefinition, RouteRegistry, StrategySizingConfig};
 use selector::OpportunitySelector;
 use state::StatePlane;
 
@@ -21,22 +21,32 @@ struct RouteExecutionProtectionState {
     consecutive_successes: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RouteExecutionSizingState {
+    pub landing_rate_bps: u16,
+    pub expected_shortfall_bps: u16,
+}
+
 #[derive(Debug)]
 pub struct StrategyPlane {
     registry: RouteRegistry,
     selector: OpportunitySelector,
+    sizing: StrategySizingConfig,
     execution_protection: HashMap<RouteId, RouteExecutionProtectionState>,
+    execution_sizing: HashMap<RouteId, RouteExecutionSizingState>,
 }
 
 impl StrategyPlane {
-    pub fn new(guardrails: GuardrailConfig) -> Self {
+    pub fn new(guardrails: GuardrailConfig, sizing: StrategySizingConfig) -> Self {
         Self {
             registry: RouteRegistry::default(),
             selector: OpportunitySelector::new(
                 LocalTwoLegQuoteEngine,
                 GuardrailSet::new(guardrails),
             ),
+            sizing,
             execution_protection: HashMap::new(),
+            execution_sizing: HashMap::new(),
         }
     }
 
@@ -50,6 +60,13 @@ impl StrategyPlane {
                 },
             );
         }
+        self.execution_sizing.insert(
+            route.route_id.clone(),
+            RouteExecutionSizingState {
+                landing_rate_bps: route.sizing.base_landing_rate_bps,
+                expected_shortfall_bps: route.sizing.base_expected_shortfall_bps,
+            },
+        );
         self.registry.register(route);
     }
 
@@ -71,7 +88,9 @@ impl StrategyPlane {
             execution,
             impacted_routes,
             inflight_submissions,
+            &self.sizing,
             &route_execution_buffers,
+            &self.execution_sizing,
         )
     }
 
@@ -79,39 +98,70 @@ impl StrategyPlane {
         let Some(route) = self.registry.get(route_id) else {
             return;
         };
-        let Some(policy) = &route.execution_protection else {
-            return;
-        };
-        let Some(state) = self.execution_protection.get_mut(route_id) else {
-            return;
-        };
-        state.current_extra_buy_leg_slippage_bps = state
-            .current_extra_buy_leg_slippage_bps
-            .saturating_add(policy.failure_step_bps)
-            .min(policy.max_extra_buy_leg_slippage_bps);
-        state.consecutive_successes = 0;
+        if let (Some(policy), Some(state)) = (
+            route.execution_protection.as_ref(),
+            self.execution_protection.get_mut(route_id),
+        ) {
+            state.current_extra_buy_leg_slippage_bps = state
+                .current_extra_buy_leg_slippage_bps
+                .saturating_add(policy.failure_step_bps)
+                .min(policy.max_extra_buy_leg_slippage_bps);
+            state.consecutive_successes = 0;
+        }
+
+        if let Some(state) = self.execution_sizing.get_mut(route_id) {
+            state.landing_rate_bps =
+                ewma_bps(state.landing_rate_bps, 0, self.sizing.ewma_alpha_bps);
+            let target = state
+                .expected_shortfall_bps
+                .saturating_add(self.sizing.too_little_output_shortfall_step_bps)
+                .min(route.sizing.max_expected_shortfall_bps);
+            state.expected_shortfall_bps = ewma_bps(
+                state.expected_shortfall_bps,
+                target,
+                self.sizing.ewma_alpha_bps,
+            );
+        }
     }
 
     pub fn record_execution_success(&mut self, route_id: &RouteId) {
         let Some(route) = self.registry.get(route_id) else {
             return;
         };
-        let Some(policy) = &route.execution_protection else {
-            return;
-        };
-        let Some(state) = self.execution_protection.get_mut(route_id) else {
-            return;
-        };
-        state.consecutive_successes = state.consecutive_successes.saturating_add(1);
-        if state.consecutive_successes < policy.recovery_success_count.max(1) {
-            return;
+        if let (Some(policy), Some(state)) = (
+            route.execution_protection.as_ref(),
+            self.execution_protection.get_mut(route_id),
+        ) {
+            state.consecutive_successes = state.consecutive_successes.saturating_add(1);
+            if state.consecutive_successes >= policy.recovery_success_count.max(1) {
+                state.current_extra_buy_leg_slippage_bps = state
+                    .current_extra_buy_leg_slippage_bps
+                    .saturating_sub(policy.failure_step_bps)
+                    .max(policy.base_extra_buy_leg_slippage_bps);
+                state.consecutive_successes = 0;
+            }
         }
 
-        state.current_extra_buy_leg_slippage_bps = state
-            .current_extra_buy_leg_slippage_bps
-            .saturating_sub(policy.failure_step_bps)
-            .max(policy.base_extra_buy_leg_slippage_bps);
-        state.consecutive_successes = 0;
+        if let Some(state) = self.execution_sizing.get_mut(route_id) {
+            state.landing_rate_bps =
+                ewma_bps(state.landing_rate_bps, 10_000, self.sizing.ewma_alpha_bps);
+            state.expected_shortfall_bps = ewma_bps(
+                state.expected_shortfall_bps,
+                route.sizing.base_expected_shortfall_bps,
+                self.sizing.ewma_alpha_bps,
+            );
+        }
+    }
+
+    pub fn record_submit_rejected(&mut self, route_id: &RouteId) {
+        self.record_execution_failure(route_id);
+    }
+
+    pub fn record_execution_failure(&mut self, route_id: &RouteId) {
+        let Some(state) = self.execution_sizing.get_mut(route_id) else {
+            return;
+        };
+        state.landing_rate_bps = ewma_bps(state.landing_rate_bps, 0, self.sizing.ewma_alpha_bps);
     }
 
     pub fn active_execution_buffer_bps(&self, route_id: &RouteId) -> Option<u16> {
@@ -119,6 +169,17 @@ impl StrategyPlane {
             .get(route_id)
             .map(|state| state.current_extra_buy_leg_slippage_bps)
     }
+}
+
+fn ewma_bps(current: u16, target: u16, alpha_bps: u16) -> u16 {
+    let alpha = u32::from(alpha_bps.min(10_000));
+    let keep = 10_000u32.saturating_sub(alpha);
+    let next = u32::from(current)
+        .saturating_mul(keep)
+        .saturating_add(u32::from(target).saturating_mul(alpha))
+        .saturating_add(9_999)
+        / 10_000;
+    next.min(u32::from(u16::MAX)) as u16
 }
 
 #[cfg(test)]
@@ -133,11 +194,31 @@ mod tests {
         guards::GuardrailConfig,
         opportunity::OpportunityDecision,
         reasons::RejectionReason,
-        route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
+        route_registry::{
+            ExecutionProtectionPolicy, RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode,
+            StrategySizingConfig, SwapSide,
+        },
     };
     use state::StatePlane;
 
     const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
+
+    fn sizing_config() -> StrategySizingConfig {
+        StrategySizingConfig {
+            mode: SizingMode::Legacy,
+            min_trade_floor_sol_lamports: 0,
+            base_landing_rate_bps: 8_500,
+            ewma_alpha_bps: 2_000,
+            base_expected_shortfall_bps: 75,
+            max_expected_shortfall_bps: 500,
+            too_little_output_shortfall_step_bps: 75,
+            inflight_penalty_bps_per_submission: 25,
+            max_inflight_penalty_bps: 1_500,
+            blockhash_penalty_bps_per_slot: 10,
+            max_blockhash_penalty_bps: 1_000,
+            max_reserve_usage_penalty_bps: 1_250,
+        }
+    }
 
     fn route_definition() -> RouteDefinition {
         RouteDefinition {
@@ -167,6 +248,13 @@ mod tests {
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
             estimated_execution_cost_lamports: 0,
+            sizing: RouteSizingPolicy {
+                mode: SizingMode::Legacy,
+                min_trade_floor_sol_lamports: 0,
+                base_landing_rate_bps: 8_500,
+                base_expected_shortfall_bps: 75,
+                max_expected_shortfall_bps: 500,
+            },
             execution_protection: None,
         }
     }
@@ -237,7 +325,7 @@ mod tests {
     #[test]
     fn blocks_routes_that_are_not_warm() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
         strategy.register_route(route.clone());
         let mut state = StatePlane::new(2);
         state.register_route(
@@ -260,13 +348,16 @@ mod tests {
     #[test]
     fn produces_structured_opportunity_candidate() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig {
-            min_profit_quote_atoms: 10,
-            require_route_warm: true,
-            max_inflight_submissions: 64,
-            min_wallet_balance_lamports: 1,
-            max_blockhash_slot_lag: 8,
-        });
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: true,
+                max_inflight_submissions: 64,
+                min_wallet_balance_lamports: 1,
+                max_blockhash_slot_lag: 8,
+            },
+            sizing_config(),
+        );
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -291,13 +382,16 @@ mod tests {
     fn selects_larger_size_when_it_improves_net_profit_after_cost() {
         let mut route = route_definition();
         route.estimated_execution_cost_lamports = 5_000;
-        let mut strategy = StrategyPlane::new(GuardrailConfig {
-            min_profit_quote_atoms: 10,
-            require_route_warm: true,
-            max_inflight_submissions: 64,
-            min_wallet_balance_lamports: 1,
-            max_blockhash_slot_lag: 8,
-        });
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: true,
+                max_inflight_submissions: 64,
+                min_wallet_balance_lamports: 1,
+                max_blockhash_slot_lag: 8,
+            },
+            sizing_config(),
+        );
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -325,13 +419,16 @@ mod tests {
     fn rejects_route_when_execution_cost_exceeds_edge() {
         let mut route = route_definition();
         route.estimated_execution_cost_lamports = 40_000;
-        let mut strategy = StrategyPlane::new(GuardrailConfig {
-            min_profit_quote_atoms: 10,
-            require_route_warm: true,
-            max_inflight_submissions: 64,
-            min_wallet_balance_lamports: 1,
-            max_blockhash_slot_lag: 8,
-        });
+        let mut strategy = StrategyPlane::new(
+            GuardrailConfig {
+                min_profit_quote_atoms: 10,
+                require_route_warm: true,
+                max_inflight_submissions: 64,
+                min_wallet_balance_lamports: 1,
+                max_blockhash_slot_lag: 8,
+            },
+            sizing_config(),
+        );
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -359,7 +456,7 @@ mod tests {
     #[test]
     fn rejects_route_when_snapshot_is_not_executable() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -437,7 +534,7 @@ mod tests {
     #[test]
     fn rejects_route_when_snapshot_is_verified_without_active_repair() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -515,7 +612,7 @@ mod tests {
     #[test]
     fn rejects_route_when_clmm_quote_model_is_not_executable() {
         let route = route_definition();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
         strategy.register_route(route.clone());
 
         let mut state = StatePlane::new(2);
@@ -594,7 +691,7 @@ mod tests {
     fn execution_protection_state_steps_up_and_recovers() {
         let route = protected_route_definition();
         let route_id = route.route_id.clone();
-        let mut strategy = StrategyPlane::new(GuardrailConfig::default());
+        let mut strategy = StrategyPlane::new(GuardrailConfig::default(), sizing_config());
         strategy.register_route(route);
 
         assert_eq!(strategy.active_execution_buffer_bps(&route_id), Some(50));

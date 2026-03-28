@@ -72,6 +72,14 @@ impl RouteQuote {
     }
 }
 
+pub fn sol_lamports_to_quote_atoms(
+    route: &RouteDefinition,
+    sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
+    lamports: u64,
+) -> Result<u64, QuoteError> {
+    execution_cost_quote_atoms(route, sol_quote_conversion_snapshot, lamports)
+}
+
 #[derive(Debug, Error)]
 pub enum QuoteError {
     #[error("expected exactly 2 snapshots for the 2-leg template")]
@@ -1621,7 +1629,7 @@ mod tests {
             compute_concentrated_swap_step, orca_sqrt_price_at_tick, orca_tick_from_sqrt_price,
             raydium_sqrt_price_at_tick, raydium_tick_from_sqrt_price,
         },
-        route_registry::{RouteDefinition, RouteLeg, SwapSide},
+        route_registry::{RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode, SwapSide},
     };
 
     fn route_definition(
@@ -1656,6 +1664,13 @@ mod tests {
             max_trade_size: 10,
             size_ladder: Vec::new(),
             estimated_execution_cost_lamports: 0,
+            sizing: RouteSizingPolicy {
+                mode: SizingMode::Legacy,
+                min_trade_floor_sol_lamports: 100_000_000,
+                base_landing_rate_bps: 8_500,
+                base_expected_shortfall_bps: 75,
+                max_expected_shortfall_bps: 500,
+            },
             execution_protection: None,
         }
     }

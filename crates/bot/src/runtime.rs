@@ -47,6 +47,7 @@ impl HotPathReport {
             selection: SelectionOutcome {
                 decisions: Vec::new(),
                 best_candidate: None,
+                shadow_candidate: None,
             },
             build_result: None,
             signed_envelope: None,
@@ -444,6 +445,10 @@ impl BotRuntime {
                 .hot_path
                 .strategy
                 .record_execution_too_little_output(&record.route_id),
+            ExecutionOutcome::Failed(_) => self
+                .hot_path
+                .strategy
+                .record_execution_failure(&record.route_id),
             _ => {}
         }
         if let Some(route_health) = route_health.as_mut() {
@@ -530,6 +535,7 @@ impl BotRuntime {
                 selection: SelectionOutcome {
                     decisions: Vec::new(),
                     best_candidate: None,
+                    shadow_candidate: None,
                 },
                 build_result: None,
                 signed_envelope: None,
@@ -559,6 +565,7 @@ impl BotRuntime {
                 selection: SelectionOutcome {
                     decisions: Vec::new(),
                     best_candidate: None,
+                    shadow_candidate: None,
                 },
                 build_result: None,
                 signed_envelope: None,
@@ -688,6 +695,9 @@ impl BotRuntime {
             submit_result.clone(),
         );
         if let ExecutionOutcome::Failed(class) = &execution_record.outcome {
+            self.hot_path
+                .strategy
+                .record_submit_rejected(&execution_record.route_id);
             if let Ok(mut route_health) = self.route_health.lock() {
                 route_health.on_execution_failure(
                     &execution_record.route_id,
@@ -796,25 +806,31 @@ mod tests {
         Pubkey::new_from_array(hashv(&[label.as_bytes()]).to_bytes()).to_string()
     }
 
-    fn snapshot_event(sequence: u64, pool_id: &str) -> NormalizedEvent {
+    fn snapshot_event(sequence: u64, pool_id: &str, price_bps: u64) -> NormalizedEvent {
+        let reserve_a = 100_000u64;
+        let reserve_b = (reserve_a as u128)
+            .saturating_mul(price_bps as u128)
+            .checked_div(10_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(reserve_a);
         NormalizedEvent::pool_snapshot_update(
             EventSourceKind::Synthetic,
             sequence,
             sequence + 9,
             PoolSnapshotUpdate {
                 pool_id: pool_id.into(),
-                price_bps: 12_000,
+                price_bps,
                 fee_bps: 4,
-                reserve_depth: 100_000,
-                reserve_a: Some(100_000),
-                reserve_b: Some(100_000),
-                active_liquidity: Some(100_000),
+                reserve_depth: reserve_a.max(reserve_b),
+                reserve_a: Some(reserve_a),
+                reserve_b: Some(reserve_b),
+                active_liquidity: Some(reserve_a.max(reserve_b)),
                 sqrt_price_x64: None,
                 venue: PoolVenue::OrcaSimplePool,
                 confidence: SnapshotConfidence::Executable,
                 repair_pending: Some(false),
-                token_mint_a: "SOL".into(),
-                token_mint_b: "USDC".into(),
+                token_mint_a: "So11111111111111111111111111111111111111112".into(),
+                token_mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
                 tick_spacing: 0,
                 current_tick_index: None,
                 slot: sequence + 9,
@@ -863,15 +879,19 @@ mod tests {
             enabled: true,
             route_class: RouteClassConfig::AmmFastPath,
             route_id: "route-a".into(),
-            input_mint: "USDC".into(),
-            output_mint: "USDC".into(),
-            base_mint: None,
-            quote_mint: None,
-            sol_quote_conversion_pool_id: None,
+            input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            base_mint: Some("So11111111111111111111111111111111111111112".into()),
+            quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+            sol_quote_conversion_pool_id: Some("pool-a".into()),
             min_trade_size: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
+            sizing: crate::config::RouteSizingConfig {
+                min_trade_floor_sol_lamports: Some(0),
+                ..Default::default()
+            },
             execution_protection: Default::default(),
             legs: [
                 RouteLegConfig {
@@ -959,8 +979,8 @@ mod tests {
         config.signing.keypair_base58 = Some(keypair_base58);
         let mut runtime = bootstrap(config).unwrap();
 
-        let first = snapshot_event(1, "pool-a");
-        let second = snapshot_event(2, "pool-b");
+        let first = snapshot_event(1, "pool-a", 5_000);
+        let second = snapshot_event(2, "pool-b", 20_000);
 
         let first_report = runtime.process_event(first).unwrap();
         assert!(first_report.submit_result.is_none());
@@ -992,8 +1012,8 @@ mod tests {
             pubkey: owner_pubkey,
         });
 
-        let first = snapshot_event(1, "pool-a");
-        let second = snapshot_event(2, "pool-b");
+        let first = snapshot_event(1, "pool-a", 5_000);
+        let second = snapshot_event(2, "pool-b", 20_000);
 
         let first_report = runtime.prepare_event_for_dispatch(first, 0).unwrap();
         assert!(matches!(first_report, PreparedHotPath::Report(_)));
@@ -1037,14 +1057,15 @@ mod tests {
         })
         .expect("bind secure signer service");
         let signer_thread = thread::spawn(move || {
-            service.serve_one().expect("serve public key request");
-            service.serve_one().expect("serve sign request");
+            service
+                .serve_one()
+                .expect("serve secure unix signer session");
         });
 
         let mut runtime = bootstrap(config).unwrap();
 
-        let first = snapshot_event(1, "pool-a");
-        let second = snapshot_event(2, "pool-b");
+        let first = snapshot_event(1, "pool-a", 5_000);
+        let second = snapshot_event(2, "pool-b", 20_000);
 
         let first_report = runtime.process_event(first).unwrap();
         assert!(first_report.submit_result.is_none());
@@ -1054,6 +1075,7 @@ mod tests {
         assert_eq!(submit.status, SubmitStatus::Accepted);
         assert!(second_report.execution_record.is_some());
 
+        drop(runtime);
         signer_thread.join().expect("secure signer thread");
         let _ = fs::remove_file(keypair_path);
         let _ = fs::remove_file(socket_path);

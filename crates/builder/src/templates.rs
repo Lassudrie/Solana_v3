@@ -48,12 +48,10 @@ impl AtomicTwoLegTemplate {
                     // The first leg fallback stays exact-in when the venue does
                     // not support exact-out for the bridge direction.
                     SwapAmountMode::ExactIn => second.input_amount,
-                    SwapAmountMode::ExactOut => {
-                        apply_input_buffer(
-                            first.input_amount,
-                            candidate.active_execution_buffer_bps.unwrap_or(0),
-                        )
-                    }
+                    SwapAmountMode::ExactOut => apply_input_buffer(
+                        first.input_amount,
+                        candidate.active_execution_buffer_bps.unwrap_or(0),
+                    ),
                 },
                 current_tick_index: first.current_tick_index,
             },
@@ -130,7 +128,11 @@ fn apply_input_buffer(amount: u64, buffer_bps: u16) -> u64 {
 #[cfg(test)]
 mod tests {
     use domain::{PoolId, RouteId};
-    use strategy::{opportunity::OpportunityCandidate, quote::LegQuote, route_registry::SwapSide};
+    use strategy::{
+        opportunity::{CandidateSelectionSource, OpportunityCandidate},
+        quote::LegQuote,
+        route_registry::SwapSide,
+    };
 
     use crate::{
         execution::{
@@ -149,6 +151,11 @@ mod tests {
             leg_snapshot_slots: [42, 42],
             sol_quote_conversion_snapshot_slot: None,
             trade_size: 10_000,
+            selected_by: CandidateSelectionSource::Legacy,
+            ranking_score_quote_atoms: 250,
+            expected_value_quote_atoms: 250,
+            p_land_bps: 10_000,
+            expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: None,
             expected_net_output: 10_250,
             minimum_acceptable_output: 10_175,

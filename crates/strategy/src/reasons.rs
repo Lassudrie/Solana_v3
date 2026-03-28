@@ -41,6 +41,10 @@ pub enum RejectionReason {
         expected: i64,
         minimum: i64,
     },
+    TradeSizeBelowSizingFloor {
+        maximum: u64,
+        minimum: u64,
+    },
     TradeSizeTooLarge {
         requested: u64,
         maximum: u64,
@@ -59,6 +63,9 @@ pub enum RejectionReason {
         detail: String,
     },
     ExecutionCostNotConvertible {
+        detail: String,
+    },
+    SizingFloorNotConvertible {
         detail: String,
     },
     NoImpactedRoutes,

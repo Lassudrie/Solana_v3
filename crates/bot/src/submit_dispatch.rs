@@ -652,6 +652,7 @@ mod tests {
             selection: SelectionOutcome {
                 decisions: Vec::new(),
                 best_candidate: None,
+                shadow_candidate: None,
             },
             build_result: None,
             signed_envelope: Some(signing::SignedTransactionEnvelope {

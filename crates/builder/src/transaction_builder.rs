@@ -410,7 +410,8 @@ fn associated_token_setup_instructions(
                     &config.token_program_id,
                 )?;
             }
-            VenueExecutionConfig::OrcaSimplePool(_) | VenueExecutionConfig::RaydiumSimplePool(_) => {}
+            VenueExecutionConfig::OrcaSimplePool(_)
+            | VenueExecutionConfig::RaydiumSimplePool(_) => {}
         }
     }
 
@@ -432,11 +433,7 @@ fn register_associated_token_account_setup(
     }
     instructions.push(LabeledInstruction::new(
         format!("ata-create-{}", short_label(mint)),
-        create_associated_token_account_idempotent(
-            fee_payer,
-            mint_pubkey,
-            token_program_pubkey,
-        ),
+        create_associated_token_account_idempotent(fee_payer, mint_pubkey, token_program_pubkey),
     ));
     Ok(())
 }
@@ -761,6 +758,7 @@ fn used_lookup_tables(
 #[cfg(test)]
 mod tests {
     use bincode::serialize;
+    use domain::RouteId;
     use solana_sdk::{
         hash::{Hash, hashv},
         message::{MessageHeader, compiled_instruction::CompiledInstruction},
@@ -768,7 +766,6 @@ mod tests {
         signature::Signature,
         transaction::VersionedTransaction,
     };
-    use domain::RouteId;
 
     use crate::types::SwapAmountMode;
 
@@ -955,8 +952,14 @@ mod tests {
             .expect("setup instructions");
 
         assert_eq!(setup.len(), 2);
-        assert_eq!(setup[0].instruction.program_id, parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID));
-        assert_eq!(setup[1].instruction.program_id, parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID));
+        assert_eq!(
+            setup[0].instruction.program_id,
+            parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID)
+        );
+        assert_eq!(
+            setup[1].instruction.program_id,
+            parse_static_pubkey(ASSOCIATED_TOKEN_PROGRAM_ID)
+        );
         assert_eq!(setup[0].instruction.data, vec![1]);
         assert_eq!(setup[1].instruction.data, vec![1]);
         assert_eq!(
@@ -1208,7 +1211,11 @@ fn describe_instruction(
 }
 
 fn short_label(value: &str) -> String {
-    value.chars().take(4).collect::<String>().to_ascii_lowercase()
+    value
+        .chars()
+        .take(4)
+        .collect::<String>()
+        .to_ascii_lowercase()
 }
 
 fn account_source(

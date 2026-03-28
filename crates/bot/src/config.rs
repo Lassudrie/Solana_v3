@@ -395,6 +395,8 @@ pub struct RouteConfig {
     #[serde(default)]
     pub size_ladder: Vec<u64>,
     #[serde(default)]
+    pub sizing: RouteSizingConfig,
+    #[serde(default)]
     pub execution_protection: RouteExecutionProtectionConfig,
     pub legs: [RouteLegConfig; 2],
     pub account_dependencies: Vec<AccountDependencyConfig>,
@@ -403,6 +405,25 @@ pub struct RouteConfig {
 
 fn default_route_enabled() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SizingModeConfig {
+    #[default]
+    Legacy,
+    EvShadow,
+    EvLive,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct RouteSizingConfig {
+    pub mode: Option<SizingModeConfig>,
+    pub min_trade_floor_sol_lamports: Option<u64>,
+    pub base_landing_rate_bps: Option<u16>,
+    pub base_expected_shortfall_bps: Option<u16>,
+    pub max_expected_shortfall_bps: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -567,6 +588,8 @@ pub struct StrategyConfig {
     pub max_inflight_submissions: usize,
     pub min_wallet_balance_lamports: u64,
     pub max_blockhash_slot_lag: u64,
+    #[serde(default)]
+    pub sizing: StrategySizingConfig,
 }
 
 impl Default for StrategyConfig {
@@ -578,6 +601,43 @@ impl Default for StrategyConfig {
             max_inflight_submissions: 64,
             min_wallet_balance_lamports: 1,
             max_blockhash_slot_lag: 64,
+            sizing: StrategySizingConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StrategySizingConfig {
+    pub mode: SizingModeConfig,
+    pub min_trade_floor_sol_lamports: u64,
+    pub base_landing_rate_bps: u16,
+    pub ewma_alpha_bps: u16,
+    pub base_expected_shortfall_bps: u16,
+    pub max_expected_shortfall_bps: u16,
+    pub too_little_output_shortfall_step_bps: u16,
+    pub inflight_penalty_bps_per_submission: u16,
+    pub max_inflight_penalty_bps: u16,
+    pub blockhash_penalty_bps_per_slot: u16,
+    pub max_blockhash_penalty_bps: u16,
+    pub max_reserve_usage_penalty_bps: u16,
+}
+
+impl Default for StrategySizingConfig {
+    fn default() -> Self {
+        Self {
+            mode: SizingModeConfig::Legacy,
+            min_trade_floor_sol_lamports: 100_000_000,
+            base_landing_rate_bps: 8_500,
+            ewma_alpha_bps: 2_000,
+            base_expected_shortfall_bps: 75,
+            max_expected_shortfall_bps: 500,
+            too_little_output_shortfall_step_bps: 75,
+            inflight_penalty_bps_per_submission: 25,
+            max_inflight_penalty_bps: 1_500,
+            blockhash_penalty_bps_per_slot: 10,
+            max_blockhash_penalty_bps: 1_000,
+            max_reserve_usage_penalty_bps: 1_250,
         }
     }
 }

@@ -22,7 +22,11 @@ mod tests {
     use domain::{LookupTableSnapshot, PoolId, RouteId};
     use solana_sdk::signer::{SeedDerivable, Signer as SolanaSigner, keypair::Keypair};
     use solana_sdk::{hash::hashv, message::VersionedMessage, pubkey::Pubkey};
-    use strategy::{opportunity::OpportunityCandidate, quote::LegQuote, route_registry::SwapSide};
+    use strategy::{
+        opportunity::{CandidateSelectionSource, OpportunityCandidate},
+        quote::LegQuote,
+        route_registry::SwapSide,
+    };
 
     use crate::{
         AtomicArbTransactionBuilder, BuildRejectionReason, ExecutionRegistry,
@@ -55,6 +59,11 @@ mod tests {
             leg_snapshot_slots: [42, 42],
             sol_quote_conversion_snapshot_slot: None,
             trade_size: 10_000,
+            selected_by: CandidateSelectionSource::Legacy,
+            ranking_score_quote_atoms: 250,
+            expected_value_quote_atoms: 250,
+            p_land_bps: 10_000,
+            expected_shortfall_quote_atoms: 0,
             active_execution_buffer_bps: None,
             expected_net_output: 10_250,
             minimum_acceptable_output: 10_025,

@@ -23,11 +23,15 @@ use std::{
 use strategy::{
     StrategyPlane,
     guards::GuardrailConfig,
-    route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
+    route_registry::{
+        ExecutionProtectionPolicy, RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode,
+        StrategySizingConfig, SwapSide,
+    },
 };
 use thiserror::Error;
 
 use crate::{
+    account_batcher::{GetMultipleAccountsBatcher, RpcContext, decode_lookup_table},
     config::{
         BotConfig, BuilderConfig, MessageModeConfig, RouteClassConfig, RouteLegExecutionConfig,
         RuntimeProfileConfig, SigningConfig, SigningProviderKind, SwapSideConfig,
@@ -82,6 +86,24 @@ struct RpcMultipleAccountsResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct RpcLatestBlockhashResponse {
+    context: RpcContext,
+    value: RpcLatestBlockhashValue,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcLatestBlockhashValue {
+    blockhash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RpcBalanceResponse {
+    #[serde(rename = "context")]
+    _context: RpcContext,
+    value: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct RpcAccountInfo {
     owner: String,
     data: (String, String),
@@ -124,13 +146,35 @@ pub fn bootstrap_with_health(
         .decoder_registry_mut()
         .register(RaydiumClmmPoolDecoder);
 
-    let mut strategy = StrategyPlane::new(GuardrailConfig {
-        min_profit_quote_atoms: config.strategy.min_profit_quote_atoms,
-        require_route_warm: config.strategy.require_route_warm,
-        max_inflight_submissions: config.strategy.max_inflight_submissions,
-        min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
-        max_blockhash_slot_lag: config.strategy.max_blockhash_slot_lag,
-    });
+    let mut strategy = StrategyPlane::new(
+        GuardrailConfig {
+            min_profit_quote_atoms: config.strategy.min_profit_quote_atoms,
+            require_route_warm: config.strategy.require_route_warm,
+            max_inflight_submissions: config.strategy.max_inflight_submissions,
+            min_wallet_balance_lamports: config.strategy.min_wallet_balance_lamports,
+            max_blockhash_slot_lag: config.strategy.max_blockhash_slot_lag,
+        },
+        StrategySizingConfig {
+            mode: map_sizing_mode(config.strategy.sizing.mode),
+            min_trade_floor_sol_lamports: config.strategy.sizing.min_trade_floor_sol_lamports,
+            base_landing_rate_bps: config.strategy.sizing.base_landing_rate_bps,
+            ewma_alpha_bps: config.strategy.sizing.ewma_alpha_bps,
+            base_expected_shortfall_bps: config.strategy.sizing.base_expected_shortfall_bps,
+            max_expected_shortfall_bps: config.strategy.sizing.max_expected_shortfall_bps,
+            too_little_output_shortfall_step_bps: config
+                .strategy
+                .sizing
+                .too_little_output_shortfall_step_bps,
+            inflight_penalty_bps_per_submission: config
+                .strategy
+                .sizing
+                .inflight_penalty_bps_per_submission,
+            max_inflight_penalty_bps: config.strategy.sizing.max_inflight_penalty_bps,
+            blockhash_penalty_bps_per_slot: config.strategy.sizing.blockhash_penalty_bps_per_slot,
+            max_blockhash_penalty_bps: config.strategy.sizing.max_blockhash_penalty_bps,
+            max_reserve_usage_penalty_bps: config.strategy.sizing.max_reserve_usage_penalty_bps,
+        },
+    );
 
     let active_routes = config
         .routes
@@ -138,6 +182,7 @@ pub fn bootstrap_with_health(
         .iter()
         .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
         .collect::<Vec<_>>();
+    let lookup_table_keys = collect_lookup_table_keys(&active_routes);
     for route in &active_routes {
         validate_runtime_route_config(route)?;
     }
@@ -206,6 +251,7 @@ pub fn bootstrap_with_health(
                 route.execution.default_compute_unit_price_micro_lamports,
                 route.execution.default_jito_tip_lamports,
             ),
+            sizing: resolve_route_sizing(&config.strategy.sizing, &route.sizing),
             execution_protection: map_execution_protection(&route.execution_protection),
         });
         execution_registry.register(BuilderRouteExecutionConfig {
@@ -234,22 +280,12 @@ pub fn bootstrap_with_health(
     }
 
     let submit_mode = submit_mode_from_config(&config);
-    let cold_path = ColdPathServices {
-        warmup: WarmupCoordinator::default(),
-        blockhash: BlockhashService {
-            current_blockhash: config.state.bootstrap_blockhash.clone(),
-            slot: config.state.bootstrap_blockhash_slot,
-        },
-        alt_cache: AltCacheService {
-            revision: config.state.bootstrap_alt_revision,
-            lookup_tables: Vec::new(),
-        },
-        wallet_refresh: WalletRefreshService {
-            balance_lamports: config.signing.bootstrap_balance_lamports,
-            ready: config.signing.wallet_ready,
-            signer_available: resolved_signer.signer_available,
-        },
-    };
+    let cold_path = build_cold_path_services(
+        &config,
+        &resolved_signer.owner_pubkey,
+        resolved_signer.signer_available,
+        &lookup_table_keys,
+    );
     let wallet_status = if !config.signing.wallet_ready {
         signing::WalletStatus::Refreshing
     } else if resolved_signer.signer_available {
@@ -282,6 +318,139 @@ pub fn bootstrap_with_health(
     Ok(runtime)
 }
 
+fn build_cold_path_services(
+    config: &BotConfig,
+    wallet_pubkey: &str,
+    signer_available: bool,
+    lookup_table_keys: &[String],
+) -> ColdPathServices {
+    let mut blockhash = BlockhashService {
+        current_blockhash: config.state.bootstrap_blockhash.clone(),
+        slot: config.state.bootstrap_blockhash_slot,
+    };
+    let mut alt_cache = AltCacheService {
+        revision: config.state.bootstrap_alt_revision,
+        lookup_tables: Vec::new(),
+    };
+    let mut wallet_refresh = WalletRefreshService {
+        balance_lamports: config.signing.bootstrap_balance_lamports,
+        ready: config.signing.wallet_ready,
+        signer_available,
+    };
+
+    let endpoint = config.reconciliation.rpc_http_endpoint.trim();
+    if !endpoint.is_empty() && !endpoint.starts_with(MOCK_SCHEME) {
+        match bootstrap_rpc_http_client() {
+            Ok(http) => {
+                match fetch_live_blockhash_seed(&http, endpoint) {
+                    Ok(live_blockhash) => blockhash = live_blockhash,
+                    Err(error) => eprintln!(
+                        "bootstrap: failed to seed live blockhash from {endpoint}: {error}"
+                    ),
+                }
+                match fetch_live_wallet_seed(&http, endpoint, wallet_pubkey) {
+                    Ok(live_wallet) => {
+                        wallet_refresh.balance_lamports = live_wallet.value;
+                        wallet_refresh.ready = true;
+                    }
+                    Err(error) => eprintln!(
+                        "bootstrap: failed to seed wallet balance from {endpoint}: {error}"
+                    ),
+                }
+                if !lookup_table_keys.is_empty() {
+                    match fetch_live_lookup_table_seed(endpoint, lookup_table_keys) {
+                        Ok(live_alt_cache) => alt_cache = live_alt_cache,
+                        Err(error) => eprintln!(
+                            "bootstrap: failed to seed lookup tables from {endpoint}: {error}"
+                        ),
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("bootstrap: failed to build RPC client for {endpoint}: {error}")
+            }
+        }
+    }
+
+    ColdPathServices {
+        warmup: WarmupCoordinator::default(),
+        blockhash,
+        alt_cache,
+        wallet_refresh,
+    }
+}
+
+fn collect_lookup_table_keys(routes: &[&crate::config::RouteConfig]) -> Vec<String> {
+    let mut unique = BTreeSet::new();
+    for route in routes {
+        for table in &route.execution.lookup_tables {
+            unique.insert(table.account_key.clone());
+        }
+    }
+    unique.into_iter().collect()
+}
+
+fn bootstrap_rpc_http_client() -> Result<Client, String> {
+    Client::builder()
+        .connect_timeout(Duration::from_millis(300))
+        .timeout(Duration::from_millis(1_000))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
+fn fetch_live_blockhash_seed(http: &Client, endpoint: &str) -> Result<BlockhashService, String> {
+    let response = rpc_call::<RpcLatestBlockhashResponse>(
+        http,
+        endpoint,
+        "getLatestBlockhash",
+        json!([{ "commitment": "processed" }]),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(BlockhashService {
+        current_blockhash: response.value.blockhash,
+        slot: response.context.slot,
+    })
+}
+
+fn fetch_live_wallet_seed(
+    http: &Client,
+    endpoint: &str,
+    wallet_pubkey: &str,
+) -> Result<RpcBalanceResponse, String> {
+    rpc_call::<RpcBalanceResponse>(
+        http,
+        endpoint,
+        "getBalance",
+        json!([
+            wallet_pubkey,
+            { "commitment": "processed" }
+        ]),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn fetch_live_lookup_table_seed(
+    endpoint: &str,
+    lookup_table_keys: &[String],
+) -> Result<AltCacheService, String> {
+    let account_batcher =
+        GetMultipleAccountsBatcher::new_with_window(endpoint, Duration::from_millis(1));
+    let fetched = account_batcher
+        .fetch(lookup_table_keys)
+        .map_err(|error| error.to_string())?;
+    let lookup_tables = lookup_table_keys
+        .iter()
+        .zip(fetched.ordered_values(lookup_table_keys))
+        .filter_map(|(account_key, account)| {
+            decode_lookup_table(account_key, account, fetched.slot)
+        })
+        .collect::<Vec<_>>();
+    Ok(AltCacheService {
+        revision: fetched.slot,
+        lookup_tables,
+    })
+}
+
 fn route_enabled_in_profile(
     route: &crate::config::RouteConfig,
     profile: RuntimeProfileConfig,
@@ -297,6 +466,38 @@ fn map_swap_side(side: &SwapSideConfig) -> SwapSide {
     match side {
         SwapSideConfig::BuyBase => SwapSide::BuyBase,
         SwapSideConfig::SellBase => SwapSide::SellBase,
+    }
+}
+
+fn map_sizing_mode(mode: crate::config::SizingModeConfig) -> SizingMode {
+    match mode {
+        crate::config::SizingModeConfig::Legacy => SizingMode::Legacy,
+        crate::config::SizingModeConfig::EvShadow => SizingMode::EvShadow,
+        crate::config::SizingModeConfig::EvLive => SizingMode::EvLive,
+    }
+}
+
+fn resolve_route_sizing(
+    global: &crate::config::StrategySizingConfig,
+    route: &crate::config::RouteSizingConfig,
+) -> RouteSizingPolicy {
+    RouteSizingPolicy {
+        mode: route
+            .mode
+            .map(map_sizing_mode)
+            .unwrap_or(map_sizing_mode(global.mode)),
+        min_trade_floor_sol_lamports: route
+            .min_trade_floor_sol_lamports
+            .unwrap_or(global.min_trade_floor_sol_lamports),
+        base_landing_rate_bps: route
+            .base_landing_rate_bps
+            .unwrap_or(global.base_landing_rate_bps),
+        base_expected_shortfall_bps: route
+            .base_expected_shortfall_bps
+            .unwrap_or(global.base_expected_shortfall_bps),
+        max_expected_shortfall_bps: route
+            .max_expected_shortfall_bps
+            .unwrap_or(global.max_expected_shortfall_bps),
     }
 }
 
@@ -549,17 +750,17 @@ fn collect_required_token_accounts(
                             }
                         })?
                     };
-                    let user_destination_address =
-                        if let Some(mint) = &config.user_destination_mint {
-                            associated_token_address(wallet_owner, mint, &config.token_program_id)?
-                        } else {
-                            config.user_destination_token_account.clone().ok_or_else(|| {
+                    let user_destination_address = if let Some(mint) = &config.user_destination_mint
+                    {
+                        associated_token_address(wallet_owner, mint, &config.token_program_id)?
+                    } else {
+                        config.user_destination_token_account.clone().ok_or_else(|| {
                                 BootstrapError::InvalidRouteConfig {
                                     route_id: route.route_id.clone(),
                                     detail: "raydium_simple_pool leg requires user_destination_token_account or user_destination_mint".into(),
                                 }
                             })?
-                        };
+                    };
                     insert_required_token_account(
                         &mut requirements,
                         route,
@@ -1174,20 +1375,27 @@ mod tests {
         RouteExecutionConfig as BuilderRouteExecutionConfig, TransactionBuilder,
     };
     use serde_json::{Value, json};
+    use solana_address_lookup_table_interface::{
+        program as alt_program,
+        state::{LOOKUP_TABLE_META_SIZE, LookupTableMeta, ProgramState},
+    };
     use solana_sdk::{
         hash::hashv,
         pubkey::Pubkey,
         signer::{Signer as SolanaCurveSigner, keypair::Keypair},
     };
     use state::types::{LookupTableSnapshot, PoolId, RouteId};
-    use strategy::{opportunity::OpportunityCandidate, quote::LegQuote};
+    use strategy::{
+        opportunity::{CandidateSelectionSource, OpportunityCandidate},
+        quote::LegQuote,
+    };
 
     use super::{
         BootstrapError, bootstrap, effective_max_quote_slot_lag, map_leg_execution,
         map_message_mode, map_swap_side, route_enabled_in_profile,
     };
     use crate::config::{
-        BotConfig, MessageModeConfig, OrcaSimplePoolLegExecutionConfig,
+        BotConfig, LookupTableConfig, MessageModeConfig, OrcaSimplePoolLegExecutionConfig,
         OrcaWhirlpoolLegExecutionConfig, RaydiumClmmLegExecutionConfig,
         RaydiumSimplePoolLegExecutionConfig, RouteClassConfig, RouteConfig, RouteExecutionConfig,
         RouteLegConfig, RouteLegExecutionConfig, RoutesConfig, SwapSideConfig,
@@ -1228,6 +1436,7 @@ mod tests {
             max_trade_size: 20_000,
             min_trade_size: None,
             size_ladder: Vec::new(),
+            sizing: Default::default(),
             execution_protection: Default::default(),
             legs: [
                 RouteLegConfig {
@@ -1315,6 +1524,7 @@ mod tests {
             max_trade_size: 20_000,
             min_trade_size: None,
             size_ladder: Vec::new(),
+            sizing: Default::default(),
             execution_protection: Default::default(),
             legs: [
                 RouteLegConfig {
@@ -1383,6 +1593,47 @@ mod tests {
         json!({
             "owner": owner_program,
             "data": [token_account_data(mint, owner), "base64"]
+        })
+    }
+
+    fn rpc_lookup_table_account(addresses: &[Pubkey], last_extended_slot: u64) -> Value {
+        let mut raw = vec![0u8; LOOKUP_TABLE_META_SIZE];
+        bincode::serialize_into(
+            &mut raw[..],
+            &ProgramState::LookupTable(LookupTableMeta {
+                last_extended_slot,
+                ..LookupTableMeta::default()
+            }),
+        )
+        .expect("serialize lookup table metadata");
+        for address in addresses {
+            raw.extend_from_slice(address.as_ref());
+        }
+        json!({
+            "owner": alt_program::id().to_string(),
+            "lamports": 0,
+            "data": [base64::engine::general_purpose::STANDARD.encode(raw), "base64"]
+        })
+    }
+
+    fn mock_latest_blockhash_response(slot: u64) -> Value {
+        json!({
+            "result": {
+                "context": { "slot": slot },
+                "value": {
+                    "blockhash": recent_blockhash(),
+                    "lastValidBlockHeight": 1
+                }
+            }
+        })
+    }
+
+    fn mock_balance_response(slot: u64, lamports: u64) -> Value {
+        json!({
+            "result": {
+                "context": { "slot": slot },
+                "value": lamports
+            }
         })
     }
 
@@ -1588,6 +1839,11 @@ mod tests {
             estimated_execution_cost_lamports: 0,
             estimated_execution_cost_quote_atoms: 0,
             expected_net_profit_quote_atoms: 1,
+            selected_by: CandidateSelectionSource::Legacy,
+            ranking_score_quote_atoms: 1,
+            expected_value_quote_atoms: 1,
+            p_land_bps: 10_000,
+            expected_shortfall_quote_atoms: 0,
             leg_quotes: [
                 LegQuote {
                     venue: route.legs[0].venue.clone(),
@@ -1772,6 +2028,8 @@ mod tests {
         config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
             match payload["method"].as_str().expect("method") {
+                "getLatestBlockhash" => mock_latest_blockhash_response(42).to_string(),
+                "getBalance" => mock_balance_response(42, 1).to_string(),
                 "getMultipleAccounts" => {
                     let keys = payload["params"][0].as_array().expect("account keys");
                     let values = keys
@@ -1791,6 +2049,71 @@ mod tests {
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
 
         bootstrap(config).expect("bootstrap should accept a prepared execution environment");
+    }
+
+    #[test]
+    fn bootstrap_seeds_live_cold_path_from_rpc_when_refresh_is_disabled() {
+        let mut route = valid_route_config();
+        let lookup_table_key = test_pubkey("bootstrap-alt");
+        let seeded_slot = 77u64;
+        let wallet_balance = 424_242u64;
+        let alt_addresses = vec![
+            Pubkey::new_from_array([1; 32]),
+            Pubkey::new_from_array([2; 32]),
+            Pubkey::new_from_array([3; 32]),
+        ];
+        let expected_alt_address_count = alt_addresses.len();
+        route.execution.lookup_tables = vec![LookupTableConfig {
+            account_key: lookup_table_key.clone(),
+        }];
+
+        let mut config = test_config(route);
+        config.signing.validate_execution_accounts = false;
+        config.state.bootstrap_blockhash_slot = 1;
+        config.state.bootstrap_alt_revision = 1;
+        config.signing.bootstrap_balance_lamports = 0;
+        config.signing.wallet_ready = false;
+        let seeded_alt_addresses = alt_addresses.clone();
+        config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            match payload["method"].as_str().expect("method") {
+                "getLatestBlockhash" => mock_latest_blockhash_response(seeded_slot).to_string(),
+                "getBalance" => mock_balance_response(seeded_slot, wallet_balance).to_string(),
+                "getMultipleAccounts" => json!({
+                    "result": {
+                        "context": { "slot": seeded_slot },
+                        "value": [rpc_lookup_table_account(&seeded_alt_addresses, seeded_slot - 1)]
+                    }
+                })
+                .to_string(),
+                other => panic!("unexpected method {other}"),
+            }
+        });
+
+        let runtime = bootstrap(config).expect("bootstrap should seed live cold-path services");
+        let execution = runtime.execution_state();
+        let expected_blockhash = recent_blockhash();
+
+        assert_eq!(execution.rpc_slot, Some(seeded_slot));
+        assert_eq!(execution.blockhash_slot, Some(seeded_slot));
+        assert_eq!(
+            execution.latest_blockhash.as_deref(),
+            Some(expected_blockhash.as_str())
+        );
+        assert_eq!(execution.alt_revision, seeded_slot);
+        assert_eq!(execution.wallet_balance_lamports, wallet_balance);
+        assert!(execution.wallet_ready);
+        assert_eq!(execution.lookup_tables.len(), 1);
+        assert_eq!(execution.lookup_tables[0].account_key, lookup_table_key);
+        assert_eq!(
+            execution.lookup_tables[0].addresses.len(),
+            expected_alt_address_count
+        );
+        assert_eq!(
+            execution.lookup_tables[0].last_extended_slot,
+            seeded_slot - 1
+        );
+        assert_eq!(execution.lookup_tables[0].fetched_slot, seeded_slot);
     }
 
     #[test]
@@ -1816,6 +2139,8 @@ mod tests {
         config.reconciliation.rpc_http_endpoint = spawn_mock_rpc_server(move |body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
             match payload["method"].as_str().expect("method") {
+                "getLatestBlockhash" => mock_latest_blockhash_response(42).to_string(),
+                "getBalance" => mock_balance_response(42, 1).to_string(),
                 "getMultipleAccounts" => {
                     let keys = payload["params"][0].as_array().expect("account keys");
                     let values = keys

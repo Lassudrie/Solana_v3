@@ -15,7 +15,10 @@ use builder::BuildRejectionReason;
 use reconciliation::{ExecutionOutcome, ExecutionRecord, FailureClass};
 use serde::{Deserialize, Serialize};
 use state::types::PoolSnapshot;
-use strategy::{opportunity::OpportunityDecision, reasons::RejectionReason};
+use strategy::{
+    opportunity::{CandidateSelectionSource, OpportunityDecision},
+    reasons::RejectionReason,
+};
 use submit::SubmitRejectionReason;
 
 pub use crate::route_health::RouteMonitorView;
@@ -130,10 +133,20 @@ pub struct MonitorTradeEvent {
     pub signature: String,
     pub submit_status: String,
     pub outcome: String,
+    pub selected_by: String,
+    pub ranking_score_quote_atoms: Option<i64>,
     pub expected_edge_quote_atoms: i64,
     pub estimated_cost_lamports: Option<u64>,
     pub estimated_cost_quote_atoms: Option<u64>,
     pub expected_pnl_quote_atoms: Option<i64>,
+    pub expected_value_quote_atoms: Option<i64>,
+    pub p_land_bps: Option<u16>,
+    pub expected_shortfall_quote_atoms: Option<u64>,
+    pub shadow_selected_by: Option<String>,
+    pub shadow_trade_size: Option<u64>,
+    pub shadow_ranking_score_quote_atoms: Option<i64>,
+    pub shadow_expected_value_quote_atoms: Option<i64>,
+    pub shadow_expected_pnl_quote_atoms: Option<i64>,
     pub realized_pnl_quote_atoms: Option<i64>,
     pub jito_tip_lamports: Option<u64>,
     pub active_execution_buffer_bps: Option<u16>,
@@ -613,6 +626,22 @@ impl ObserverState {
             .best_candidate
             .as_ref()
             .map(|candidate| candidate.expected_net_profit_quote_atoms);
+        let expected_value = report
+            .selection
+            .best_candidate
+            .as_ref()
+            .map(|candidate| candidate.expected_value_quote_atoms);
+        let p_land_bps = report
+            .selection
+            .best_candidate
+            .as_ref()
+            .map(|candidate| candidate.p_land_bps);
+        let expected_shortfall_quote_atoms = report
+            .selection
+            .best_candidate
+            .as_ref()
+            .map(|candidate| candidate.expected_shortfall_quote_atoms);
+        let shadow_candidate = report.selection.shadow_candidate.as_ref();
         let source_to_submit_nanos = duration_nanos_opt(report.pipeline_trace.total_to_submit);
         let submit_to_terminal_nanos = matches!(record.outcome, ExecutionOutcome::Pending)
             .then_some(None)
@@ -624,10 +653,33 @@ impl ObserverState {
             signature: record.chain_signature.clone(),
             submit_status: submit_status_label(record.submit_status).into(),
             outcome: outcome_label(&record.outcome).into(),
+            selected_by: report
+                .selection
+                .best_candidate
+                .as_ref()
+                .map(|candidate| selection_source_label(candidate.selected_by).into())
+                .unwrap_or_else(|| "unknown".into()),
+            ranking_score_quote_atoms: report
+                .selection
+                .best_candidate
+                .as_ref()
+                .map(|candidate| candidate.ranking_score_quote_atoms),
             expected_edge_quote_atoms: expected_edge,
             estimated_cost_lamports: estimated_cost,
             estimated_cost_quote_atoms,
             expected_pnl_quote_atoms: expected_pnl,
+            expected_value_quote_atoms: expected_value,
+            p_land_bps,
+            expected_shortfall_quote_atoms,
+            shadow_selected_by: shadow_candidate
+                .map(|candidate| selection_source_label(candidate.selected_by).into()),
+            shadow_trade_size: shadow_candidate.map(|candidate| candidate.trade_size),
+            shadow_ranking_score_quote_atoms: shadow_candidate
+                .map(|candidate| candidate.ranking_score_quote_atoms),
+            shadow_expected_value_quote_atoms: shadow_candidate
+                .map(|candidate| candidate.expected_value_quote_atoms),
+            shadow_expected_pnl_quote_atoms: shadow_candidate
+                .map(|candidate| candidate.expected_net_profit_quote_atoms),
             realized_pnl_quote_atoms: None,
             jito_tip_lamports: report
                 .build_result
@@ -1367,6 +1419,13 @@ fn outcome_label(outcome: &ExecutionOutcome) -> &'static str {
     }
 }
 
+fn selection_source_label(source: CandidateSelectionSource) -> &'static str {
+    match source {
+        CandidateSelectionSource::Legacy => "legacy",
+        CandidateSelectionSource::Ev => "ev",
+    }
+}
+
 fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
     match reason {
         RejectionReason::RouteNotRegistered => "route_not_registered",
@@ -1381,6 +1440,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::BlockhashUnavailable => "blockhash_unavailable",
         RejectionReason::BlockhashTooStale { .. } => "blockhash_too_stale",
         RejectionReason::ProfitBelowThreshold { .. } => "profit_below_threshold",
+        RejectionReason::TradeSizeBelowSizingFloor { .. } => "trade_size_below_sizing_floor",
         RejectionReason::TradeSizeTooLarge { .. } => "trade_size_too_large",
         RejectionReason::WalletNotReady => "wallet_not_ready",
         RejectionReason::WalletBalanceTooLow { .. } => "wallet_balance_too_low",
@@ -1388,6 +1448,7 @@ fn strategy_reason_code(reason: &RejectionReason) -> &'static str {
         RejectionReason::KillSwitchActive => "kill_switch_active",
         RejectionReason::QuoteFailed { .. } => "quote_failed",
         RejectionReason::ExecutionCostNotConvertible { .. } => "execution_cost_not_convertible",
+        RejectionReason::SizingFloorNotConvertible { .. } => "sizing_floor_not_convertible",
         RejectionReason::NoImpactedRoutes => "no_impacted_routes",
         RejectionReason::RouteFilteredOut { .. } => "route_filtered_out",
     }
@@ -1427,6 +1488,9 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
         RejectionReason::ProfitBelowThreshold { expected, minimum } => {
             format!("expected={expected}, minimum={minimum}")
         }
+        RejectionReason::TradeSizeBelowSizingFloor { maximum, minimum } => {
+            format!("maximum={maximum}, minimum={minimum}")
+        }
         RejectionReason::TradeSizeTooLarge { requested, maximum } => {
             format!("requested={requested}, maximum={maximum}")
         }
@@ -1438,6 +1502,7 @@ fn strategy_reason_detail(reason: &RejectionReason) -> String {
         }
         RejectionReason::QuoteFailed { detail } => detail.clone(),
         RejectionReason::ExecutionCostNotConvertible { detail } => detail.clone(),
+        RejectionReason::SizingFloorNotConvertible { detail } => detail.clone(),
         RejectionReason::RouteFilteredOut { route_id } => format!("route_id={}", route_id.0),
         _ => format!("{reason:?}"),
     }
@@ -1727,6 +1792,7 @@ mod tests {
             selection: SelectionOutcome {
                 decisions: Vec::new(),
                 best_candidate: None,
+                shadow_candidate: None,
             },
             build_result: None,
             signed_envelope: None,

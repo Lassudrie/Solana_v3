@@ -1,12 +1,15 @@
 use crate::{
+    RouteExecutionSizingState,
     guards::GuardrailSet,
-    opportunity::{OpportunityCandidate, OpportunityDecision, SelectionOutcome},
+    opportunity::{
+        CandidateSelectionSource, OpportunityCandidate, OpportunityDecision, SelectionOutcome,
+    },
     quote::{
         LocalTwoLegQuoteEngine, PoolPricingView, QuoteEngine, QuoteExecutionAdjustments,
-        route_uses_sol_quote_conversion,
+        route_uses_sol_quote_conversion, sol_lamports_to_quote_atoms,
     },
     reasons::RejectionReason,
-    route_registry::{RouteDefinition, RouteRegistry, SwapSide},
+    route_registry::{RouteDefinition, RouteRegistry, SizingMode, StrategySizingConfig, SwapSide},
 };
 use domain::{ExecutionSnapshot, PoolSnapshot, RouteId};
 use state::StatePlane;
@@ -22,6 +25,12 @@ pub struct OpportunitySelector<E = LocalTwoLegQuoteEngine> {
     guards: GuardrailSet,
 }
 
+#[derive(Debug, Clone)]
+struct RouteSelection {
+    live_candidate: OpportunityCandidate,
+    shadow_candidate: Option<OpportunityCandidate>,
+}
+
 impl<E> OpportunitySelector<E>
 where
     E: QuoteEngine,
@@ -33,14 +42,16 @@ where
         }
     }
 
-    pub fn evaluate(
+    pub(crate) fn evaluate(
         &self,
         registry: &RouteRegistry,
         state: &StatePlane,
         execution_state: &ExecutionSnapshot,
         impacted_routes: &[RouteId],
         inflight_submissions: usize,
+        sizing_config: &StrategySizingConfig,
         route_execution_buffers: &HashMap<RouteId, u16>,
+        route_execution_sizing: &HashMap<RouteId, RouteExecutionSizingState>,
     ) -> SelectionOutcome {
         if impacted_routes.is_empty() {
             return SelectionOutcome {
@@ -49,11 +60,13 @@ where
                     reason: RejectionReason::NoImpactedRoutes,
                 }],
                 best_candidate: None,
+                shadow_candidate: None,
             };
         }
 
         let mut decisions = Vec::with_capacity(impacted_routes.len());
-        let mut accepted = Vec::new();
+        let mut live_candidates = Vec::new();
+        let mut shadow_candidates = Vec::new();
 
         for route_id in impacted_routes {
             let Some(route) = registry.get(route_id) else {
@@ -69,11 +82,16 @@ where
                 state,
                 execution_state,
                 inflight_submissions,
+                sizing_config,
                 route_execution_buffers.get(route_id).copied(),
+                route_execution_sizing.get(route_id).copied(),
             ) {
-                Ok(candidate) => {
-                    accepted.push(candidate.clone());
-                    decisions.push(OpportunityDecision::Accepted(candidate));
+                Ok(selection) => {
+                    live_candidates.push(selection.live_candidate.clone());
+                    if let Some(candidate) = selection.shadow_candidate.clone() {
+                        shadow_candidates.push(candidate);
+                    }
+                    decisions.push(OpportunityDecision::Accepted(selection.live_candidate));
                 }
                 Err(reason) => decisions.push(OpportunityDecision::Rejected {
                     route_id: route_id.clone(),
@@ -82,13 +100,19 @@ where
             }
         }
 
-        let best_candidate = accepted
-            .into_iter()
-            .max_by_key(|candidate| candidate.expected_net_profit_quote_atoms);
+        let mut best_candidate = None;
+        for candidate in live_candidates {
+            select_best_candidate(&mut best_candidate, candidate);
+        }
+        let mut shadow_candidate = None;
+        for candidate in shadow_candidates {
+            select_best_candidate(&mut shadow_candidate, candidate);
+        }
 
         SelectionOutcome {
             decisions,
             best_candidate,
+            shadow_candidate,
         }
     }
 
@@ -98,8 +122,10 @@ where
         state: &StatePlane,
         execution_state: &ExecutionSnapshot,
         inflight_submissions: usize,
+        sizing_config: &StrategySizingConfig,
         active_execution_buffer_bps: Option<u16>,
-    ) -> Result<OpportunityCandidate, RejectionReason> {
+        route_execution_sizing: Option<RouteExecutionSizingState>,
+    ) -> Result<RouteSelection, RejectionReason> {
         self.guards
             .evaluate_route_readiness(&route.route_id, state)?;
 
@@ -140,10 +166,25 @@ where
         }
         reject_stale_for_execution(route, execution_state.head_slot, &execution_snapshots)?;
 
-        let mut best_candidate: Option<OpportunityCandidate> = None;
+        let route_sizing_state = route_execution_sizing.unwrap_or(RouteExecutionSizingState {
+            landing_rate_bps: route.sizing.base_landing_rate_bps,
+            expected_shortfall_bps: route.sizing.base_expected_shortfall_bps,
+        });
+        let effective_min_trade_size =
+            effective_min_trade_size(route, sol_quote_conversion_snapshot)
+                .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
+        if effective_min_trade_size > route.max_trade_size.max(1) {
+            return Err(RejectionReason::TradeSizeBelowSizingFloor {
+                maximum: route.max_trade_size.max(1),
+                minimum: effective_min_trade_size,
+            });
+        }
+
+        let mut best_legacy_candidate: Option<OpportunityCandidate> = None;
+        let mut best_ev_candidate: Option<OpportunityCandidate> = None;
         let mut last_rejection = None;
         let adjustments = route_quote_adjustments(route, active_execution_buffer_bps);
-        for trade_size in trade_sizes(route) {
+        for trade_size in trade_sizes(route, effective_min_trade_size) {
             let quote = match self.quote_engine.quote(
                 route,
                 [
@@ -182,55 +223,97 @@ where
                 last_rejection = Some(reason);
                 continue;
             }
+            let reserve_usage_bps =
+                reserve_usage_bps(route, [first, second], &quote).unwrap_or_default();
 
             match self
                 .guards
                 .evaluate_quote(route, &quote, execution_state, inflight_submissions)
             {
                 Ok(()) => {
-                    let candidate = OpportunityCandidate {
-                        route_id: route.route_id.clone(),
-                        quoted_slot: quote.quoted_slot,
+                    let p_land_bps = effective_landing_rate_bps(
+                        sizing_config,
+                        execution_state,
+                        inflight_submissions,
+                        route_sizing_state.landing_rate_bps,
+                    );
+                    let expected_shortfall_quote_atoms = expected_shortfall_quote_atoms(
+                        &quote,
+                        route_sizing_state.expected_shortfall_bps,
+                        active_execution_buffer_bps.unwrap_or_default(),
+                    );
+                    let execution_risk_penalty_quote_atoms = reserve_usage_penalty_quote_atoms(
+                        sizing_config,
+                        reserve_usage_bps,
+                        quote.expected_gross_profit_quote_atoms,
+                    );
+                    let expected_value_quote_atoms = expected_value_quote_atoms(
+                        p_land_bps,
+                        quote.expected_gross_profit_quote_atoms,
+                        quote.estimated_execution_cost_quote_atoms,
+                        expected_shortfall_quote_atoms,
+                        execution_risk_penalty_quote_atoms,
+                    );
+                    let shared_fields = CandidateSharedFields {
+                        route,
+                        quote: &quote,
                         leg_snapshot_slots: [first.last_update_slot, second.last_update_slot],
                         sol_quote_conversion_snapshot_slot: used_sol_quote_conversion_snapshot
                             .map(|snapshot| snapshot.last_update_slot),
-                        trade_size: quote.input_amount,
-                        active_execution_buffer_bps: route
-                            .execution_protection
-                            .as_ref()
-                            .map(|_| active_execution_buffer_bps.unwrap_or(0)),
-                        expected_net_output: quote.net_output_amount,
+                        active_execution_buffer_bps,
                         minimum_acceptable_output: self.guards.minimum_acceptable_output(
                             quote.input_amount,
                             quote.estimated_execution_cost_quote_atoms,
                         ),
-                        expected_gross_profit_quote_atoms: quote.expected_gross_profit_quote_atoms,
-                        estimated_execution_cost_lamports: quote.estimated_execution_cost_lamports,
-                        estimated_execution_cost_quote_atoms: quote
-                            .estimated_execution_cost_quote_atoms,
-                        expected_net_profit_quote_atoms: quote.expected_net_profit_quote_atoms,
-                        leg_quotes: quote.leg_quotes,
+                        p_land_bps,
+                        expected_shortfall_quote_atoms,
+                        expected_value_quote_atoms,
                     };
-                    match &best_candidate {
-                        Some(best)
-                            if best.expected_net_profit_quote_atoms
-                                > candidate.expected_net_profit_quote_atoms => {}
-                        Some(best)
-                            if best.expected_net_profit_quote_atoms
-                                == candidate.expected_net_profit_quote_atoms
-                                && best.trade_size <= candidate.trade_size => {}
-                        _ => best_candidate = Some(candidate),
+                    let legacy_candidate = build_candidate(
+                        shared_fields,
+                        CandidateSelectionSource::Legacy,
+                        quote.expected_net_profit_quote_atoms,
+                    );
+                    select_best_candidate(&mut best_legacy_candidate, legacy_candidate);
+
+                    if expected_value_quote_atoms >= self.guards.minimum_profit_quote_atoms() {
+                        let ev_candidate = build_candidate(
+                            shared_fields,
+                            CandidateSelectionSource::Ev,
+                            expected_value_quote_atoms,
+                        );
+                        select_best_candidate(&mut best_ev_candidate, ev_candidate);
+                    } else {
+                        last_rejection = Some(RejectionReason::ProfitBelowThreshold {
+                            expected: expected_value_quote_atoms,
+                            minimum: self.guards.minimum_profit_quote_atoms(),
+                        });
                     }
                 }
                 Err(reason) => last_rejection = Some(reason),
             }
         }
 
-        best_candidate.ok_or_else(|| {
-            last_rejection.unwrap_or(RejectionReason::RouteFilteredOut {
-                route_id: route.route_id.clone(),
+        let live_candidate = match route.sizing.mode {
+            SizingMode::Legacy | SizingMode::EvShadow => best_legacy_candidate.clone(),
+            SizingMode::EvLive => best_ev_candidate.clone(),
+        };
+        let shadow_candidate = match route.sizing.mode {
+            SizingMode::Legacy => None,
+            SizingMode::EvShadow => best_ev_candidate,
+            SizingMode::EvLive => best_legacy_candidate,
+        };
+
+        live_candidate
+            .map(|live_candidate| RouteSelection {
+                live_candidate,
+                shadow_candidate,
             })
-        })
+            .ok_or_else(|| {
+                last_rejection.unwrap_or(RejectionReason::RouteFilteredOut {
+                    route_id: route.route_id.clone(),
+                })
+            })
     }
 }
 
@@ -251,8 +334,7 @@ fn route_quote_adjustments(
     adjustments
 }
 
-fn trade_sizes(route: &RouteDefinition) -> Vec<u64> {
-    let min_trade_size = effective_min_trade_size(route);
+fn trade_sizes(route: &RouteDefinition, min_trade_size: u64) -> Vec<u64> {
     let max_trade_size = route.max_trade_size.max(min_trade_size);
     let default_trade_size = route
         .default_trade_size
@@ -279,12 +361,22 @@ fn trade_sizes(route: &RouteDefinition) -> Vec<u64> {
     prioritize_trade_sizes(candidates.into_iter().collect(), default_trade_size)
 }
 
-fn effective_min_trade_size(route: &RouteDefinition) -> u64 {
-    route
+fn effective_min_trade_size(
+    route: &RouteDefinition,
+    sol_quote_conversion_snapshot: Option<&PoolSnapshot>,
+) -> Result<u64, String> {
+    let route_min_trade_size = route
         .min_trade_size
         .max(1)
         .min(route.default_trade_size.max(1))
-        .min(route.max_trade_size.max(1))
+        .min(route.max_trade_size.max(1));
+    let sizing_floor = sol_lamports_to_quote_atoms(
+        route,
+        sol_quote_conversion_snapshot,
+        route.sizing.min_trade_floor_sol_lamports,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(route_min_trade_size.max(sizing_floor))
 }
 
 fn prioritize_trade_sizes(mut sizes: Vec<u64>, default_trade_size: u64) -> Vec<u64> {
@@ -343,6 +435,154 @@ fn reserve_usage_rejection(
     None
 }
 
+fn reserve_usage_bps(
+    route: &RouteDefinition,
+    snapshots: [&PoolSnapshot; 2],
+    quote: &crate::quote::RouteQuote,
+) -> Option<u64> {
+    let base_mint = route.base_mint.as_deref()?;
+    let quote_mint = route.quote_mint.as_deref()?;
+
+    route
+        .legs
+        .iter()
+        .zip(snapshots.iter())
+        .enumerate()
+        .filter_map(|(index, (leg, snapshot))| {
+            let (input_mint, output_mint) = match leg.side {
+                SwapSide::BuyBase => (quote_mint, base_mint),
+                SwapSide::SellBase => (base_mint, quote_mint),
+            };
+            let (reserve_in, _) =
+                snapshot.constant_product_reserves_for(input_mint, output_mint)?;
+            let input_amount = quote.leg_quotes[index].input_amount;
+            Some(
+                ((u128::from(input_amount) * 10_000u128)
+                    .saturating_add(u128::from(reserve_in).saturating_sub(1))
+                    / u128::from(reserve_in)) as u64,
+            )
+        })
+        .max()
+}
+
+fn effective_landing_rate_bps(
+    sizing_config: &StrategySizingConfig,
+    execution_state: &ExecutionSnapshot,
+    inflight_submissions: usize,
+    route_landing_rate_bps: u16,
+) -> u16 {
+    let inflight_penalty_bps = u16::try_from(inflight_submissions)
+        .unwrap_or(u16::MAX)
+        .saturating_mul(sizing_config.inflight_penalty_bps_per_submission)
+        .min(sizing_config.max_inflight_penalty_bps);
+    let blockhash_penalty_bps = execution_state
+        .blockhash_slot_lag()
+        .unwrap_or_default()
+        .min(u64::from(u16::MAX)) as u16;
+    let blockhash_penalty_bps = blockhash_penalty_bps
+        .saturating_mul(sizing_config.blockhash_penalty_bps_per_slot)
+        .min(sizing_config.max_blockhash_penalty_bps);
+    route_landing_rate_bps
+        .saturating_sub(inflight_penalty_bps)
+        .saturating_sub(blockhash_penalty_bps)
+}
+
+fn expected_shortfall_quote_atoms(
+    quote: &crate::quote::RouteQuote,
+    route_expected_shortfall_bps: u16,
+    active_execution_buffer_bps: u16,
+) -> u64 {
+    let shortfall_bps = route_expected_shortfall_bps.max(active_execution_buffer_bps);
+    ((u128::from(quote.net_output_amount) * u128::from(shortfall_bps)) / 10_000u128) as u64
+}
+
+fn reserve_usage_penalty_quote_atoms(
+    sizing_config: &StrategySizingConfig,
+    reserve_usage_bps: u64,
+    expected_gross_profit_quote_atoms: i64,
+) -> u64 {
+    if expected_gross_profit_quote_atoms <= 0 {
+        return 0;
+    }
+    let penalty_bps = ((reserve_usage_bps
+        .saturating_mul(u64::from(sizing_config.max_reserve_usage_penalty_bps)))
+        / MAX_RESERVE_USAGE_BPS)
+        .min(u64::from(sizing_config.max_reserve_usage_penalty_bps));
+    ((expected_gross_profit_quote_atoms as u128) * u128::from(penalty_bps) / 10_000u128) as u64
+}
+
+fn expected_value_quote_atoms(
+    p_land_bps: u16,
+    expected_gross_profit_quote_atoms: i64,
+    estimated_execution_cost_quote_atoms: u64,
+    expected_shortfall_quote_atoms: u64,
+    execution_risk_penalty_quote_atoms: u64,
+) -> i64 {
+    let value_before_penalty = i128::from(expected_gross_profit_quote_atoms)
+        .saturating_sub(i128::from(estimated_execution_cost_quote_atoms))
+        .saturating_sub(i128::from(expected_shortfall_quote_atoms));
+    let weighted = value_before_penalty
+        .saturating_mul(i128::from(p_land_bps))
+        .saturating_div(10_000);
+    (weighted - i128::from(execution_risk_penalty_quote_atoms))
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+#[derive(Clone, Copy)]
+struct CandidateSharedFields<'a> {
+    route: &'a RouteDefinition,
+    quote: &'a crate::quote::RouteQuote,
+    leg_snapshot_slots: [u64; 2],
+    sol_quote_conversion_snapshot_slot: Option<u64>,
+    active_execution_buffer_bps: Option<u16>,
+    minimum_acceptable_output: u64,
+    p_land_bps: u16,
+    expected_shortfall_quote_atoms: u64,
+    expected_value_quote_atoms: i64,
+}
+
+fn build_candidate(
+    shared: CandidateSharedFields<'_>,
+    selected_by: CandidateSelectionSource,
+    ranking_score_quote_atoms: i64,
+) -> OpportunityCandidate {
+    OpportunityCandidate {
+        route_id: shared.route.route_id.clone(),
+        quoted_slot: shared.quote.quoted_slot,
+        leg_snapshot_slots: shared.leg_snapshot_slots,
+        sol_quote_conversion_snapshot_slot: shared.sol_quote_conversion_snapshot_slot,
+        trade_size: shared.quote.input_amount,
+        selected_by,
+        ranking_score_quote_atoms,
+        expected_value_quote_atoms: shared.expected_value_quote_atoms,
+        p_land_bps: shared.p_land_bps,
+        expected_shortfall_quote_atoms: shared.expected_shortfall_quote_atoms,
+        active_execution_buffer_bps: shared
+            .route
+            .execution_protection
+            .as_ref()
+            .map(|_| shared.active_execution_buffer_bps.unwrap_or(0)),
+        expected_net_output: shared.quote.net_output_amount,
+        minimum_acceptable_output: shared.minimum_acceptable_output,
+        expected_gross_profit_quote_atoms: shared.quote.expected_gross_profit_quote_atoms,
+        estimated_execution_cost_lamports: shared.quote.estimated_execution_cost_lamports,
+        estimated_execution_cost_quote_atoms: shared.quote.estimated_execution_cost_quote_atoms,
+        expected_net_profit_quote_atoms: shared.quote.expected_net_profit_quote_atoms,
+        leg_quotes: shared.quote.leg_quotes.clone(),
+    }
+}
+
+fn select_best_candidate(best: &mut Option<OpportunityCandidate>, candidate: OpportunityCandidate) {
+    match best {
+        Some(current)
+            if current.ranking_score_quote_atoms > candidate.ranking_score_quote_atoms => {}
+        Some(current)
+            if current.ranking_score_quote_atoms == candidate.ranking_score_quote_atoms
+                && current.trade_size <= candidate.trade_size => {}
+        _ => *best = Some(candidate),
+    }
+}
+
 fn reject_stale_for_execution(
     route: &RouteDefinition,
     head_slot: u64,
@@ -383,7 +623,7 @@ mod tests {
 
     const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 
-    use super::{OpportunitySelector, trade_sizes};
+    use super::{OpportunitySelector, effective_min_trade_size, trade_sizes};
     use crate::{
         guards::{GuardrailConfig, GuardrailSet},
         quote::{
@@ -391,7 +631,10 @@ mod tests {
             RouteQuote,
         },
         reasons::RejectionReason,
-        route_registry::{ExecutionProtectionPolicy, RouteDefinition, RouteLeg, SwapSide},
+        route_registry::{
+            ExecutionProtectionPolicy, RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode,
+            StrategySizingConfig, SwapSide,
+        },
     };
     use domain::{
         EventSourceKind, ExecutionStateSnapshot, NormalizedEvent, PoolId, PoolSnapshotUpdate,
@@ -401,6 +644,23 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct MockQuoteEngine;
+
+    fn sizing_config() -> StrategySizingConfig {
+        StrategySizingConfig {
+            mode: SizingMode::Legacy,
+            min_trade_floor_sol_lamports: 0,
+            base_landing_rate_bps: 8_500,
+            ewma_alpha_bps: 2_000,
+            base_expected_shortfall_bps: 75,
+            max_expected_shortfall_bps: 500,
+            too_little_output_shortfall_step_bps: 75,
+            inflight_penalty_bps_per_submission: 25,
+            max_inflight_penalty_bps: 1_500,
+            blockhash_penalty_bps_per_slot: 10,
+            max_blockhash_penalty_bps: 1_000,
+            max_reserve_usage_penalty_bps: 1_250,
+        }
+    }
 
     impl QuoteEngine for MockQuoteEngine {
         fn quote(
@@ -563,13 +823,27 @@ mod tests {
             max_trade_size: 5_000_000,
             size_ladder: Vec::new(),
             estimated_execution_cost_lamports: 0,
+            sizing: RouteSizingPolicy {
+                mode: SizingMode::Legacy,
+                min_trade_floor_sol_lamports: 0,
+                base_landing_rate_bps: 8_500,
+                base_expected_shortfall_bps: 75,
+                max_expected_shortfall_bps: 500,
+            },
             execution_protection: None,
         }
     }
 
+    fn trade_sizes_for_test(route: &RouteDefinition) -> Vec<u64> {
+        trade_sizes(
+            route,
+            effective_min_trade_size(route, None).expect("sizing floor"),
+        )
+    }
+
     #[test]
     fn default_ladder_evaluates_default_then_smaller_then_larger_sizes() {
-        let sizes = trade_sizes(&route_definition());
+        let sizes = trade_sizes_for_test(&route_definition());
         assert_eq!(
             sizes,
             vec![1_000_000, 500_000, 250_000, 2_000_000, 3_000_000, 5_000_000]
@@ -581,7 +855,7 @@ mod tests {
         let mut route = route_definition();
         route.size_ladder = vec![100_000, 250_000, 500_000, 2_000_000, 3_000_000];
 
-        let sizes = trade_sizes(&route);
+        let sizes = trade_sizes_for_test(&route);
         assert_eq!(
             sizes,
             vec![1_000_000, 500_000, 250_000, 2_000_000, 3_000_000, 5_000_000]
@@ -642,12 +916,20 @@ mod tests {
         }
 
         let candidate = selector
-            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
             .expect("smaller profitable trade size should be selected");
 
-        assert_eq!(candidate.trade_size, 250_000);
-        assert_eq!(candidate.expected_net_profit_quote_atoms, 25);
-        assert_eq!(candidate.leg_snapshot_slots, [10, 10]);
+        assert_eq!(candidate.live_candidate.trade_size, 250_000);
+        assert_eq!(candidate.live_candidate.expected_net_profit_quote_atoms, 25);
+        assert_eq!(candidate.live_candidate.leg_snapshot_slots, [10, 10]);
     }
 
     #[test]
@@ -704,11 +986,19 @@ mod tests {
         }
 
         let candidate = selector
-            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
             .expect("smaller trade size should still be selected after quote failures");
 
-        assert_eq!(candidate.trade_size, 250_000);
-        assert_eq!(candidate.expected_net_profit_quote_atoms, 25);
+        assert_eq!(candidate.live_candidate.trade_size, 250_000);
+        assert_eq!(candidate.live_candidate.expected_net_profit_quote_atoms, 25);
     }
 
     #[test]
@@ -772,11 +1062,22 @@ mod tests {
         }
 
         let candidate = selector
-            .evaluate_route(&route, &state, &execution_state, 0, Some(50))
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                Some(50),
+                None,
+            )
             .expect("protected route should remain tradable");
 
-        assert_eq!(candidate.trade_size, 500_000);
-        assert_eq!(candidate.active_execution_buffer_bps, Some(50));
+        assert_eq!(candidate.live_candidate.trade_size, 500_000);
+        assert_eq!(
+            candidate.live_candidate.active_execution_buffer_bps,
+            Some(50)
+        );
     }
 
     #[test]
@@ -834,12 +1135,20 @@ mod tests {
         state.set_latest_slot(12);
 
         let candidate = selector
-            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
             .expect("candidate should be selected");
 
-        assert_eq!(candidate.quoted_slot, 12);
-        assert_eq!(candidate.leg_snapshot_slots, [8, 11]);
-        assert_eq!(candidate.oldest_leg_snapshot_slot(), 8);
+        assert_eq!(candidate.live_candidate.quoted_slot, 12);
+        assert_eq!(candidate.live_candidate.leg_snapshot_slots, [8, 11]);
+        assert_eq!(candidate.live_candidate.oldest_leg_snapshot_slot(), 8);
     }
 
     #[test]
@@ -900,13 +1209,24 @@ mod tests {
         state.set_latest_slot(12);
 
         let candidate = selector
-            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
             .expect("candidate should be selected");
 
-        assert_eq!(candidate.quoted_slot, 7);
-        assert_eq!(candidate.leg_snapshot_slots, [8, 11]);
-        assert_eq!(candidate.sol_quote_conversion_snapshot_slot, Some(7));
-        assert_eq!(candidate.oldest_relevant_snapshot_slot(), 7);
+        assert_eq!(candidate.live_candidate.quoted_slot, 7);
+        assert_eq!(candidate.live_candidate.leg_snapshot_slots, [8, 11]);
+        assert_eq!(
+            candidate.live_candidate.sol_quote_conversion_snapshot_slot,
+            Some(7)
+        );
+        assert_eq!(candidate.live_candidate.oldest_relevant_snapshot_slot(), 7);
     }
 
     #[test]
@@ -968,7 +1288,15 @@ mod tests {
         state.set_latest_slot(43);
 
         let rejected = selector
-            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
             .expect_err("stale-for-execution route should be rejected before quoting");
 
         assert_eq!(
@@ -1044,7 +1372,15 @@ mod tests {
         state.set_latest_slot(43);
 
         let rejected = selector
-            .evaluate_route(&route, &state, &execution_state, 0, None)
+            .evaluate_route(
+                &route,
+                &state,
+                &execution_state,
+                0,
+                &sizing_config(),
+                None,
+                None,
+            )
             .expect_err("stale conversion pool should be rejected before quoting");
 
         assert_eq!(

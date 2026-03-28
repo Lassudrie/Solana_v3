@@ -999,8 +999,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("pool-a", 1, 12_000),
-                replay_event("pool-b", 2, 12_000)
+                replay_event("pool-a", 1, 5_000),
+                replay_event("pool-b", 2, 20_000)
             ),
         )
         .unwrap();
@@ -1030,8 +1030,8 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("pool-a", 1, 12_000),
-                replay_event("pool-b", 2, 12_000)
+                replay_event("pool-a", 1, 5_000),
+                replay_event("pool-b", 2, 20_000)
             ),
         )
         .unwrap();
@@ -1061,15 +1061,30 @@ mod tests {
             &path,
             format!(
                 "{}\n{}\n",
-                replay_event("pool-a", 1, 12_000),
-                replay_event("pool-b", 2, 12_000)
+                replay_event("pool-a", 1, 5_000),
+                replay_event("pool-b", 2, 20_000)
             ),
         )
         .unwrap();
 
-        let rpc_endpoint = spawn_mock_rpc_server(|body| {
+        let latest_blockhash = hashv(&[b"daemon-reconcile-test-blockhash"]).to_string();
+        let rpc_endpoint = spawn_mock_rpc_server(move |body| {
             let payload: Value = serde_json::from_str(body).expect("json-rpc body");
             match payload["method"].as_str().expect("method") {
+                "getLatestBlockhash" => json!({
+                    "result": {
+                        "context": { "slot": 0 },
+                        "value": { "blockhash": latest_blockhash }
+                    }
+                })
+                .to_string(),
+                "getBalance" => json!({
+                    "result": {
+                        "context": { "slot": 0 },
+                        "value": 1_000_000_000u64
+                    }
+                })
+                .to_string(),
                 "getSignatureStatuses" => {
                     json!({ "result": { "value": [{ "slot": 99, "err": null }] } }).to_string()
                 }
@@ -1089,9 +1104,9 @@ mod tests {
         let status = daemon.status_snapshot();
 
         assert_eq!(exit, DaemonExit::SourceExhausted);
-        assert_eq!(status.metrics.submit_count, 1);
-        assert_eq!(status.metrics.inclusion_count, 1);
-        assert_eq!(status.inflight_submissions, 0);
+        assert_eq!(status.metrics.submit_count, 1, "{status:?}");
+        assert_eq!(status.metrics.inclusion_count, 1, "{status:?}");
+        assert_eq!(status.inflight_submissions, 0, "{status:?}");
 
         let _ = fs::remove_file(path);
     }
@@ -1102,14 +1117,13 @@ mod tests {
         fs::write(&path, "").unwrap();
         let mut config = bot_config(path.to_string_lossy().into_owned());
         config.runtime.health_server.enabled = false;
-        config
-            .routes
-            .definitions
-            .push(unwarmed_route("route-b", "pool-c", "pool-d", "acct-c", "acct-d"));
+        config.routes.definitions.push(unwarmed_route(
+            "route-b", "pool-c", "pool-d", "acct-c", "acct-d",
+        ));
         let mut daemon = BotDaemon::from_config(config).unwrap();
 
-        daemon.process_source_event(replay_snapshot_event("pool-a", 1, 12_000));
-        daemon.process_source_event(replay_snapshot_event("pool-b", 2, 12_000));
+        daemon.process_source_event(replay_snapshot_event("pool-a", 1, 5_000));
+        daemon.process_source_event(replay_snapshot_event("pool-b", 2, 20_000));
         daemon.flush_build_sign_dispatcher();
         daemon.flush_submit_dispatcher();
         daemon.flush_reconciliation_worker();
@@ -1142,15 +1156,19 @@ mod tests {
                 enabled: true,
                 route_class: RouteClassConfig::AmmFastPath,
                 route_id: "route-a".into(),
-                input_mint: "USDC".into(),
-                output_mint: "USDC".into(),
-                base_mint: None,
-                quote_mint: None,
-                sol_quote_conversion_pool_id: None,
+                input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+                output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+                base_mint: Some("So11111111111111111111111111111111111111112".into()),
+                quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+                sol_quote_conversion_pool_id: Some("pool-a".into()),
                 min_trade_size: None,
                 default_trade_size: 10_000,
                 max_trade_size: 20_000,
                 size_ladder: Vec::new(),
+                sizing: crate::config::RouteSizingConfig {
+                    min_trade_floor_sol_lamports: Some(0),
+                    ..Default::default()
+                },
                 execution_protection: Default::default(),
                 legs: [
                     RouteLegConfig {
@@ -1199,7 +1217,9 @@ mod tests {
                                 market_pc_vault: test_pubkey("serum-pc-vault"),
                                 market_vault_signer: test_pubkey("serum-vault-signer"),
                                 user_source_token_account: Some(test_pubkey("route-mid-ata")),
-                                user_destination_token_account: Some(test_pubkey("route-output-ata")),
+                                user_destination_token_account: Some(test_pubkey(
+                                    "route-output-ata",
+                                )),
                                 user_source_mint: None,
                                 user_destination_mint: None,
                             },
@@ -1245,15 +1265,19 @@ mod tests {
             enabled: true,
             route_class: RouteClassConfig::AmmFastPath,
             route_id: route_id.into(),
-            input_mint: "USDC".into(),
-            output_mint: "USDC".into(),
-            base_mint: None,
-            quote_mint: None,
-            sol_quote_conversion_pool_id: None,
+            input_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            output_mint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
+            base_mint: Some("So11111111111111111111111111111111111111112".into()),
+            quote_mint: Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into()),
+            sol_quote_conversion_pool_id: Some(first_pool_id.into()),
             min_trade_size: None,
             default_trade_size: 10_000,
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
+            sizing: crate::config::RouteSizingConfig {
+                min_trade_floor_sol_lamports: Some(0),
+                ..Default::default()
+            },
             execution_protection: Default::default(),
             legs: [
                 RouteLegConfig {
@@ -1340,12 +1364,25 @@ mod tests {
     }
 
     fn replay_event(pool_id: &str, sequence: u64, price_bps: u64) -> String {
+        let reserve_a = 100_000u64;
+        let reserve_b = (reserve_a as u128)
+            .saturating_mul(price_bps as u128)
+            .checked_div(10_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(reserve_a);
+        let reserve_depth = reserve_a.max(reserve_b);
         format!(
-            "{{\"type\":\"pool_snapshot_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pool_id\":\"{pool_id}\",\"price_bps\":{price_bps},\"fee_bps\":4,\"reserve_depth\":100000,\"reserve_a\":100000,\"reserve_b\":100000,\"active_liquidity\":100000,\"sqrt_price_x64\":null,\"venue\":\"orca_simple_pool\",\"confidence\":\"executable\",\"repair_pending\":false,\"token_mint_a\":\"SOL\",\"token_mint_b\":\"USDC\",\"tick_spacing\":0,\"current_tick_index\":null,\"slot\":{sequence},\"write_version\":1}}"
+            "{{\"type\":\"pool_snapshot_update\",\"source\":\"replay\",\"sequence\":{sequence},\"observed_slot\":{sequence},\"pool_id\":\"{pool_id}\",\"price_bps\":{price_bps},\"fee_bps\":4,\"reserve_depth\":{reserve_depth},\"reserve_a\":{reserve_a},\"reserve_b\":{reserve_b},\"active_liquidity\":{reserve_depth},\"sqrt_price_x64\":null,\"venue\":\"orca_simple_pool\",\"confidence\":\"executable\",\"repair_pending\":false,\"token_mint_a\":\"So11111111111111111111111111111111111111112\",\"token_mint_b\":\"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\",\"tick_spacing\":0,\"current_tick_index\":null,\"slot\":{sequence},\"write_version\":1}}"
         )
     }
 
     fn replay_snapshot_event(pool_id: &str, sequence: u64, price_bps: u64) -> NormalizedEvent {
+        let reserve_a = 100_000u64;
+        let reserve_b = (reserve_a as u128)
+            .saturating_mul(price_bps as u128)
+            .checked_div(10_000)
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or(reserve_a);
         NormalizedEvent::pool_snapshot_update(
             EventSourceKind::Replay,
             sequence,
@@ -1354,16 +1391,16 @@ mod tests {
                 pool_id: pool_id.into(),
                 price_bps,
                 fee_bps: 4,
-                reserve_depth: 100_000,
-                reserve_a: Some(100_000),
-                reserve_b: Some(100_000),
-                active_liquidity: Some(100_000),
+                reserve_depth: reserve_a.max(reserve_b),
+                reserve_a: Some(reserve_a),
+                reserve_b: Some(reserve_b),
+                active_liquidity: Some(reserve_a.max(reserve_b)),
                 sqrt_price_x64: None,
                 venue: PoolVenue::OrcaSimplePool,
                 confidence: SnapshotConfidence::Executable,
                 repair_pending: Some(false),
-                token_mint_a: "SOL".into(),
-                token_mint_b: "USDC".into(),
+                token_mint_a: "So11111111111111111111111111111111111111112".into(),
+                token_mint_b: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into(),
                 tick_spacing: 0,
                 current_tick_index: None,
                 slot: sequence,

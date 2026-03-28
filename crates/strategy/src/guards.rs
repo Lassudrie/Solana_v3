@@ -33,6 +33,10 @@ impl GuardrailSet {
         Self { config }
     }
 
+    pub fn minimum_profit_quote_atoms(&self) -> i64 {
+        self.config.min_profit_quote_atoms
+    }
+
     pub fn minimum_acceptable_output(
         &self,
         trade_size: u64,
@@ -176,7 +180,7 @@ mod tests {
         guards::{GuardrailConfig, GuardrailSet},
         quote::{LegQuote, RouteQuote},
         reasons::RejectionReason,
-        route_registry::{RouteDefinition, RouteLeg, SwapSide},
+        route_registry::{RouteDefinition, RouteLeg, RouteSizingPolicy, SizingMode, SwapSide},
     };
 
     fn executable_snapshot(pool_id: &str, slot_lag: u64) -> PoolSnapshot {
@@ -236,6 +240,13 @@ mod tests {
             max_trade_size: 20_000,
             size_ladder: Vec::new(),
             estimated_execution_cost_lamports: 0,
+            sizing: RouteSizingPolicy {
+                mode: SizingMode::Legacy,
+                min_trade_floor_sol_lamports: 100_000_000,
+                base_landing_rate_bps: 8_500,
+                base_expected_shortfall_bps: 75,
+                max_expected_shortfall_bps: 500,
+            },
             execution_protection: None,
         }
     }

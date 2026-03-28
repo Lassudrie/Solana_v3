@@ -3950,9 +3950,7 @@ fn build_executable_state_from_accounts(
                     last_update_slot: slot,
                     write_version: next_write_version,
                     last_verified_slot: slot,
-                    confidence: constant_product_confidence_for_venue(
-                        PoolVenue::RaydiumSimplePool,
-                    ),
+                    confidence: constant_product_confidence_for_venue(PoolVenue::RaydiumSimplePool),
                     repair_pending: false,
                 }),
                 quote_model_update: None,
