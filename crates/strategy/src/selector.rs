@@ -284,8 +284,11 @@ where
             max_trade_size: route.max_trade_size,
         });
         let source_input_balance = source_input_balance(route, execution_state)?;
-        let effective_max_trade_size =
-            effective_max_trade_size(route, route_sizing_state.max_trade_size, source_input_balance);
+        let effective_max_trade_size = effective_max_trade_size(
+            route,
+            route_sizing_state.max_trade_size,
+            source_input_balance,
+        );
         if sizing_config.fixed_trade_size {
             return self.evaluate_route_fixed_size(
                 route,
@@ -309,10 +312,9 @@ where
                 effective_min_trade_size(route, sol_quote_conversion_snapshot)
                     .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
             if effective_min_trade_size > effective_max_trade_size.max(1) {
-                if let (Some(account), Some(current)) = (
-                    route.input_source_account.as_ref(),
-                    source_input_balance,
-                ) {
+                if let (Some(account), Some(current)) =
+                    (route.input_source_account.as_ref(), source_input_balance)
+                {
                     return Err(RejectionReason::SourceBalanceTooLow {
                         account: account.clone(),
                         current,
@@ -324,11 +326,7 @@ where
                     minimum: effective_min_trade_size,
                 });
             }
-            trade_sizes(
-                route,
-                effective_min_trade_size,
-                effective_max_trade_size,
-            )
+            trade_sizes(route, effective_min_trade_size, effective_max_trade_size)
         };
 
         let mut best_legacy_candidate: Option<OpportunityCandidate> = None;
@@ -506,8 +504,9 @@ where
         effective_max_trade_size: u64,
         route_sizing_state: RouteExecutionSizingState,
     ) -> Result<RouteSelection, RejectionReason> {
-        let effective_min_trade_size = effective_min_trade_size(route, sol_quote_conversion_snapshot)
-            .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
+        let effective_min_trade_size =
+            effective_min_trade_size(route, sol_quote_conversion_snapshot)
+                .map_err(|detail| RejectionReason::SizingFloorNotConvertible { detail })?;
         if effective_min_trade_size > effective_max_trade_size.max(1) {
             if let (Some(account), Some(current)) =
                 (route.input_source_account.as_ref(), source_input_balance)
@@ -933,8 +932,7 @@ fn effective_landing_rate_bps(
         .saturating_mul(sizing_config.blockhash_penalty_bps_per_slot)
         .min(sizing_config.max_blockhash_penalty_bps);
     let quote_age_slots = execution_state.head_slot.saturating_sub(quote.quoted_slot);
-    let quote_age_penalty_bps = quote_age_slots
-        .min(u64::from(u16::MAX)) as u16;
+    let quote_age_penalty_bps = quote_age_slots.min(u64::from(u16::MAX)) as u16;
     let quote_age_penalty_bps = quote_age_penalty_bps
         .saturating_mul(sizing_config.quote_age_penalty_bps_per_slot)
         .min(sizing_config.max_quote_age_penalty_bps);

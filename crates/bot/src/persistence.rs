@@ -847,7 +847,9 @@ fn trade_from_report(seq: u64, report: &HotPathReport) -> Option<MonitorTradeEve
         route_kind: best_candidate
             .map(|candidate| route_kind_label(candidate.route_kind).into())
             .unwrap_or_else(|| "unknown".into()),
-        leg_count: best_candidate.map(|candidate| candidate.leg_count()).unwrap_or_default(),
+        leg_count: best_candidate
+            .map(|candidate| candidate.leg_count())
+            .unwrap_or_default(),
         trade_size: best_candidate.map(|candidate| candidate.trade_size),
         submission_id: record.submission_id.0.clone(),
         signature: record.chain_signature.clone(),
@@ -856,7 +858,8 @@ fn trade_from_report(seq: u64, report: &HotPathReport) -> Option<MonitorTradeEve
         selected_by: best_candidate
             .map(|candidate| selection_source_label(candidate.selected_by).into())
             .unwrap_or_else(|| "unknown".into()),
-        ranking_score_quote_atoms: best_candidate.map(|candidate| candidate.ranking_score_quote_atoms),
+        ranking_score_quote_atoms: best_candidate
+            .map(|candidate| candidate.ranking_score_quote_atoms),
         expected_edge_quote_atoms: expected_edge,
         estimated_cost_lamports: estimated_cost,
         estimated_cost_quote_atoms,
@@ -884,9 +887,13 @@ fn trade_from_report(seq: u64, report: &HotPathReport) -> Option<MonitorTradeEve
         active_execution_buffer_bps: best_candidate
             .and_then(|candidate| candidate.active_execution_buffer_bps),
         source_input_balance: best_candidate.and_then(|candidate| candidate.source_input_balance),
-        oldest_snapshot_slot: best_candidate.map(|candidate| candidate.oldest_relevant_snapshot_slot()),
-        quote_state_age_slots: best_candidate
-            .map(|candidate| candidate.quoted_slot.saturating_sub(candidate.oldest_relevant_snapshot_slot())),
+        oldest_snapshot_slot: best_candidate
+            .map(|candidate| candidate.oldest_relevant_snapshot_slot()),
+        quote_state_age_slots: best_candidate.map(|candidate| {
+            candidate
+                .quoted_slot
+                .saturating_sub(candidate.oldest_relevant_snapshot_slot())
+        }),
         leg_ticks_crossed: best_candidate
             .map(|candidate| {
                 candidate

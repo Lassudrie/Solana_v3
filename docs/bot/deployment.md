@@ -75,6 +75,8 @@ Le script `scripts/render_bot_config.sh` transforme ensuite le manifest de route
 - `signing.validate_execution_accounts = true`
 - `[runtime.event_source] mode = "shredstream"`
 - `[runtime.monitor_server] enabled = true`
+- `[runtime.control] idle_sleep_millis = 0`
+- `[runtime.control] max_events_per_tick = 512`
 - `[shredstream] grpc_endpoint = "http://127.0.0.1:50051"`
 
 Le `owner_pubkey` est volontairement vide pour laisser le bot interroger `signerd` et recuperer la vraie cle publique de la hot wallet au boot.

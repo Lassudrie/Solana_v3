@@ -25,8 +25,8 @@ use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, interval};
 use yellowstone_grpc_client::GeyserGrpcBuilder;
 use yellowstone_grpc_proto::prelude::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions,
-    SubscribeRequestPing, subscribe_update::UpdateOneof as UpdateOneof,
+    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+    subscribe_update::UpdateOneof,
 };
 
 fn main() {
@@ -135,8 +135,7 @@ async fn run_bridge(
 
         eprintln!(
             "yellowstone bridge: streaming {} -> {}",
-            config.yellowstone_endpoint,
-            config.proxy.listen_address
+            config.yellowstone_endpoint, config.proxy.listen_address
         );
         backoff = base_backoff;
 
@@ -269,14 +268,20 @@ fn queue_transaction(
     transaction: LegacyVersionedTransaction,
     batch_max_transactions: usize,
 ) -> io::Result<()> {
-    if pending.slot.is_some_and(|pending_slot| pending_slot != slot) {
+    if pending
+        .slot
+        .is_some_and(|pending_slot| pending_slot != slot)
+    {
         flush_pending_batch(handle, pending)?;
     }
 
     if pending.slot.is_none() {
         pending.slot = Some(slot);
         pending.created_at = Some(created_at);
-    } else if pending.created_at.is_none_or(|existing| created_at < existing) {
+    } else if pending
+        .created_at
+        .is_none_or(|existing| created_at < existing)
+    {
         pending.created_at = Some(created_at);
     }
     pending.transactions.push(transaction);
@@ -556,12 +561,10 @@ where
         config.reconnect_backoff_ms = parse_u64_flag("--reconnect-backoff-ms", &value)?;
     }
     if let Some(value) = non_empty(env_max_reconnect_backoff_ms) {
-        config.max_reconnect_backoff_ms =
-            parse_u64_flag("--max-reconnect-backoff-ms", &value)?;
+        config.max_reconnect_backoff_ms = parse_u64_flag("--max-reconnect-backoff-ms", &value)?;
     }
     if let Some(value) = non_empty(env_batch_max_transactions) {
-        config.batch_max_transactions =
-            parse_usize_flag("--batch-max-transactions", &value)?;
+        config.batch_max_transactions = parse_usize_flag("--batch-max-transactions", &value)?;
     }
     if let Some(value) = non_empty(env_batch_flush_ms) {
         config.batch_flush_ms = parse_u64_flag("--batch-flush-ms", &value)?;
@@ -602,8 +605,7 @@ where
                 let value = args
                     .next()
                     .ok_or(CliError::MissingValue("--reconnect-backoff-ms"))?;
-                config.reconnect_backoff_ms =
-                    parse_u64_flag("--reconnect-backoff-ms", &value)?;
+                config.reconnect_backoff_ms = parse_u64_flag("--reconnect-backoff-ms", &value)?;
             }
             "--max-reconnect-backoff-ms" => {
                 let value = args
@@ -647,8 +649,7 @@ where
                 let value = args
                     .next()
                     .ok_or(CliError::MissingValue("--heartbeat-ttl-ms"))?;
-                config.proxy.heartbeat_ttl_ms =
-                    parse_u32_flag("--heartbeat-ttl-ms", &value)?;
+                config.proxy.heartbeat_ttl_ms = parse_u32_flag("--heartbeat-ttl-ms", &value)?;
             }
             other => return Err(CliError::UnknownArgument(other.to_string())),
         }

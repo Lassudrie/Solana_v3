@@ -1043,7 +1043,9 @@ impl ObserverState {
             route_kind: best_candidate
                 .map(|candidate| route_kind_label(candidate.route_kind).into())
                 .unwrap_or_else(|| "unknown".into()),
-            leg_count: best_candidate.map(|candidate| candidate.leg_count()).unwrap_or_default(),
+            leg_count: best_candidate
+                .map(|candidate| candidate.leg_count())
+                .unwrap_or_default(),
             trade_size: best_candidate.map(|candidate| candidate.trade_size),
             submission_id: record.submission_id.0.clone(),
             signature: record.chain_signature.clone(),
@@ -1080,10 +1082,15 @@ impl ObserverState {
             jito_tip_lamports: envelope.map(|envelope| envelope.jito_tip_lamports),
             active_execution_buffer_bps: best_candidate
                 .and_then(|candidate| candidate.active_execution_buffer_bps),
-            source_input_balance: best_candidate.and_then(|candidate| candidate.source_input_balance),
-            oldest_snapshot_slot: best_candidate.map(|candidate| candidate.oldest_relevant_snapshot_slot()),
-            quote_state_age_slots: best_candidate
-                .map(|candidate| candidate.quoted_slot.saturating_sub(candidate.oldest_relevant_snapshot_slot())),
+            source_input_balance: best_candidate
+                .and_then(|candidate| candidate.source_input_balance),
+            oldest_snapshot_slot: best_candidate
+                .map(|candidate| candidate.oldest_relevant_snapshot_slot()),
+            quote_state_age_slots: best_candidate.map(|candidate| {
+                candidate
+                    .quoted_slot
+                    .saturating_sub(candidate.oldest_relevant_snapshot_slot())
+            }),
             leg_ticks_crossed: best_candidate
                 .map(|candidate| {
                     candidate
@@ -2057,7 +2064,11 @@ fn summarize_metrics(samples: &[MonitorSignalSample]) -> BTreeMap<String, Monito
     );
     metrics.insert(
         "trigger_barrier_wait".into(),
-        summarize_optional(samples.iter().map(|sample| sample.trigger_barrier_wait_nanos)),
+        summarize_optional(
+            samples
+                .iter()
+                .map(|sample| sample.trigger_barrier_wait_nanos),
+        ),
     );
     metrics.insert(
         "state_apply".into(),

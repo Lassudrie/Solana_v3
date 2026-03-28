@@ -183,15 +183,9 @@ pub fn bootstrap_with_health(
             max_inflight_penalty_bps: config.strategy.sizing.max_inflight_penalty_bps,
             blockhash_penalty_bps_per_slot: config.strategy.sizing.blockhash_penalty_bps_per_slot,
             max_blockhash_penalty_bps: config.strategy.sizing.max_blockhash_penalty_bps,
-            quote_age_penalty_bps_per_slot: config
-                .strategy
-                .sizing
-                .quote_age_penalty_bps_per_slot,
+            quote_age_penalty_bps_per_slot: config.strategy.sizing.quote_age_penalty_bps_per_slot,
             max_quote_age_penalty_bps: config.strategy.sizing.max_quote_age_penalty_bps,
-            tick_cross_penalty_bps_per_tick: config
-                .strategy
-                .sizing
-                .tick_cross_penalty_bps_per_tick,
+            tick_cross_penalty_bps_per_tick: config.strategy.sizing.tick_cross_penalty_bps_per_tick,
             max_tick_cross_penalty_bps: config.strategy.sizing.max_tick_cross_penalty_bps,
             max_reserve_usage_penalty_bps: config.strategy.sizing.max_reserve_usage_penalty_bps,
         },
@@ -658,13 +652,18 @@ fn resolve_route_input_source_account(
     wallet_owner: &str,
 ) -> Result<String, BootstrapError> {
     let route_kind = map_route_kind(route.kind);
-    let first_leg = route.legs.first().ok_or_else(|| BootstrapError::InvalidRouteConfig {
-        route_id: route.route_id.clone(),
-        detail: "route must contain at least one leg".into(),
-    })?;
+    let first_leg = route
+        .legs
+        .first()
+        .ok_or_else(|| BootstrapError::InvalidRouteConfig {
+            route_id: route.route_id.clone(),
+            detail: "route must contain at least one leg".into(),
+        })?;
     let (input_mint, _) = resolve_route_leg_mints(route, route_kind, first_leg, 0)?;
     match &first_leg.execution {
-        RouteLegExecutionConfig::OrcaSimplePool(config) => Ok(config.user_source_token_account.clone()),
+        RouteLegExecutionConfig::OrcaSimplePool(config) => {
+            Ok(config.user_source_token_account.clone())
+        }
         RouteLegExecutionConfig::RaydiumSimplePool(config) => {
             if let Some(mint) = &config.user_source_mint {
                 associated_token_address(wallet_owner, mint, &config.token_program_id)
@@ -2768,7 +2767,8 @@ mod tests {
         });
         config.reconciliation.rpc_ws_endpoint = "mock://solana-ws".into();
 
-        bootstrap(config).expect("missing derived ATA should be allowed when builder can derive it");
+        bootstrap(config)
+            .expect("missing derived ATA should be allowed when builder can derive it");
     }
 
     #[test]

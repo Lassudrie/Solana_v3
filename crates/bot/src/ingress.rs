@@ -50,7 +50,7 @@ impl IngressRouter {
             EventLane::StateOnly => {
                 event.latency.state_published_at = Some(now);
                 let (state_key, pool_key) = self.state_key(&event);
-                let shard_index = self.shard_index(&state_key);
+                let shard_index = self.shard_index(&pool_key);
                 if self.state_shards[shard_index].insert(
                     state_key,
                     StateMailboxEntry { pool_key, event },
@@ -89,11 +89,13 @@ impl IngressRouter {
             return Some(trigger.event);
         }
 
-        if let Some(event) = self.broadcast_queue.pop_front() {
+        // Favor state updates over broadcast traffic so warmup and hot-path freshness
+        // do not stall behind slot/heartbeat chatter under bursty ingress.
+        if let Some(event) = self.pop_next_state() {
             return Some(event);
         }
 
-        self.pop_next_state()
+        self.broadcast_queue.pop_front()
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -119,7 +121,8 @@ impl IngressRouter {
 
         for (shard_index, shard) in self.state_shards.iter().enumerate() {
             for (key, entry) in &shard.mailboxes {
-                if entry.pool_key != pool_id || entry.event.source.sequence >= trigger.event.source.sequence
+                if entry.pool_key != pool_id
+                    || entry.event.source.sequence >= trigger.event.source.sequence
                 {
                     continue;
                 }
@@ -134,7 +137,9 @@ impl IngressRouter {
         if trigger.first_blocked_at.is_none() {
             trigger.first_blocked_at = Some(SystemTime::now());
         }
-        self.state_shards[shard_index].take(&key).map(|entry| entry.event)
+        self.state_shards[shard_index]
+            .take(&key)
+            .map(|entry| entry.event)
     }
 
     fn pop_next_state(&mut self) -> Option<NormalizedEvent> {
@@ -161,21 +166,24 @@ impl IngressRouter {
                     .get(&update.pubkey)
                     .cloned()
                     .unwrap_or_else(|| format!("account:{}", update.pubkey));
-                (format!("state:{pool_key}"), pool_key)
+                (format!("state:{pool_key}:account"), pool_key)
             }
             MarketEvent::PoolSnapshotUpdate(update) => {
                 let pool_key = update.pool_id.clone();
-                (format!("state:{pool_key}"), pool_key)
+                (format!("state:{pool_key}:snapshot"), pool_key)
             }
             MarketEvent::PoolQuoteModelUpdate(update) => {
                 let pool_key = update.pool_id.clone();
-                (format!("state:{pool_key}"), pool_key)
+                (format!("state:{pool_key}:quote_model"), pool_key)
             }
             MarketEvent::PoolInvalidation(update) => {
                 let pool_key = update.pool_id.clone();
-                (format!("state:{pool_key}"), pool_key)
+                (format!("state:{pool_key}:invalidation"), pool_key)
             }
-            other => (format!("state:{}", fallback_key(other)), fallback_key(other)),
+            other => (
+                format!("state:{}", fallback_key(other)),
+                fallback_key(other),
+            ),
         }
     }
 
@@ -183,6 +191,123 @@ impl IngressRouter {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut hasher);
         (hasher.finish() as usize) % self.state_shards.len().max(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domain::{
+        EventSourceKind, Heartbeat, MarketEvent, NormalizedEvent, PoolQuoteModelUpdate,
+        PoolSnapshotUpdate, SnapshotConfidence, types::PoolVenue,
+    };
+
+    use crate::config::{RuntimeParallelismConfig, StateUpdateModeConfig};
+
+    use super::IngressRouter;
+
+    fn snapshot_event(sequence: u64) -> NormalizedEvent {
+        NormalizedEvent::pool_snapshot_update(
+            EventSourceKind::ShredStream,
+            sequence,
+            100,
+            PoolSnapshotUpdate {
+                pool_id: "pool-a".into(),
+                price_bps: 10_000,
+                fee_bps: 30,
+                reserve_depth: 1_000,
+                reserve_a: Some(500),
+                reserve_b: Some(500),
+                active_liquidity: Some(1_000),
+                sqrt_price_x64: Some(1u128 << 64),
+                venue: PoolVenue::OrcaWhirlpool,
+                confidence: SnapshotConfidence::Executable,
+                repair_pending: Some(false),
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                tick_spacing: 64,
+                current_tick_index: Some(0),
+                slot: 100,
+                write_version: 1,
+            },
+        )
+    }
+
+    fn quote_model_event(sequence: u64) -> NormalizedEvent {
+        NormalizedEvent::pool_quote_model_update(
+            EventSourceKind::ShredStream,
+            sequence,
+            100,
+            PoolQuoteModelUpdate {
+                pool_id: "pool-a".into(),
+                liquidity: 1_000,
+                sqrt_price_x64: 1u128 << 64,
+                current_tick_index: 0,
+                tick_spacing: 64,
+                required_a_to_b: true,
+                required_b_to_a: true,
+                a_to_b: None,
+                b_to_a: None,
+                slot: 100,
+                write_version: 1,
+            },
+        )
+    }
+
+    fn broadcast_event(sequence: u64) -> NormalizedEvent {
+        NormalizedEvent::with_payload(
+            EventSourceKind::ShredStream,
+            sequence,
+            100,
+            MarketEvent::Heartbeat(Heartbeat {
+                slot: 100,
+                note: "test",
+            }),
+        )
+    }
+
+    #[test]
+    fn latest_only_keeps_snapshot_and_quote_model_for_same_pool() {
+        let mut parallelism = RuntimeParallelismConfig::default();
+        parallelism.state_shard_count = 1;
+        parallelism.state_update_mode = StateUpdateModeConfig::LatestOnly;
+        let mut router = IngressRouter::new(&parallelism, Default::default());
+
+        let snapshot_stats = router.route(snapshot_event(1));
+        let quote_stats = router.route(quote_model_event(2));
+
+        assert_eq!(snapshot_stats.coalesced_updates, 0);
+        assert_eq!(quote_stats.coalesced_updates, 0);
+        assert_eq!(router.state_dirty_mailboxes(), 2);
+
+        let first = router.pop_next().expect("snapshot event");
+        let second = router.pop_next().expect("quote model event");
+
+        assert!(matches!(
+            first.payload,
+            domain::MarketEvent::PoolSnapshotUpdate(_)
+        ));
+        assert!(matches!(
+            second.payload,
+            domain::MarketEvent::PoolQuoteModelUpdate(_)
+        ));
+    }
+
+    #[test]
+    fn state_updates_take_priority_over_broadcast_events() {
+        let mut router =
+            IngressRouter::new(&RuntimeParallelismConfig::default(), Default::default());
+
+        router.route(broadcast_event(1));
+        router.route(snapshot_event(2));
+
+        let first = router.pop_next().expect("state event");
+        let second = router.pop_next().expect("broadcast event");
+
+        assert!(matches!(
+            first.payload,
+            domain::MarketEvent::PoolSnapshotUpdate(_)
+        ));
+        assert!(matches!(second.payload, domain::MarketEvent::Heartbeat(_)));
     }
 }
 

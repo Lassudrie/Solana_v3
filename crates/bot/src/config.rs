@@ -173,7 +173,7 @@ impl BotConfig {
         set_if_default(
             &mut self.runtime.control.max_events_per_tick,
             defaults.runtime.control.max_events_per_tick,
-            4_096,
+            512,
         );
         set_if_default(
             &mut self.runtime.parallelism.state_shard_count,
@@ -1333,7 +1333,7 @@ account_batch_parallel_rpc_requests = 4
             SingleTransactionSubmitPolicyConfig::JitoOnly
         );
         assert_eq!(config.runtime.control.idle_sleep_millis, 0);
-        assert_eq!(config.runtime.control.max_events_per_tick, 4_096);
+        assert_eq!(config.runtime.control.max_events_per_tick, 512);
         assert_eq!(config.reconciliation.poll_interval_millis, 25);
         assert_eq!(config.reconciliation.account_batch_parallel_rpc_requests, 1);
         assert_eq!(config.jito.request_timeout_ms, 250);

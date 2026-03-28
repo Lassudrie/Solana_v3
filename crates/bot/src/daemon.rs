@@ -317,17 +317,16 @@ impl BotDaemon {
             .iter()
             .filter(|route| route_enabled_in_profile(route, config.runtime.profile))
             .collect::<Vec<_>>();
-        let source_token_accounts = collect_route_input_source_accounts(
-            &active_routes,
-            runtime.wallet_pubkey(),
-        )
-        .map_err(DaemonError::Bootstrap)?;
+        let source_token_accounts =
+            collect_route_input_source_accounts(&active_routes, runtime.wallet_pubkey())
+                .map_err(DaemonError::Bootstrap)?;
         let account_to_pool = active_routes
             .iter()
             .flat_map(|route| {
-                route.account_dependencies.iter().map(|dependency| {
-                    (dependency.account_key.clone(), dependency.pool_id.clone())
-                })
+                route
+                    .account_dependencies
+                    .iter()
+                    .map(|dependency| (dependency.account_key.clone(), dependency.pool_id.clone()))
             })
             .collect::<HashMap<_, _>>();
         let refresher = AsyncStateRefresher::new(

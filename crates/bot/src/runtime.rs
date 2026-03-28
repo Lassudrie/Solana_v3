@@ -387,7 +387,9 @@ impl BotRuntime {
             self.hot_path
                 .execution
                 .set_source_token_balances(source_token_balances.balances);
-            self.hot_path.state.set_latest_slot(source_token_balances.slot);
+            self.hot_path
+                .state
+                .set_latest_slot(source_token_balances.slot);
         }
     }
 
@@ -732,7 +734,8 @@ impl BotRuntime {
                 .hot_path
                 .strategy
                 .has_impacted_triangular_route(&state_outcome.impacted_routes);
-        if event.source.source == EventSourceKind::ShredStream && !should_evaluate_shredstream_routes
+        if event.source.source == EventSourceKind::ShredStream
+            && !should_evaluate_shredstream_routes
         {
             return Ok(PreparedHotPath::Report(HotPathReport {
                 state_outcome: Some(state_outcome),
@@ -1117,10 +1120,13 @@ mod tests {
     }
 
     fn seed_source_input_balance(runtime: &mut BotRuntime) {
-        runtime.hot_path.execution.set_source_token_balances(HashMap::from([(
-            test_pubkey("route-input-ata"),
-            1_000_000,
-        )]));
+        runtime
+            .hot_path
+            .execution
+            .set_source_token_balances(HashMap::from([(
+                test_pubkey("route-input-ata"),
+                1_000_000,
+            )]));
     }
 
     fn route_execution() -> RouteExecutionConfig {
@@ -1574,10 +1580,13 @@ mod tests {
         config.signing.owner_pubkey = owner_pubkey.clone();
         config.signing.keypair_base58 = Some(keypair_base58);
         let mut runtime = bootstrap(config).unwrap();
-        runtime.hot_path.execution.set_source_token_balances(HashMap::from([(
-            test_pubkey("tri-route-input-ata"),
-            1_000_000,
-        )]));
+        runtime
+            .hot_path
+            .execution
+            .set_source_token_balances(HashMap::from([(
+                test_pubkey("tri-route-input-ata"),
+                1_000_000,
+            )]));
         runtime.hot_path.signer = Arc::new(PanicSigner {
             pubkey: owner_pubkey,
         });
@@ -1616,11 +1625,20 @@ mod tests {
         let prepared = runtime.prepare_event_for_dispatch(third, 0).unwrap();
         match prepared {
             PreparedHotPath::BuildSign(task) => {
-                assert_eq!(task.report.selection.best_candidate.as_ref().map(|candidate| candidate.route_id.0.as_str()), Some("route-tri"));
+                assert_eq!(
+                    task.report
+                        .selection
+                        .best_candidate
+                        .as_ref()
+                        .map(|candidate| candidate.route_id.0.as_str()),
+                    Some("route-tri")
+                );
                 assert!(task.report.build_result.is_none());
                 assert!(task.report.signed_envelope.is_none());
             }
-            other => panic!("expected build/sign handoff for triangular shredstream route, got {other:?}"),
+            other => panic!(
+                "expected build/sign handoff for triangular shredstream route, got {other:?}"
+            ),
         }
     }
 

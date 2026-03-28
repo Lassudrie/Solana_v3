@@ -318,9 +318,7 @@ impl PipelineMetrics {
             state_dirty_mailboxes: self.state_dirty_mailboxes.load(Ordering::Relaxed),
             trigger_queue_depth: self.trigger_queue_depth.load(Ordering::Relaxed),
             trigger_queue_wait_nanos: self.trigger_queue_wait_nanos.load(Ordering::Relaxed),
-            trigger_barrier_wait_nanos: self
-                .trigger_barrier_wait_nanos
-                .load(Ordering::Relaxed),
+            trigger_barrier_wait_nanos: self.trigger_barrier_wait_nanos.load(Ordering::Relaxed),
             route_eval_nanos: self.route_eval_nanos.load(Ordering::Relaxed),
             state_mailbox_age_nanos: self.state_mailbox_age_nanos.load(Ordering::Relaxed),
         }

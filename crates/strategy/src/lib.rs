@@ -11,7 +11,9 @@ use domain::{ExecutionSnapshot, RouteId};
 use guards::{GuardrailConfig, GuardrailSet};
 use opportunity::SelectionOutcome;
 use quote::LocalTwoLegQuoteEngine;
-use route_registry::{JitoTipPolicy, RouteDefinition, RouteKind, RouteRegistry, StrategySizingConfig};
+use route_registry::{
+    JitoTipPolicy, RouteDefinition, RouteKind, RouteRegistry, StrategySizingConfig,
+};
 use selector::OpportunitySelector;
 use state::StatePlane;
 

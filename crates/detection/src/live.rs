@@ -144,6 +144,10 @@ impl LiveConcentratedQuoteModelStore {
         self.models.get(pool_id)
     }
 
+    fn version(&self, pool_id: &PoolId) -> Option<LiveQuoteModelVersion> {
+        self.versions.get(pool_id).copied()
+    }
+
     fn accepts(&self, pool_id: &PoolId, slot: u64, write_version: u64) -> bool {
         self.versions.get(pool_id).is_none_or(|existing| {
             existing.slot < slot
@@ -203,8 +207,16 @@ impl LiveExecutableStateStore {
     }
 
     fn next_write_version(&self, pool_id: &PoolId) -> u64 {
-        self.get(pool_id)
-            .map(|state| state.write_version().saturating_add(1))
+        let state_write_version = self.get(pool_id).map(ExecutablePoolState::write_version);
+        let quote_write_version = self
+            .concentrated_quote_models
+            .version(pool_id)
+            .map(|version| version.write_version);
+        state_write_version
+            .into_iter()
+            .chain(quote_write_version)
+            .max()
+            .map(|write_version| write_version.saturating_add(1))
             .unwrap_or(1)
     }
 
@@ -240,6 +252,97 @@ impl LiveExecutableStateStore {
         if let Some(update) = &reduction.quote_model_update {
             let _ = self.concentrated_quote_models.upsert(update.clone());
         }
+        true
+    }
+
+    fn upsert_repair_reduction(&mut self, reduction: &ExactReduction) -> bool {
+        if self.upsert_exact_reduction(reduction) {
+            return true;
+        }
+
+        if executable_state_requires_repair(&reduction.next_state) {
+            return false;
+        }
+
+        let pool_id = reduction.next_state.pool_id().clone();
+        let slot = reduction.next_state.last_update_slot();
+        let write_version = reduction.next_state.write_version();
+        let current_state_requires_repair = self
+            .get(&pool_id)
+            .map(executable_state_requires_repair)
+            .unwrap_or(true);
+
+        if let Some(existing) = self.get(&pool_id) {
+            if existing.last_update_slot() > slot.saturating_add(MAX_REPAIR_RESULT_SLOT_LAG) {
+                return false;
+            }
+            if existing.last_update_slot() == slot && existing.write_version() >= write_version {
+                return false;
+            }
+            if existing.last_update_slot() > slot && !executable_state_requires_repair(existing) {
+                return false;
+            }
+        }
+
+        if let Some(update) = &reduction.quote_model_update {
+            if !self
+                .concentrated_quote_models
+                .accepts(&pool_id, update.slot, update.write_version)
+            {
+                let Some(existing) = self.concentrated_quote_models.version(&pool_id) else {
+                    return false;
+                };
+                if existing.slot > update.slot.saturating_add(MAX_REPAIR_RESULT_SLOT_LAG) {
+                    return false;
+                }
+                if existing.slot == update.slot && existing.write_version >= update.write_version {
+                    return false;
+                }
+                if !current_state_requires_repair {
+                    return false;
+                }
+            }
+        }
+
+        let state_replaced = match self.get(&pool_id) {
+            Some(existing)
+                if existing.last_update_slot() > slot
+                    || (existing.last_update_slot() == slot
+                        && existing.write_version() >= write_version) =>
+            {
+                if let Some(state) = self.get_mut(&pool_id) {
+                    *state = reduction.next_state.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => self.states.upsert(reduction.next_state.clone()),
+        };
+        if !state_replaced {
+            return false;
+        }
+
+        if let Some(update) = &reduction.quote_model_update {
+            if self
+                .concentrated_quote_models
+                .accepts(&pool_id, update.slot, update.write_version)
+            {
+                let _ = self.concentrated_quote_models.upsert(update.clone());
+            } else {
+                self.concentrated_quote_models.versions.insert(
+                    pool_id.clone(),
+                    LiveQuoteModelVersion {
+                        slot: update.slot,
+                        write_version: update.write_version,
+                    },
+                );
+                self.concentrated_quote_models
+                    .models
+                    .insert(pool_id, update.clone());
+            }
+        }
+
         true
     }
 
@@ -285,6 +388,8 @@ const ORCA_WHIRLPOOL_ACCOUNT_MIN_LEN: usize = 245;
 const RAYDIUM_CLMM_ACCOUNT_MIN_LEN: usize = 273;
 const ORCA_TICK_ARRAY_ACCOUNT_MIN_LEN: usize = 8 + 4 + 113 * 88 + 32;
 const RAYDIUM_TICK_ARRAY_ACCOUNT_MIN_LEN: usize = 8 + 32 + 4 + 168 * 60 + 1 + 8 + 107;
+const MAX_CONCENTRATED_REPAIR_FETCH_PASSES: usize = 4;
+const MAX_REPAIR_RESULT_SLOT_LAG: u64 = 2;
 
 #[derive(Debug)]
 pub struct GrpcEntriesEventSource {
@@ -1005,12 +1110,12 @@ fn seed_initial_repairs(
     repair_tx: &mpsc::Sender<RepairRequest>,
 ) {
     for pool_id in pool_ids {
-        let queued = sync_tracker
+        let enqueue = sync_tracker
             .lock()
             .ok()
             .map(|mut tracker| tracker.repair_requested(&pool_id, 0))
             .unwrap_or(false);
-        if !queued {
+        if !enqueue {
             continue;
         }
         let _ = repair_tx.send(RepairRequest {
@@ -2813,6 +2918,7 @@ fn finalize_completed_sync_request(
     pool_id: &str,
     mode: SyncRequestMode,
     fallback_observed_slot: u64,
+    satisfied_through_slot: Option<u64>,
 ) -> SyncCompletionDisposition {
     let Ok(mut tracker) = sync_tracker.lock() else {
         return SyncCompletionDisposition::Unsatisfied {
@@ -2823,15 +2929,18 @@ fn finalize_completed_sync_request(
         .requested_observed_slot(pool_id, mode)
         .map(|requested| requested.max(fallback_observed_slot))
         .unwrap_or(fallback_observed_slot);
-    let satisfied = executable_states
-        .read()
-        .ok()
-        .and_then(|store| {
-            store
-                .get(&PoolId(pool_id.to_string()))
-                .map(|state| state_satisfies_request(state, current_observed_slot))
-        })
-        .unwrap_or(false);
+    let satisfied = satisfied_through_slot
+        .map(|slot| current_observed_slot <= slot)
+        .unwrap_or(false)
+        || executable_states
+            .read()
+            .ok()
+            .and_then(|store| {
+                store
+                    .get(&PoolId(pool_id.to_string()))
+                    .map(|state| state_satisfies_request(state, current_observed_slot))
+            })
+            .unwrap_or(false);
     if satisfied {
         clear_sync_request(&mut tracker, pool_id, mode);
         SyncCompletionDisposition::Satisfied {
@@ -3493,30 +3602,48 @@ fn drain_repair_results(
                 let result_satisfies_job = state_satisfies_request(&next_state, observed_slot);
                 let result_satisfies_latest =
                     state_satisfies_request(&next_state, latest_observed_slot);
-                let mut published = false;
+                let mut published_snapshot = None;
+                let mut published_quote_model = None;
                 if result_satisfies_latest {
                     if let Ok(mut store) = executable_states.write() {
-                        published = store.upsert_exact_reduction(&ExactReduction {
+                        if store.upsert_repair_reduction(&ExactReduction {
                             next_state: next_state.clone(),
                             quote_model_update: quote_model_update.clone(),
                             refresh_required: false,
-                        });
+                        }) {
+                            published_snapshot = Some(next_state.clone());
+                            published_quote_model = quote_model_update.clone();
+                        }
                     }
                 }
-                if published {
+                if result_satisfies_latest && published_snapshot.is_none() {
+                    let pool_key = PoolId(pool_id.clone());
+                    if let Ok(store) = executable_states.read() {
+                        if let Some(current_state) = store
+                            .get(&pool_key)
+                            .cloned()
+                            .filter(|state| state_satisfies_request(state, latest_observed_slot))
+                        {
+                            published_quote_model =
+                                store.concentrated_quote_model(&pool_key).cloned();
+                            published_snapshot = Some(current_state);
+                        }
+                    }
+                }
+                if let Some(snapshot_state) = published_snapshot {
                     publish_pool_snapshot_update(
                         event_tx,
                         sequence,
-                        slot,
+                        snapshot_state.last_update_slot(),
                         SystemTime::now(),
                         None,
-                        &next_state,
+                        &snapshot_state,
                     );
-                    if let Some(quote_model_update) = quote_model_update {
+                    if let Some(quote_model_update) = published_quote_model {
                         publish_pool_quote_model_update(
                             event_tx,
                             sequence,
-                            slot,
+                            quote_model_update.slot,
                             SystemTime::now(),
                             None,
                             quote_model_update,
@@ -3529,6 +3656,7 @@ fn drain_repair_results(
                     &pool_id,
                     mode,
                     observed_slot,
+                    result_satisfies_latest.then_some(latest_observed_slot),
                 ) {
                     SyncCompletionDisposition::Satisfied { observed_slot } => {
                         attempts.remove(&(pool_id.clone(), mode));
@@ -3873,27 +4001,52 @@ fn fetch_repair_accounts(
     observed_slot: u64,
 ) -> Result<(u64, HashMap<String, RpcAccountValue>), RpcError> {
     let repair_keys = tracked_pool.repair_account_keys();
-    let (slot, accounts) = fetch_accounts_by_key(account_batcher, &repair_keys, observed_slot)?;
+    let mut requested_keys = repair_keys.iter().cloned().collect::<BTreeSet<_>>();
+    let min_context_slot = observed_slot.saturating_sub(MAX_REPAIR_RESULT_SLOT_LAG);
+    let mut last_result = None;
 
-    let concentrated_keys = required_quote_model_keys(tracked_pool, &accounts)?;
-    if concentrated_keys.is_empty() {
-        return Ok((slot, accounts));
+    for _ in 0..MAX_CONCENTRATED_REPAIR_FETCH_PASSES {
+        let fetch_keys = requested_keys.iter().cloned().collect::<Vec<_>>();
+        let (slot, accounts) =
+            fetch_accounts_by_key(account_batcher, &fetch_keys, min_context_slot)?;
+        let concentrated_keys = required_quote_model_keys(tracked_pool, &accounts)?;
+        if concentrated_keys.is_empty() {
+            return Ok((slot, accounts));
+        }
+
+        let next_requested_keys = repair_keys
+            .iter()
+            .cloned()
+            .chain(concentrated_keys)
+            .chain(requested_keys.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        last_result = Some((slot, accounts, next_requested_keys.clone()));
+        if next_requested_keys == requested_keys {
+            return Ok((
+                slot,
+                last_result
+                    .take()
+                    .expect("repair fetch result should be present")
+                    .1,
+            ));
+        }
+        requested_keys = next_requested_keys;
     }
 
-    let unified_keys = repair_keys
-        .into_iter()
-        .chain(concentrated_keys)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    // The second fetch only needs to stay at or above the event watermark.
-    // Requiring the exact slot from the probe fetch can trigger transient
-    // "minimum context slot" failures on public RPCs even when a coherent
-    // snapshot is otherwise available.
-    let (refetch_slot, refetched_accounts) =
-        fetch_accounts_by_key(account_batcher, &unified_keys, observed_slot)?;
-    ensure_quote_model_keys_covered(tracked_pool, &refetched_accounts, &unified_keys)?;
-    Ok((refetch_slot, refetched_accounts))
+    if let Some((_, accounts, requested_keys)) = last_result {
+        ensure_quote_model_keys_covered(
+            tracked_pool,
+            &accounts,
+            &requested_keys.into_iter().collect::<Vec<_>>(),
+        )?;
+    }
+
+    Err(RpcError::DecodeFailed {
+        method: "getMultipleAccounts".into(),
+        detail: format!(
+            "concentrated repair context did not stabilize after {MAX_CONCENTRATED_REPAIR_FETCH_PASSES} fetch passes"
+        ),
+    })
 }
 
 fn required_quote_model_keys(
@@ -4488,25 +4641,27 @@ fn fetch_accounts_by_key(
     min_context_slot: u64,
 ) -> Result<(u64, HashMap<String, RpcAccountValue>), RpcError> {
     let fetched =
-        match account_batcher.fetch_with_min_context_slot(account_keys, Some(min_context_slot)) {
-            Ok(fetched) => fetched,
-            Err(error) if error.is_min_context_slot_not_reached() => {
-                account_batcher.fetch(account_keys)?
-            }
-            Err(error) => return Err(error),
-        };
+        account_batcher.fetch_with_min_context_slot(account_keys, Some(min_context_slot))?;
     Ok((fetched.slot, fetched.present_accounts()))
 }
 
-fn state_satisfies_request(state: &ExecutablePoolState, observed_slot: u64) -> bool {
-    let requires_repair = match state {
+fn executable_state_requires_repair(state: &ExecutablePoolState) -> bool {
+    match state {
         ExecutablePoolState::OrcaSimplePool(state)
         | ExecutablePoolState::RaydiumSimplePool(state) => constant_product_requires_repair(state),
         ExecutablePoolState::OrcaWhirlpool(state) | ExecutablePoolState::RaydiumClmm(state) => {
             !state.confidence.is_executable() || state.repair_pending
         }
-    };
-    state.last_update_slot() >= observed_slot && !requires_repair
+    }
+}
+
+fn state_satisfies_request(state: &ExecutablePoolState, observed_slot: u64) -> bool {
+    let requires_repair = executable_state_requires_repair(state);
+    state
+        .last_update_slot()
+        .saturating_add(MAX_REPAIR_RESULT_SLOT_LAG)
+        >= observed_slot
+        && !requires_repair
 }
 
 fn decode_base64_account(account: &RpcAccountValue) -> Option<Vec<u8>> {
@@ -4653,6 +4808,7 @@ mod tests {
         collections::{BTreeSet, HashMap, HashSet},
         io::{Read, Write},
         net::{TcpListener, TcpStream},
+        str::FromStr,
         sync::{
             Arc, Mutex, RwLock,
             atomic::AtomicU64,
@@ -4664,8 +4820,9 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use domain::{
         ConcentratedLiquidityPoolState, ConstantProductPoolState, DirectionalPoolQuoteModelUpdate,
-        ExecutablePoolState, InitializedTickUpdate, PoolConfidence, PoolId, PoolQuoteModelUpdate,
-        PoolVenue, TickArrayWindowUpdate,
+        ExecutablePoolState, InitializedTickUpdate, ORCA_WHIRLPOOL_TICK_ARRAY_SIZE, PoolConfidence,
+        PoolId, PoolQuoteModelUpdate, PoolVenue, TickArrayWindowUpdate, derive_orca_tick_arrays,
+        tick_array_start_index,
     };
     use prost_types::Timestamp;
     use serde_json::{Value, json};
@@ -4691,7 +4848,7 @@ mod tests {
         anchor_instruction_discriminator, apply_mutation_exact, associated_token_address,
         build_executable_state_from_accounts, build_repair_result,
         constant_product_amount_in_for_output, constant_product_amount_out, drain_repair_results,
-        finalize_completed_sync_request, finalize_dropped_sync_request,
+        fetch_accounts_by_key, finalize_completed_sync_request, finalize_dropped_sync_request,
         invalidate_live_snapshot_after_advanced_request, parse_legacy_pubkey,
         reduce_orca_simple_swap, reduce_raydium_simple_swap, refresh_idle_tracked_pools,
         required_orca_tick_array_keys, required_raydium_tick_array_keys, resolve_transaction,
@@ -4800,6 +4957,18 @@ mod tests {
         .to_string()
     }
 
+    fn json_rpc_error_response(code: i64, message: &str) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        })
+        .to_string()
+    }
+
     fn spawn_mock_rpc_server<F>(handler: F) -> String
     where
         F: Fn(&str) -> String + Send + Sync + 'static,
@@ -4900,6 +5069,78 @@ mod tests {
             confidence,
             repair_pending,
         })
+    }
+
+    fn concentrated_repair_reduction(
+        pool_id: &str,
+        slot: u64,
+        write_version: u64,
+    ) -> ExactReduction {
+        ExactReduction {
+            next_state: ExecutablePoolState::OrcaWhirlpool(ConcentratedLiquidityPoolState {
+                pool_id: PoolId(pool_id.to_string()),
+                venue: PoolVenue::OrcaWhirlpool,
+                token_mint_a: "mint-a".into(),
+                token_mint_b: "mint-b".into(),
+                token_vault_a: "vault-a".into(),
+                token_vault_b: "vault-b".into(),
+                fee_bps: 30,
+                active_liquidity: 1_000_000,
+                liquidity: 1_000_000,
+                sqrt_price_x64: 1u128 << 64,
+                current_tick_index: 0,
+                tick_spacing: 64,
+                loaded_tick_arrays: 5,
+                expected_tick_arrays: 6,
+                last_update_slot: slot,
+                write_version,
+                last_verified_slot: slot,
+                confidence: PoolConfidence::Executable,
+                repair_pending: false,
+            }),
+            quote_model_update: Some(PoolQuoteModelUpdate {
+                pool_id: pool_id.to_string(),
+                liquidity: 1_000_000,
+                sqrt_price_x64: 1u128 << 64,
+                current_tick_index: 0,
+                tick_spacing: 64,
+                required_a_to_b: true,
+                required_b_to_a: true,
+                a_to_b: Some(DirectionalPoolQuoteModelUpdate {
+                    loaded_tick_arrays: 3,
+                    expected_tick_arrays: 3,
+                    complete: true,
+                    windows: vec![TickArrayWindowUpdate {
+                        start_tick_index: -5632,
+                        end_tick_index: 0,
+                        initialized_tick_count: 1,
+                    }],
+                    initialized_ticks: vec![InitializedTickUpdate {
+                        tick_index: 0,
+                        liquidity_net: 100_000,
+                        liquidity_gross: 100_000,
+                    }],
+                }),
+                b_to_a: Some(DirectionalPoolQuoteModelUpdate {
+                    loaded_tick_arrays: 3,
+                    expected_tick_arrays: 3,
+                    complete: true,
+                    windows: vec![TickArrayWindowUpdate {
+                        start_tick_index: 0,
+                        end_tick_index: 5632,
+                        initialized_tick_count: 1,
+                    }],
+                    initialized_ticks: vec![InitializedTickUpdate {
+                        tick_index: 0,
+                        liquidity_net: 100_000,
+                        liquidity_gross: 100_000,
+                    }],
+                }),
+                slot,
+                write_version,
+            }),
+            refresh_required: false,
+        }
     }
 
     fn sample_registry() -> TrackedPoolRegistry {
@@ -5717,6 +5958,79 @@ mod tests {
     }
 
     #[test]
+    fn fetch_accounts_by_key_keeps_min_context_slot_barrier() {
+        let endpoint = spawn_mock_rpc_server(|body| {
+            let payload: Value = serde_json::from_str(body).expect("json-rpc body");
+            let min_context_slot = payload["params"][1]["minContextSlot"]
+                .as_u64()
+                .expect("min context slot");
+            assert_eq!(min_context_slot, 100);
+            json_rpc_error_response(-32016, "Minimum context slot has not been reached")
+        });
+        let batcher = GetMultipleAccountsBatcher::new(&endpoint);
+
+        let error = fetch_accounts_by_key(&batcher, &["acct-a".into()], 100)
+            .expect_err("min context slot should be preserved");
+
+        assert!(error.is_min_context_slot_not_reached());
+    }
+
+    #[test]
+    fn state_satisfies_request_allows_small_rpc_slot_lag() {
+        let state = constant_product_state("pool-a", 100, 1, PoolConfidence::Executable, false);
+
+        assert!(state_satisfies_request(&state, 102));
+        assert!(!state_satisfies_request(&state, 103));
+    }
+
+    #[test]
+    fn next_write_version_tracks_quote_model_invalidation_barrier() {
+        let pool_id = PoolId("pool-a".to_string());
+        let mut store = LiveExecutableStateStore::default();
+
+        assert!(store.concentrated_quote_models.invalidate(&pool_id, 100, 1));
+        assert_eq!(store.next_write_version(&pool_id), 2);
+    }
+
+    #[test]
+    fn repair_upsert_tolerates_small_quote_model_invalidation_lead() {
+        let pool_id = PoolId("pool-a".to_string());
+        let mut store = LiveExecutableStateStore::default();
+        assert!(store.concentrated_quote_models.invalidate(&pool_id, 100, 1));
+
+        let reduction = concentrated_repair_reduction(&pool_id.0, 98, 2);
+
+        assert!(store.upsert_repair_reduction(&reduction));
+        assert_eq!(
+            store
+                .get(&pool_id)
+                .expect("repair should install state")
+                .last_update_slot(),
+            98
+        );
+        assert_eq!(
+            store
+                .concentrated_quote_model(&pool_id)
+                .expect("repair should install quote model")
+                .slot,
+            98
+        );
+    }
+
+    #[test]
+    fn repair_upsert_rejects_quote_model_invalidation_beyond_tolerance() {
+        let pool_id = PoolId("pool-a".to_string());
+        let mut store = LiveExecutableStateStore::default();
+        assert!(store.concentrated_quote_models.invalidate(&pool_id, 101, 1));
+
+        let reduction = concentrated_repair_reduction(&pool_id.0, 98, 2);
+
+        assert!(!store.upsert_repair_reduction(&reduction));
+        assert!(store.get(&pool_id).is_none());
+        assert!(store.concentrated_quote_model(&pool_id).is_none());
+    }
+
+    #[test]
     fn repair_builds_orca_whirlpool_as_verified_state() {
         let tracked_pool = TrackedPool {
             pool_id: "pool-orca".into(),
@@ -5841,14 +6155,33 @@ mod tests {
         let TrackedPoolKind::OrcaWhirlpool(config) = &tracked_pool.kind else {
             panic!("expected whirlpool config");
         };
+        let program_id = Pubkey::from_str(&config.program_id).expect("orca program id");
+        let whirlpool = Pubkey::from_str(&config.whirlpool).expect("whirlpool pubkey");
         let required_keys =
             required_orca_tick_array_keys(config, 12).expect("required whirlpool tick arrays");
+        let required_arrays =
+            derive_orca_tick_arrays(program_id, whirlpool, config.tick_spacing, 12, true)
+                .into_iter()
+                .zip([0, -1, -2])
+                .map(|(key, offset)| {
+                    (
+                        key.to_string(),
+                        tick_array_start_index(
+                            12,
+                            config.tick_spacing,
+                            ORCA_WHIRLPOOL_TICK_ARRAY_SIZE,
+                            offset,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
         let requested = Arc::new(Mutex::new(Vec::<(Vec<String>, Option<u64>)>::new()));
         let endpoint = spawn_mock_rpc_server({
             let requested = Arc::clone(&requested);
             let whirlpool = config.whirlpool.clone();
             let program_id = config.program_id.clone();
             let required_keys = required_keys.clone();
+            let required_arrays = required_arrays.clone();
             move |body| {
                 let payload: Value = serde_json::from_str(body).expect("json-rpc body");
                 let keys = payload["params"][0]
@@ -5876,10 +6209,13 @@ mod tests {
                 };
 
                 let mut accounts = HashMap::from([(whirlpool.clone(), whirlpool_account)]);
-                for (index, key) in required_keys.iter().enumerate() {
+                for key in &required_keys {
                     accounts.insert(
                         key.clone(),
-                        orca_tick_array_account(&program_id, index as i32),
+                        orca_tick_array_account(
+                            &program_id,
+                            *required_arrays.get(key).expect("tick array start index"),
+                        ),
                     );
                 }
 
@@ -5898,6 +6234,7 @@ mod tests {
         let quote_model = next.quote_model_update.expect("quote model update");
         assert_eq!(state.last_update_slot, 101);
         assert_eq!(state.last_verified_slot, 101);
+        assert_eq!(state.confidence, PoolConfidence::Executable);
         assert_eq!(state.liquidity, 700_000);
         assert_eq!(state.sqrt_price_x64, 1u128 << 65);
         assert_eq!(quote_model.slot, 101);
@@ -5906,8 +6243,8 @@ mod tests {
 
         let requested = requested.lock().expect("requested calls");
         assert_eq!(requested.len(), 2);
-        assert_eq!(requested[0].1, Some(90));
-        assert_eq!(requested[1].1, Some(90));
+        assert_eq!(requested[0].1, Some(88));
+        assert_eq!(requested[1].1, Some(88));
         assert_eq!(
             requested[1].0.iter().cloned().collect::<BTreeSet<_>>(),
             tracked_pool
@@ -5919,7 +6256,7 @@ mod tests {
     }
 
     #[test]
-    fn concentrated_repair_retries_when_second_fetch_moves_beyond_initial_tick_plan() {
+    fn concentrated_repair_converges_after_second_fetch_moves_beyond_initial_tick_plan() {
         let tracked_pool = TrackedPool {
             pool_id: "pool-orca".into(),
             reducer_mode: ReducerRolloutMode::Active,
@@ -5940,10 +6277,44 @@ mod tests {
         let TrackedPoolKind::OrcaWhirlpool(config) = &tracked_pool.kind else {
             panic!("expected whirlpool config");
         };
+        let program_id = Pubkey::from_str(&config.program_id).expect("orca program id");
+        let whirlpool = Pubkey::from_str(&config.whirlpool).expect("whirlpool pubkey");
         let initial_required_keys =
             required_orca_tick_array_keys(config, 12).expect("initial tick arrays");
         let moved_required_keys =
             required_orca_tick_array_keys(config, 100_000).expect("moved tick arrays");
+        let initial_required_arrays =
+            derive_orca_tick_arrays(program_id, whirlpool, config.tick_spacing, 12, true)
+                .into_iter()
+                .zip([0, -1, -2])
+                .map(|(key, offset)| {
+                    (
+                        key.to_string(),
+                        tick_array_start_index(
+                            12,
+                            config.tick_spacing,
+                            ORCA_WHIRLPOOL_TICK_ARRAY_SIZE,
+                            offset,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+        let moved_required_arrays =
+            derive_orca_tick_arrays(program_id, whirlpool, config.tick_spacing, 100_000, true)
+                .into_iter()
+                .zip([0, -1, -2])
+                .map(|(key, offset)| {
+                    (
+                        key.to_string(),
+                        tick_array_start_index(
+                            100_000,
+                            config.tick_spacing,
+                            ORCA_WHIRLPOOL_TICK_ARRAY_SIZE,
+                            offset,
+                        ),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
         assert!(
             moved_required_keys
                 .iter()
@@ -5956,6 +6327,9 @@ mod tests {
             let whirlpool = config.whirlpool.clone();
             let program_id = config.program_id.clone();
             let initial_required_keys = initial_required_keys.clone();
+            let moved_required_keys = moved_required_keys.clone();
+            let initial_required_arrays = initial_required_arrays.clone();
+            let moved_required_arrays = moved_required_arrays.clone();
             move |body| {
                 let payload: Value = serde_json::from_str(body).expect("json-rpc body");
                 let keys = payload["params"][0]
@@ -5985,10 +6359,26 @@ mod tests {
                         current_tick_index,
                     ),
                 )]);
-                for (index, key) in initial_required_keys.iter().enumerate() {
+                for key in &initial_required_keys {
                     accounts.insert(
                         key.clone(),
-                        orca_tick_array_account(&program_id, index as i32),
+                        orca_tick_array_account(
+                            &program_id,
+                            *initial_required_arrays
+                                .get(key)
+                                .expect("initial tick array start index"),
+                        ),
+                    );
+                }
+                for key in &moved_required_keys {
+                    accounts.insert(
+                        key.clone(),
+                        orca_tick_array_account(
+                            &program_id,
+                            *moved_required_arrays
+                                .get(key)
+                                .expect("moved tick array start index"),
+                        ),
                     );
                 }
 
@@ -5998,15 +6388,37 @@ mod tests {
         let batcher = GetMultipleAccountsBatcher::new(&endpoint);
         let states = Arc::new(RwLock::new(LiveExecutableStateStore::default()));
 
-        assert!(matches!(
-            build_repair_result(&batcher, &tracked_pool, &states, 90),
-            Err(RepairRetryKind::Failed)
-        ));
+        let next = build_repair_result(&batcher, &tracked_pool, &states, 90)
+            .expect("repair should converge after one drift");
+        let ExecutablePoolState::OrcaWhirlpool(state) = next.next_state else {
+            panic!("expected whirlpool state");
+        };
+        assert_eq!(state.last_update_slot, 101);
+        assert_eq!(state.current_tick_index, 100_000);
+        assert_eq!(state.confidence, PoolConfidence::Executable);
 
         let requested = requested.lock().expect("requested calls");
-        assert_eq!(requested.len(), 2);
-        assert_eq!(requested[0].1, Some(90));
-        assert_eq!(requested[1].1, Some(90));
+        assert_eq!(requested.len(), 3);
+        assert_eq!(requested[0].1, Some(88));
+        assert_eq!(requested[1].1, Some(88));
+        assert_eq!(requested[2].1, Some(88));
+        assert_eq!(
+            requested[1].0.iter().cloned().collect::<BTreeSet<_>>(),
+            tracked_pool
+                .repair_account_keys()
+                .into_iter()
+                .chain(initial_required_keys)
+                .collect()
+        );
+        assert_eq!(
+            requested[2].0.iter().cloned().collect::<BTreeSet<_>>(),
+            tracked_pool
+                .repair_account_keys()
+                .into_iter()
+                .chain(moved_required_keys)
+                .chain(requested[1].0.iter().cloned())
+                .collect()
+        );
     }
 
     #[test]
@@ -6473,7 +6885,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_repair_success_keeps_refresh_pending_and_retries() {
+    fn repair_success_with_small_slot_lag_satisfies_refresh() {
         let pool_id = "pool-a".to_string();
         let executable_states = Arc::new(RwLock::new(LiveExecutableStateStore::default()));
         executable_states
@@ -6534,9 +6946,14 @@ mod tests {
             &mut attempts,
         );
 
+        let published = event_rx.try_recv().expect("snapshot update");
+        assert!(matches!(
+            published.payload,
+            crate::MarketEvent::PoolSnapshotUpdate(_)
+        ));
         assert!(matches!(event_rx.try_recv(), Err(TryRecvError::Empty)));
         assert!(
-            sync_tracker
+            !sync_tracker
                 .lock()
                 .expect("tracker lock")
                 .refresh_required(&pool_id)
@@ -6548,15 +6965,9 @@ mod tests {
                 .get(&PoolId(pool_id.clone()))
                 .expect("state")
                 .last_update_slot(),
-            12
+            10
         );
-
-        let retry = retry_rx
-            .recv_timeout(Duration::from_secs(8))
-            .expect("retry request");
-        assert_eq!(retry.pool_id, pool_id);
-        assert_eq!(retry.mode, SyncRequestMode::RefreshExact);
-        assert_eq!(retry.observed_slot, 12);
+        assert!(matches!(retry_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 
     #[test]
@@ -6770,6 +7181,7 @@ mod tests {
             &pool_id,
             SyncRequestMode::RefreshExact,
             100,
+            None,
         );
         assert_eq!(
             disposition,
@@ -6812,6 +7224,40 @@ mod tests {
             .clone();
         assert_eq!(state.last_update_slot(), 105);
         assert_eq!(state.confidence(), PoolConfidence::Invalid);
+    }
+
+    #[test]
+    fn finalize_completed_sync_request_accepts_satisfied_result_override() {
+        let pool_id = "pool-a".to_string();
+        let executable_states = Arc::new(RwLock::new(LiveExecutableStateStore::default()));
+        let sync_tracker = Arc::new(Mutex::new(PoolSyncTracker::default()));
+        {
+            let mut tracker = sync_tracker.lock().expect("tracker lock");
+            tracker.schedule_refresh(&pool_id, 100);
+            tracker.mark_refresh_started(&pool_id);
+            let (_, should_enqueue) = tracker.schedule_refresh(&pool_id, 101);
+            assert!(!should_enqueue);
+        }
+
+        let disposition = finalize_completed_sync_request(
+            &executable_states,
+            &sync_tracker,
+            &pool_id,
+            SyncRequestMode::RefreshExact,
+            100,
+            Some(101),
+        );
+
+        assert_eq!(
+            disposition,
+            SyncCompletionDisposition::Satisfied { observed_slot: 101 }
+        );
+        let tracker = sync_tracker.lock().expect("tracker lock");
+        assert!(!tracker.refresh_required(&pool_id));
+        assert_eq!(
+            tracker.requested_observed_slot(&pool_id, SyncRequestMode::RefreshExact),
+            None
+        );
     }
 
     #[test]
